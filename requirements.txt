@@ -1,0 +1,22 @@
+# Pinned roughly to what's been verified in the `veil` conda env.
+# Install order matters: torch first via pytorch.org cu128 wheels.
+# pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+# pip install -r requirements.txt
+
+transformers>=5.7.0
+accelerate>=1.13
+qwen-vl-utils[decord]
+FlagEmbedding
+sentence-transformers
+huggingface_hub>=1.12
+
+pydantic>=2.0
+pyyaml
+tqdm
+pandas
+einops
+sentencepiece
+protobuf
+av
+pillow
+numpy
