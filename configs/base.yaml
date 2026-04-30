@@ -1,0 +1,56 @@
+# VEIL base config — shared defaults across benchmarks.
+# Override per-benchmark in mlvu.yaml / videomme.yaml.
+
+paths:
+  models_root: /home/Dataset/Models
+  outputs_root: /home2/ycj/Project/VEIL/outputs
+
+models:
+  vlm:
+    model_path: /home/Dataset/Models/Qwen/Qwen3-VL-8B-Instruct
+    dtype: bfloat16
+    device: cuda:0
+    attn_impl: sdpa            # sdpa | flash_attention_2 | eager
+    max_new_tokens: 512
+  llm:
+    model_path: /home/Dataset/Models/Qwen/Qwen3-8B
+    dtype: bfloat16
+    device: cuda:1
+    attn_impl: sdpa
+    enable_thinking: false
+    max_new_tokens: 512
+    # Switch to MoE Instruct-2507 for stronger planner/verifier:
+    # model_path: /home/Dataset/Models/Qwen/Qwen3-30B-A3B-Instruct-2507
+  embedder:
+    model_path: /home/Dataset/Models/BAAI/bge-m3
+    use_fp16: true
+    device: cuda:2
+    batch_size: 32
+    max_length: 512
+  reranker:
+    model_path: /home/Dataset/Models/BAAI/bge-reranker-v2-m3
+    use_fp16: true
+    device: cuda:2
+    batch_size: 16
+    max_length: 512
+
+memory:
+  segment_seconds: 16          # window length for memory chunks
+  fps_per_segment: 1.0         # frames sampled per second within a segment
+  max_frames_per_segment: 8    # hard cap for VLM input
+  prompt_template: default     # see veil/memory/build_memory.py
+
+retrieval:
+  coarse_top_k: 50             # BGE-M3 dense top-k
+  rerank_top_k: 10             # bge-reranker-v2-m3 final top-k
+
+veil_loop:
+  max_iter: 3                  # max iterative retrieval rounds
+  dedup_threshold: 0.85        # if new evidence overlaps too much with old, stop early
+
+eval:
+  benchmark: mlvu
+  task_types: null             # null = all; else list e.g. ["plotQA", "needle"]
+  max_videos: null             # null = all; int for subset
+  max_questions_per_video: null
+  output_dir: ${paths.outputs_root}/results

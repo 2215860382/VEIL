@@ -1,0 +1,39 @@
+# MLVU benchmark config. Inherits base.yaml.
+# Usage: python scripts/run_eval.py --config configs/mlvu.yaml --pipeline veil
+
+inherit: base.yaml
+
+benchmark:
+  name: mlvu
+  split: dev                   # dev | test
+  json_dir: /home/Dataset/Dataset/MLVU/MLVU/json
+  video_dir: /home/Dataset/Dataset/MLVU/MLVU/video
+  # MLVU-Dev has 9 task types; question_type field in JSON matches folder names below.
+  task_types:
+    - plotQA
+    - needle
+    - ego
+    - count
+    - order
+    - anomaly_reco
+    - topic_reasoning
+    - sub_scene
+    - summary
+  # Map json filename -> question_type
+  json_files:
+    plotQA: 1_plotQA.json
+    needle: 2_needle.json
+    ego: 3_ego.json
+    count: 4_count.json
+    order: 5_order.json
+    anomaly_reco: 6_anomaly_reco.json
+    topic_reasoning: 7_topic_reasoning.json
+    sub_scene: 8_sub_scene.json
+    summary: 9_summary.json
+
+memory:
+  cache_dir: ${paths.outputs_root}/memory/mlvu
+
+eval:
+  benchmark: mlvu
+  output_dir: ${paths.outputs_root}/results/mlvu
