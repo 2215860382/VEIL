@@ -18,6 +18,10 @@ class SampledVideo:
     timestamps: List[float]    # seconds from video start, one per frame
     fps_native: float
     duration: float
+    # Sampling parameters (what was requested, not native video properties)
+    target_fps: float = 1.0
+    target_max_frames: int = 256
+    target_resolution: int = 448
 
 
 def _resize_and_crop(frame_rgb: np.ndarray, resolution: int) -> np.ndarray:
@@ -73,6 +77,9 @@ def sample_frames(
         timestamps=timestamps,
         fps_native=fps_native,
         duration=duration,
+        target_fps=fps,
+        target_max_frames=max_frames,
+        target_resolution=resolution,
     )
 
 

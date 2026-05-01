@@ -149,7 +149,9 @@ def build_memory_bank(
         duration=sampled.duration,
         chunk_size=chunk_size,
         stride=stride,
-        fps=sampled.fps_native,
+        fps=sampled.target_fps,
+        max_frames=sampled.target_max_frames,
+        resolution=sampled.target_resolution,
         chunks=chunks,
     )
 
