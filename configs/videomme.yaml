@@ -1,14 +1,14 @@
-# Video-MME config — placeholder, to fill once data is staged.
-
 inherit: base.yaml
 
 benchmark:
   name: videomme
-  split: test
-  data_root: /home/Dataset/VideoMME            # to be confirmed
-  parquet_path: null
-  video_dir: null
-  subtitle_dir: null
+  parquet_path: /home2/ycj/Datas/VideoMME/videomme/test-00000-of-00001.parquet
+  video_dir: /home2/ycj/Datas/VideoMME/videos
+  duration_groups:        # null = all; ["long"] for long-only
+    - long
+
+memory:
+  cache_dir: ${paths.outputs_root}/memory/videomme
 
 eval:
   benchmark: videomme

@@ -64,6 +64,10 @@ def load_mlvu(
             entries = json.load(f)
 
         for i, entry in enumerate(entries):
+            # sub_scene and summary are open-ended (no candidates) — skip for MCQ eval.
+            if "candidates" not in entry:
+                continue
+
             video_filename = entry["video"]
             video_path = _video_path(video_dir, video_subfolder, video_filename)
             video_id = Path(video_filename).stem

@@ -4,6 +4,9 @@ Resumable. Writes per-(sample, pipeline) records to outputs/results/mlvu/stage1.
 as soon as they finish, so a crash/reboot at most loses one in-flight inference.
 On rerun, already-recorded (sample × pipeline) combos are skipped.
 
+All pipelines share the SAME pre-sampled frame set (fps / max_frames / resolution from
+frame_sampling config), ensuring fair comparison.
+
 Usage:
     PYTHONPATH=. python scripts/stage1.py --per-task 10
 """
@@ -25,6 +28,7 @@ from data.load_mlvu import load_mlvu, unique_videos
 from eval.compute_accuracy import compute_accuracy
 from eval.parse_answer import candidate_text_for_letter, parse_letter
 from memory.build_memory import build_memory_bank, memory_bank_path
+from memory.sample_frames import SampledVideo, sample_frames
 from memory.schema import MemoryBank
 from models.embedder import BGEM3Embedder
 from models.llm_client import LLMClient
@@ -77,19 +81,32 @@ def main():
     ap.add_argument("--out", default="outputs/results/mlvu/stage1.jsonl")
     ap.add_argument("--pipelines", nargs="+", default=list(PIPELINES))
     ap.add_argument("--task-types", nargs="*", default=None)
+    ap.add_argument("--min-duration", type=float, default=None,
+                    help="Only include videos longer than this many seconds.")
+    ap.add_argument("--max-duration", type=float, default=None,
+                    help="Exclude videos longer than this many seconds.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     bench = cfg["benchmark"]
     task_types = args.task_types or bench["task_types"]
+    fs_cfg = cfg["frame_sampling"]          # fps / max_frames / resolution
+    mem_cfg = cfg["memory"]                  # chunk_size / stride
+    dv_cfg = cfg.get("direct_video_qa", {}) # max_new_tokens
 
-    # Sample selection: first N from each task.
+    # Sample selection.
     all_samples = []
     for task in task_types:
         ss = load_mlvu(
             bench["json_dir"], bench["video_dir"], bench["json_files"],
             task_types=[task],
         )
+        if args.min_duration is not None:
+            ss = [s for s in ss if s.duration >= args.min_duration]
+        if args.max_duration is not None:
+            ss = [s for s in ss if s.duration <= args.max_duration]
+        if args.min_duration is not None or args.max_duration is not None:
+            ss.sort(key=lambda s: s.duration, reverse=True)
         all_samples.extend(ss[: args.per_task])
     log.info("selected %d samples across %d tasks", len(all_samples), len(task_types))
 
@@ -100,7 +117,7 @@ def main():
     log.info("resume: %d records already on disk", len(done_keys))
 
     # Plan work.
-    todo = []  # list of (sample, pipeline)
+    todo = []
     for s in all_samples:
         for p in args.pipelines:
             if sample_key(s, p) not in done_keys:
@@ -114,7 +131,7 @@ def main():
     needs_vlm = any(p in args.pipelines for p in ("direct", "naive_rag", "veil"))
     needs_llm = "veil" in args.pipelines
     needs_retr = any(p in args.pipelines for p in ("naive_rag", "veil"))
-    cache_dir = Path(cfg["memory"]["cache_dir"])
+    cache_dir = Path(mem_cfg["cache_dir"])
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # ----- Stage A: VLM + memory bank build -----
@@ -130,16 +147,34 @@ def main():
         vlm = VLMClient(**cfg["models"]["vlm"])
         log.info("  VLM ready (%.1fs)", time.time() - t0)
 
+    # Lazy frame cache: keyed by video_id.
+    _frame_cache: dict[str, SampledVideo] = {}
+
+    def get_frames(video_path: str, video_id: str) -> SampledVideo:
+        if video_id not in _frame_cache:
+            log.info("sampling frames: %s", video_id)
+            _frame_cache[video_id] = sample_frames(
+                video_path,
+                fps=fs_cfg["fps"],
+                max_frames=fs_cfg["max_frames"],
+                resolution=fs_cfg["resolution"],
+            )
+            sv = _frame_cache[video_id]
+            log.info("  %d frames, %.1fs duration", len(sv.frames), sv.duration)
+        return _frame_cache[video_id]
+
     # Build banks for missing videos.
     for sv in missing_banks:
         log.info("building memory: %s", sv.video_id)
         t0 = time.time()
         try:
+            sampled = get_frames(sv.video_path, sv.video_id)
             bank = build_memory_bank(
-                video_path=sv.video_path, video_id=sv.video_id, vlm=vlm,
-                segment_seconds=cfg["memory"]["segment_seconds"],
-                fps_per_segment=cfg["memory"]["fps_per_segment"],
-                max_frames_per_segment=cfg["memory"]["max_frames_per_segment"],
+                sampled=sampled,
+                video_id=sv.video_id,
+                vlm=vlm,
+                chunk_size=mem_cfg.get("chunk_size", 8),
+                stride=mem_cfg.get("stride", 4),
                 progress=False,
             )
             bank.save(memory_bank_path(cache_dir, sv.video_id))
@@ -170,6 +205,7 @@ def main():
 
     # ----- Stage C: run pipelines -----
     bank_cache: dict[str, MemoryBank] = {}
+
     def get_bank(vid: str) -> MemoryBank | None:
         if vid in bank_cache:
             return bank_cache[vid]
@@ -186,9 +222,13 @@ def main():
         out, err = {}, None
         try:
             if pipeline == "direct":
+                sampled = get_frames(s.video_path, s.video_id)
                 out = run_direct_video_qa(
-                    s.video_path, s.question, s.candidates, vlm,
-                    fps=0.5, max_pixels=128 * 28 * 28, max_new_tokens=128,
+                    frames=sampled.frames,
+                    question=s.question,
+                    candidates=s.candidates,
+                    vlm=vlm,
+                    max_new_tokens=dv_cfg.get("max_new_tokens", 192),
                 )
             else:
                 bank = get_bank(s.video_id)
@@ -241,7 +281,7 @@ def main():
 
 def report(jsonl_path: Path, samples: list, pipelines: list, task_types: list) -> None:
     """Read jsonl and print accuracy table per (task, pipeline)."""
-    by = defaultdict(list)  # (task, pipeline) -> [records]
+    by = defaultdict(list)
     if not jsonl_path.exists():
         log.warning("no records to report")
         return
@@ -256,7 +296,7 @@ def report(jsonl_path: Path, samples: list, pipelines: list, task_types: list) -
     header = f"{'task':<20s} | " + " | ".join(f"{p:>12s}" for p in pipelines)
     print(header)
     print("-" * len(header))
-    overall = {p: [0, 0] for p in pipelines}  # pipeline -> [correct, total]
+    overall = {p: [0, 0] for p in pipelines}
     for task in task_types:
         cells = []
         for p in pipelines:

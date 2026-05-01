@@ -8,7 +8,7 @@ benchmark:
   split: dev                   # dev | test
   json_dir: /home/Dataset/Dataset/MLVU/MLVU/json
   video_dir: /home/Dataset/Dataset/MLVU/MLVU/video
-  # MLVU-Dev has 9 task types; question_type field in JSON matches folder names below.
+  # MLVU-Dev MCQ tasks (7). sub_scene and summary are open-ended — excluded from MCQ eval.
   task_types:
     - plotQA
     - needle
@@ -17,8 +17,6 @@ benchmark:
     - order
     - anomaly_reco
     - topic_reasoning
-    - sub_scene
-    - summary
   # Map json filename -> question_type
   json_files:
     plotQA: 1_plotQA.json
@@ -28,8 +26,8 @@ benchmark:
     order: 5_order.json
     anomaly_reco: 6_anomaly_reco.json
     topic_reasoning: 7_topic_reasoning.json
-    sub_scene: 8_sub_scene.json
-    summary: 9_summary.json
+    sub_scene: 8_sub_scene.json    # open-ended, skipped in MCQ loader
+    summary: 9_summary.json        # open-ended, skipped in MCQ loader
 
 memory:
   cache_dir: ${paths.outputs_root}/memory/mlvu

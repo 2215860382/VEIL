@@ -1,9 +1,9 @@
-"""Memory chunk schema. One row per fixed-time-window video segment."""
+"""Memory chunk schema. One row per sliding-window chunk of pre-sampled frames."""
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -29,8 +29,15 @@ class MemoryChunk(BaseModel):
 class MemoryBank(BaseModel):
     video_id: str
     duration: float
-    segment_seconds: float
     chunks: List[MemoryChunk]
+    # Sampling provenance (set on build; None for legacy banks).
+    chunk_size: Optional[int] = None
+    stride: Optional[int] = None
+    fps: Optional[float] = None
+    max_frames: Optional[int] = None
+    resolution: Optional[int] = None
+    # Legacy field from old time-based segmenter; kept for loading old banks.
+    segment_seconds: Optional[float] = None
 
     def save(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)

@@ -11,11 +11,11 @@ import argparse
 import sys
 from pathlib import Path
 
-# Ensure local package import works when run as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.load_mlvu import load_mlvu, unique_videos
 from memory.build_memory import build_memory_bank, memory_bank_path
+from memory.sample_frames import sample_frames
 from memory.schema import MemoryBank
 from models.vlm_client import VLMClient
 from utils.config import load_config
@@ -43,6 +43,9 @@ def main():
     cache_dir = Path(cfg["memory"]["cache_dir"])
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    fs_cfg = cfg["frame_sampling"]
+    mem_cfg = cfg["memory"]
+
     samples = load_mlvu(
         json_dir=bench["json_dir"],
         video_dir=bench["video_dir"],
@@ -53,7 +56,6 @@ def main():
     videos = unique_videos(samples)
     log.info("Found %d unique videos across %s", len(videos), task_types or "all")
 
-    # Lazy-load VLM only if there's work to do.
     pending = []
     for s in videos:
         out = memory_bank_path(cache_dir, s.video_id)
@@ -68,16 +70,21 @@ def main():
     log.info("Loading VLM %s", cfg["models"]["vlm"]["model_path"])
     vlm = VLMClient(**cfg["models"]["vlm"])
 
-    mem_cfg = cfg["memory"]
     for s, out in pending:
         log.info("Building memory: %s (%s)", s.video_id, s.video_path)
+        sampled = sample_frames(
+            s.video_path,
+            fps=fs_cfg["fps"],
+            max_frames=fs_cfg["max_frames"],
+            resolution=fs_cfg["resolution"],
+        )
+        log.info("  sampled %d frames, %.1fs", len(sampled.frames), sampled.duration)
         bank = build_memory_bank(
-            video_path=s.video_path,
+            sampled=sampled,
             video_id=s.video_id,
             vlm=vlm,
-            segment_seconds=mem_cfg["segment_seconds"],
-            fps_per_segment=mem_cfg["fps_per_segment"],
-            max_frames_per_segment=mem_cfg["max_frames_per_segment"],
+            chunk_size=mem_cfg.get("chunk_size", 8),
+            stride=mem_cfg.get("stride", 4),
         )
         bank.save(out)
         log.info("  → %s (%d chunks)", out, len(bank.chunks))

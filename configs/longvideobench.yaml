@@ -1,0 +1,15 @@
+inherit: base.yaml
+
+benchmark:
+  name: longvideobench
+  json_path: /home/Dataset/jdata/longvideobench/lvb_val.json
+  video_dir: /home2/ycj/Datas/LongVideoBench/videos/videos
+  duration_groups:        # 60min+ bucket only; null = all
+    - 3600
+
+memory:
+  cache_dir: ${paths.outputs_root}/memory/longvideobench
+
+eval:
+  benchmark: longvideobench
+  output_dir: ${paths.outputs_root}/results/longvideobench

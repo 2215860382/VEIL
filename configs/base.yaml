@@ -2,43 +2,54 @@
 # Override per-benchmark in mlvu.yaml / videomme.yaml.
 
 paths:
-  models_root: /home/Dataset/Models
+  models_root: /home2/ycj/Models
   outputs_root: /home2/ycj/Project/VEIL/outputs
 
 models:
   vlm:
-    model_path: /home/Dataset/Models/Qwen/Qwen3-VL-8B-Instruct
+    model_path: /home2/ycj/Models/Qwen/Qwen3-VL-8B-Instruct
     dtype: bfloat16
     device: cuda:0
     attn_impl: sdpa            # sdpa | flash_attention_2 | eager
     max_new_tokens: 512
   llm:
-    model_path: /home/Dataset/Models/Qwen/Qwen3-8B
+    model_path: /home2/ycj/Models/Qwen/Qwen3-8B
     dtype: bfloat16
     device: cuda:1
     attn_impl: sdpa
     enable_thinking: false
     max_new_tokens: 512
     # Switch to MoE Instruct-2507 for stronger planner/verifier:
-    # model_path: /home/Dataset/Models/Qwen/Qwen3-30B-A3B-Instruct-2507
+    # model_path: /home2/ycj/Models/Qwen/Qwen3-30B-A3B-Instruct-2507
   embedder:
-    model_path: /home/Dataset/Models/BAAI/bge-m3
+    model_path: /home2/ycj/Models/BAAI/bge-m3
     use_fp16: true
     device: cuda:2
     batch_size: 32
     max_length: 512
   reranker:
-    model_path: /home/Dataset/Models/BAAI/bge-reranker-v2-m3
+    model_path: /home2/ycj/Models/BAAI/bge-reranker-v2-m3
     use_fp16: true
     device: cuda:2
     batch_size: 16
     max_length: 512
 
+# ── Unified frame sampling (shared by ALL methods) ───────────────────────────
+# All pipelines operate on the same pre-sampled frame set for fair comparison.
+frame_sampling:
+  fps: 1                       # target fps before global cap
+  max_frames: 256              # global cap; long videos are uniformly subsampled to this
+  resolution: 448              # resize shorter side to this (square crop → 448×448)
+
+# ── Memory / chunk settings ───────────────────────────────────────────────────
 memory:
-  segment_seconds: 16          # window length for memory chunks
-  fps_per_segment: 1.0         # frames sampled per second within a segment
-  max_frames_per_segment: 8    # hard cap for VLM input
-  prompt_template: default     # see veil/memory/build_memory.py
+  chunk_size: 8                # frames per chunk (VLM sees this many frames at once)
+  stride: 4                    # sliding window stride (overlap = chunk_size - stride = 4)
+  prompt_template: default     # see memory/build_memory.py
+
+# ── Direct VideoQA baseline ───────────────────────────────────────────────────
+direct_video_qa:
+  max_new_tokens: 192          # uses the shared frame_sampling settings above
 
 retrieval:
   coarse_top_k: 50             # BGE-M3 dense top-k
