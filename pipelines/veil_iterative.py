@@ -1,4 +1,4 @@
-"""VEIL: planner → retrieve+rerank → verifier → iterate → answerer."""
+"""VEIL: planner → retrieve+rerank → verifier → iterate → Qwen3-8B answerer."""
 from __future__ import annotations
 
 from typing import List
@@ -6,7 +6,7 @@ from typing import List
 import numpy as np
 
 from memory.schema import MemoryBank
-from reasoning.answerer import VLAnswerer
+from reasoning.answerer import TextAnswerer
 from reasoning.planner import Planner
 from reasoning.verifier import Verifier
 
@@ -45,29 +45,24 @@ def run_veil(
     verifier: Verifier,
     embedder,
     reranker,
-    answerer: VLAnswerer,
+    llm_answerer: TextAnswerer,
     coarse_top_k: int = 50,
     rerank_top_k: int = 10,
     max_iter: int = 3,
     final_evidence_cap: int = 15,
 ) -> dict:
     texts = bank.memory_texts()
-    trace = {
-        "queries": [],
-        "iterations": [],
-    }
+    trace = {"queries": [], "iterations": []}
     if not texts:
         return {"answer": "", "evidence": [], "rationale": "no memory chunks",
                 "evidence_texts": [], "evidence_chunk_ids": [], "trace": trace}
 
-    # Planner: initial query.
     plan = planner.plan(question, candidates)
     query = plan.get("search_query") or question
     trace["queries"].append(query)
     trace["plan"] = plan
 
     accumulated_idx: List[int] = []
-    last_decision = None
     for it in range(max_iter):
         retrieved_idx, _ = _retrieve_once(query, texts, embedder, reranker, coarse_top_k, rerank_top_k)
         new_idx = [i for i in retrieved_idx if i not in accumulated_idx]
@@ -75,7 +70,6 @@ def run_veil(
         evidence_texts = [texts[i] for i in accumulated_idx]
 
         decision = verifier.verify(question, candidates, evidence_texts)
-        last_decision = decision
         trace["iterations"].append({
             "iter": it,
             "query": query,
@@ -86,18 +80,14 @@ def run_veil(
         if decision.get("is_sufficient"):
             break
         next_q = decision.get("next_query", "").strip()
-        if not next_q or next_q == query:
-            break
-        # Stop early if iteration adds no fresh evidence.
-        if not new_idx:
+        if not next_q or next_q == query or not new_idx:
             break
         query = next_q
         trace["queries"].append(query)
 
-    # Final answer.
     evidence_texts = [texts[i] for i in accumulated_idx]
     evidence_chunk_ids = [bank.chunks[i].chunk_id for i in accumulated_idx]
-    result = answerer.answer(question, candidates, evidence_texts, evidence_frames=())
+    result = llm_answerer.answer(question, candidates, evidence_texts)
     result["evidence_texts"] = evidence_texts
     result["evidence_chunk_ids"] = evidence_chunk_ids
     result["trace"] = trace
