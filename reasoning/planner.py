@@ -1,42 +1,84 @@
-"""Planner — turn (question, options) into an initial retrieval query."""
+"""Planner — generate a retrieval query from question + optional missing-evidence analysis.
+
+First call  (missing_analysis=None) : generate initial query AND rubric.
+Repair call (missing_analysis given): generate a focused repair query targeting the gap.
+"""
 from __future__ import annotations
 
-from typing import List
+from typing import Dict, List, Optional
 
-from utils.jsonx import as_list, as_str, extract_json
+from utils.jsonx import as_str, extract_json
 
-PLANNER_SYS = """You design retrieval queries for video evidence search.
-Given a question and its multiple-choice options, write a SHORT search query that would retrieve
-the most relevant video segments to answer it. Also describe what kind of evidence would settle the question.
+PLANNER_SYS = """You generate targeted video search queries for evidence retrieval.
 
-Return ONLY a strict JSON object with these keys:
-- "search_query": one concise English query (<= 20 words), no quotes inside.
-- "target_evidence": one sentence describing what evidence in the video would answer the question.
-- "expected_video_clues": list of 2-4 short clue phrases (visible objects, actions, scenes, OCR text).
+You receive a question, answer options, and — on repair calls — a Missing Evidence Analysis
+describing the type and description of evidence that has not yet been found.
+
+## First call (no missing evidence)
+Generate:
+  - "query":  a concise search query (≤ 20 words) to find the most relevant video segments.
+  - "rubric": one sentence stating the concrete criteria that define sufficient evidence
+              for this specific question (e.g. "Evidence must show the exact count of red
+              objects in the final scene").
+
+## Repair call (missing evidence provided)
+Generate:
+  - "query":  a NEW query (≤ 20 words) that directly targets the missing evidence type
+              and description. Avoid repeating the previous query.
+  - "rubric": empty string — the original rubric is reused.
+
+Return ONLY a strict JSON object, no prose, no markdown fences:
+{"query": "...", "rubric": "..."}
 """
-
-
-def _normalize_plan(raw: dict) -> dict:
-    return {
-        "search_query":         as_str(raw.get("search_query", "")),
-        "target_evidence":      as_str(raw.get("target_evidence", "")),
-        "expected_video_clues": as_list(raw.get("expected_video_clues", [])),
-    }
 
 
 class Planner:
     def __init__(self, llm):
         self.llm = llm
 
-    def plan(self, question: str, candidates: List[str]) -> dict:
+    def plan(
+        self,
+        question: str,
+        candidates: List[str],
+        missing_analysis: Optional[Dict] = None,
+    ) -> Dict:
+        """Generate a retrieval query.
+
+        Args:
+            question:         The question text.
+            candidates:       Answer option strings.
+            missing_analysis: None on first call; dict with "type" and "description"
+                              on repair calls (from Verifier output).
+
+        Returns:
+            {"query": str, "rubric": str}
+        """
         opts = "\n".join(f"  ({chr(ord('A')+i)}) {c}" for i, c in enumerate(candidates))
-        user = f"Question: {question}\nOptions:\n{opts}\n\nReturn the JSON now."
+
+        if missing_analysis:
+            gap_type = missing_analysis.get("type", "")
+            gap_desc = missing_analysis.get("description", "")
+            missing_block = (
+                f"\nMissing Evidence Analysis:\n"
+                f"  type: {gap_type}\n"
+                f"  description: {gap_desc}\n"
+            )
+        else:
+            missing_block = ""
+
+        user = (
+            f"Question: {question}\n"
+            f"Options:\n{opts}"
+            f"{missing_block}\n"
+            "Return the JSON now."
+        )
         messages = [
             {"role": "system", "content": PLANNER_SYS},
-            {"role": "user", "content": user},
+            {"role": "user",   "content": user},
         ]
-        raw = self.llm.chat(messages, max_new_tokens=256, enable_thinking=False)
-        plan = _normalize_plan(extract_json(raw))
-        if not plan["search_query"]:
-            plan["search_query"] = question  # fallback
-        return plan
+        raw = self.llm.chat(messages, max_new_tokens=128, enable_thinking=False)
+        parsed = extract_json(raw)
+        return {
+            "query":  as_str(parsed.get("query",  "")) or question,
+            "rubric": as_str(parsed.get("rubric", "")),
+        }
