@@ -17,7 +17,6 @@ import sys
 import time
 from pathlib import Path
 
-# Reduce fragmentation OOM risk on shared GPUs.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -25,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data.load_mlvu import load_mlvu
 from eval.parse_answer import candidate_text_for_letter, parse_letter
 from memory.build_memory import build_memory_bank, memory_bank_path
+from memory.sample_frames import sample_frames
 from memory.schema import MemoryBank
 from models.embedder import BGEM3Embedder
 from models.llm_client import LLMClient
@@ -60,6 +60,7 @@ def main():
 
     cfg = load_config(args.config)
     b = cfg["benchmark"]
+    fs_cfg = cfg["frame_sampling"]
 
     samples = load_mlvu(
         b["json_dir"], b["video_dir"], b["json_files"],
@@ -72,14 +73,10 @@ def main():
     log.info("Q: %s", s.question)
     log.info("opts: %s | gold: %s", s.candidates, s.answer)
 
-    # Smoke-test overrides — spread across GPUs, lighter sampling.
     cfg["models"]["vlm"]["device"] = args.vlm_gpu
     cfg["models"]["llm"]["device"] = args.llm_gpu
     cfg["models"]["embedder"]["device"] = args.bge_gpu
     cfg["models"]["reranker"]["device"] = args.bge_gpu
-    cfg["memory"]["segment_seconds"] = 32
-    cfg["memory"]["fps_per_segment"] = 0.5
-    cfg["memory"]["max_frames_per_segment"] = 4
     log.info("device assignment: vlm=%s llm=%s bge=%s",
              args.vlm_gpu, args.llm_gpu, args.bge_gpu)
 
@@ -87,7 +84,15 @@ def main():
     cache_dir.mkdir(parents=True, exist_ok=True)
     bank_path = memory_bank_path(cache_dir, s.video_id)
 
-    # ---- Stage 1: load VLM, build (or load) memory bank ----
+    # ---- Stage 1: sample frames (shared by all pipelines) ----
+    log.info("sampling frames: fps=%.1f max=%d res=%d",
+             fs_cfg["fps"], fs_cfg["max_frames"], fs_cfg["resolution"])
+    t0 = time.time()
+    # Smoke test: cap at 32 frames to keep build fast
+    sampled = sample_frames(s.video_path, fps=fs_cfg["fps"], max_frames=32, resolution=fs_cfg["resolution"])
+    log.info("  %d frames, %.1fs duration (%.1fs)", len(sampled.frames), sampled.duration, time.time() - t0)
+
+    # ---- Stage 2: load VLM, build (or load) memory bank ----
     t0 = time.time()
     log.info("loading VLM ...")
     vlm = VLMClient(**cfg["models"]["vlm"])
@@ -99,29 +104,34 @@ def main():
     else:
         log.info("building memory bank for %s ...", s.video_id)
         t0 = time.time()
+        mem_cfg = cfg["memory"]
         bank = build_memory_bank(
-            video_path=s.video_path, video_id=s.video_id, vlm=vlm,
-            segment_seconds=cfg["memory"]["segment_seconds"],
-            fps_per_segment=cfg["memory"]["fps_per_segment"],
-            max_frames_per_segment=cfg["memory"]["max_frames_per_segment"],
+            sampled=sampled,
+            video_id=s.video_id,
+            vlm=vlm,
+            chunk_size=mem_cfg.get("chunk_size", 8),
+            stride=mem_cfg.get("stride", 4),
             progress=True,
         )
         bank.save(bank_path)
         log.info("  %d chunks built in %.1fs → %s", len(bank.chunks), time.time() - t0, bank_path)
     log.info("first chunk preview: %s", bank.chunks[0].memory_text[:300])
 
-    # ---- Stage 2: Direct VideoQA baseline ----
+    # ---- Stage 3: Direct VideoQA baseline ----
     log.info("=== Pipeline: Direct Video QA ===")
     t0 = time.time()
     out_d = run_direct_video_qa(
-        s.video_path, s.question, s.candidates, vlm,
-        fps=0.5, max_pixels=128 * 28 * 28, max_new_tokens=128,
+        frames=sampled.frames,
+        question=s.question,
+        candidates=s.candidates,
+        vlm=vlm,
+        max_new_tokens=128,
     )
     print(out_d["raw"][:400])
     letter_d = parse_letter(out_d["raw"], len(s.candidates))
     print(_summary_line("direct", letter_d, s.answer, s.candidates, time.time() - t0))
 
-    # ---- Stage 3: BGE retrieval ----
+    # ---- Stage 4: BGE retrieval ----
     log.info("loading BGE embedder + reranker ...")
     embedder = BGEM3Embedder(**cfg["models"]["embedder"])
     reranker = BGEReranker(**cfg["models"]["reranker"])
@@ -139,7 +149,7 @@ def main():
     print(_summary_line("naive_rag", letter_n, s.answer, s.candidates, time.time() - t0,
                         extra=f"chunks={out_n.get('evidence_chunk_ids', [])}"))
 
-    # ---- Stage 4: VEIL iterative ----
+    # ---- Stage 5: VEIL iterative ----
     log.info("loading LLM (Qwen3-8B) ...")
     llm = LLMClient(**cfg["models"]["llm"])
     planner = Planner(llm); verifier = Verifier(llm)

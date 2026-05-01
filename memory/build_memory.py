@@ -1,8 +1,10 @@
 """Build a memory bank for one video with Qwen3-VL.
 
-For each VideoSegment we ask the VLM to emit a compact, retrieval-oriented description:
-visual caption + main events + objects/persons/actions + OCR. Then collapse them into
-`memory_text` (the canonical retrieval target).
+Accepts a SampledVideo (pre-decoded, uniformly sampled, pre-cropped frames)
+and applies a sliding window: each window of `chunk_size` consecutive frames
+is captioned by the VLM, producing one MemoryChunk per window.
+
+This guarantees the same fps / max_frames / resolution as the direct-VQA baseline.
 """
 from __future__ import annotations
 
@@ -12,16 +14,16 @@ from typing import List
 
 from tqdm import tqdm
 
+from .sample_frames import SampledVideo, sliding_windows
 from .schema import MemoryBank, MemoryChunk
-from .segment_video import VideoSegment, segment_video, video_duration
 
-DEFAULT_PROMPT = """You are a careful video segment analyst.
-You are shown {n_frames} frames sampled from a {seg_seconds:.0f}-second video segment (timestamp {t0:.0f}s - {t1:.0f}s of the source video).
+DEFAULT_PROMPT = """You are a careful video analyst.
+You are shown {n_frames} frames sampled from timestamps {t0:.0f}s - {t1:.0f}s of the video.
 
 Describe ONLY what is visible in these frames. Do not speculate beyond what you see.
 Return a strict JSON object with these keys:
 - "visual_caption": 1-2 sentences capturing the visible scene (setting, who, doing what).
-- "event_summary":  1 sentence summarizing the key event(s) of this segment.
+- "event_summary":  1 sentence summarizing the key event(s) of this window.
 - "objects":        list of salient inanimate objects (concise nouns).
 - "persons":        list of people / characters by short descriptor (e.g. "a boy in red").
 - "actions":        list of verbs/short phrases describing observed actions.
@@ -32,7 +34,6 @@ Return ONLY the JSON, no prose, no markdown fences.
 
 
 def _as_str(v) -> str:
-    """Coerce arbitrary JSON value to a string. Lists are joined with '; '."""
     if v is None:
         return ""
     if isinstance(v, str):
@@ -43,7 +44,6 @@ def _as_str(v) -> str:
 
 
 def _as_list(v) -> list:
-    """Coerce arbitrary JSON value to a list[str]."""
     if v is None or v == "":
         return []
     if isinstance(v, list):
@@ -70,7 +70,6 @@ def _make_memory_text(c: dict, t0: float, t1: float) -> str:
 
 
 def _safe_json(text: str) -> dict:
-    """Best-effort JSON extraction. Returns dict with normalized types."""
     s = text.strip()
     if s.startswith("```"):
         s = s.strip("`")
@@ -96,46 +95,63 @@ def _safe_json(text: str) -> dict:
 
 
 def build_memory_bank(
-    video_path: str,
+    sampled: SampledVideo,
     video_id: str,
-    vlm,                                    # veil.reasoning.vlm_client.VLMClient
-    segment_seconds: float = 16.0,
-    fps_per_segment: float = 1.0,
-    max_frames_per_segment: int = 8,
+    vlm,
+    chunk_size: int = 8,
+    stride: int = 4,
     prompt_template: str = DEFAULT_PROMPT,
     progress: bool = True,
 ) -> MemoryBank:
-    """Run VLM over each segment and assemble a MemoryBank."""
-    segments: List[VideoSegment] = segment_video(
-        video_path,
-        segment_seconds=segment_seconds,
-        fps_per_segment=fps_per_segment,
-        max_frames_per_segment=max_frames_per_segment,
-    )
-    duration = video_duration(video_path)
+    """Caption each sliding window of `chunk_size` frames and assemble a MemoryBank.
 
+    Args:
+        sampled:    Pre-sampled video from sample_frames().
+        video_id:   Unique video identifier (used for chunk labels).
+        vlm:        VLMClient with chat_with_frames().
+        chunk_size: Number of frames per VLM call.
+        stride:     Hop size between windows (overlap = chunk_size - stride).
+        progress:   Show tqdm bar.
+    """
+    frames = sampled.frames
+    timestamps = sampled.timestamps
+    n = len(frames)
+
+    windows = list(sliding_windows(n, chunk_size, stride))
     chunks: List[MemoryChunk] = []
-    iterator = tqdm(segments, desc=f"build_memory[{video_id}]") if progress else segments
-    for seg in iterator:
-        prompt = prompt_template.format(n_frames=len(seg.frames), seg_seconds=seg.end_time - seg.start_time, t0=seg.start_time, t1=seg.end_time)
-        raw = vlm.chat_with_frames(seg.frames, prompt, max_new_tokens=384)
+    iterator = tqdm(windows, desc=f"build_memory[{video_id}]") if progress else windows
+
+    for chunk_id, (start, end) in enumerate(iterator):
+        win_frames = frames[start:end]
+        t0 = timestamps[start]
+        t1 = timestamps[end - 1]
+        prompt = prompt_template.format(n_frames=len(win_frames), t0=t0, t1=t1)
+        raw = vlm.chat_with_frames(win_frames, prompt, max_new_tokens=384)
         parsed = _safe_json(raw)
         chunks.append(
             MemoryChunk(
                 video_id=video_id,
-                chunk_id=seg.chunk_id,
-                start_time=seg.start_time,
-                end_time=seg.end_time,
+                chunk_id=chunk_id,
+                start_time=t0,
+                end_time=t1,
                 visual_caption=parsed.get("visual_caption", ""),
                 event_summary=parsed.get("event_summary", ""),
                 objects=parsed.get("objects", []) or [],
                 persons=parsed.get("persons", []) or [],
                 actions=parsed.get("actions", []) or [],
                 ocr=parsed.get("ocr", "") or "",
-                memory_text=_make_memory_text(parsed, seg.start_time, seg.end_time),
+                memory_text=_make_memory_text(parsed, t0, t1),
             )
         )
-    return MemoryBank(video_id=video_id, duration=duration, segment_seconds=segment_seconds, chunks=chunks)
+
+    return MemoryBank(
+        video_id=video_id,
+        duration=sampled.duration,
+        chunk_size=chunk_size,
+        stride=stride,
+        fps=sampled.fps_native,
+        chunks=chunks,
+    )
 
 
 def memory_bank_path(cache_dir: str | Path, video_id: str) -> Path:

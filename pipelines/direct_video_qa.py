@@ -1,10 +1,11 @@
-"""Baseline 1: feed the full video + question directly to Qwen3-VL.
+"""Baseline 1: feed all pre-sampled frames + question directly to Qwen3-VL.
 
-Knobs: fps, max_pixels — tweak in configs/*.yaml under `direct_video_qa`.
+Frames are supplied by the caller (pre-sampled via memory.sample_frames.sample_frames),
+guaranteeing the same fps / max_frames / resolution as the memory-bank pipeline.
 """
 from __future__ import annotations
 
-from typing import List
+from typing import List, Sequence
 
 
 PROMPT_TEMPLATE = """You are watching a long video.
@@ -23,14 +24,21 @@ def _format_options(candidates: List[str]) -> str:
 
 
 def run_direct_video_qa(
-    video_path: str,
+    frames: Sequence,
     question: str,
     candidates: List[str],
     vlm,
-    fps: float = 1.0,
-    max_pixels: int = 360 * 420,
     max_new_tokens: int = 192,
 ) -> dict:
+    """Answer a multiple-choice question by showing all frames to the VLM.
+
+    Args:
+        frames:         Pre-sampled frames (np.ndarray or PIL), already at target resolution.
+        question:       Question text.
+        candidates:     List of answer option strings.
+        vlm:            VLMClient instance.
+        max_new_tokens: Generation budget.
+    """
     prompt = PROMPT_TEMPLATE.format(question=question, options=_format_options(candidates))
-    raw = vlm.chat_with_video(video_path, prompt, max_new_tokens=max_new_tokens, fps=fps, max_pixels=max_pixels)
+    raw = vlm.chat_with_frames(frames, prompt, max_new_tokens=max_new_tokens)
     return {"raw": raw, "evidence_texts": [], "evidence_chunk_ids": []}

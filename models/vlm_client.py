@@ -18,12 +18,19 @@ from PIL import Image
 _DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32, "auto": "auto"}
 
 
-def _to_pil(frame) -> Image.Image:
+def _to_pil(frame, max_pixels: int | None = None) -> Image.Image:
     if isinstance(frame, Image.Image):
-        return frame
-    if isinstance(frame, np.ndarray):
-        return Image.fromarray(frame)
-    raise TypeError(f"Unsupported frame type: {type(frame)}")
+        img = frame
+    elif isinstance(frame, np.ndarray):
+        img = Image.fromarray(frame)
+    else:
+        raise TypeError(f"Unsupported frame type: {type(frame)}")
+    if max_pixels is not None:
+        w, h = img.size
+        if w * h > max_pixels:
+            scale = (max_pixels / (w * h)) ** 0.5
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR)
+    return img
 
 
 class VLMClient:
@@ -57,9 +64,10 @@ class VLMClient:
         prompt: str,
         max_new_tokens: int | None = None,
         temperature: float = 0.0,
+        max_pixels: int | None = None,
     ) -> str:
         """Multi-image chat. `frames` is a sequence of np arrays or PIL images."""
-        pil_frames = [_to_pil(f) for f in frames]
+        pil_frames = [_to_pil(f, max_pixels=max_pixels) for f in frames]
         content = [{"type": "image", "image": img} for img in pil_frames]
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
