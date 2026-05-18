@@ -1,0 +1,55 @@
+# videomme_memory_bank — Video-MME-L + 预建 memory bank（BGE / reranker / VEIL）。
+# 跑哪条管线：experiments/run_experiments.py --pipelines …
+# 建库：python -m memory.build_similarity_memory --benchmark videomme --vlm-model … --siglip-model …
+
+paths:
+  models_root: /home2/ycj/Models
+  outputs_root: /home2/ycj/Project/VEIL/outputs
+
+models:
+  vlm:
+    model_path: /home2/ycj/Models/Qwen/Qwen3-VL-8B-Instruct
+  llm:
+    model_path: /home2/ycj/Models/Qwen/Qwen3-8B
+    dtype: bfloat16
+    device: cuda:1
+    attn_impl: sdpa
+    enable_thinking: false
+    max_new_tokens: 512
+  embedder:
+    model_path: /home2/ycj/Models/BAAI/bge-m3
+    use_fp16: true
+    device: cuda:2
+    batch_size: 32
+    max_length: 512
+  reranker:
+    model_path: /home2/ycj/Models/BAAI/bge-reranker-v2-m3
+    use_fp16: true
+    device: cuda:2
+    batch_size: 16
+    max_length: 512
+
+retrieval:
+  coarse_top_k: 64
+  rerank_top_k: 8
+
+veil_loop:
+  max_iter: 3
+  dedup_threshold: 0.85
+
+frame_sampling:
+  fps: 1
+  max_frames: 256
+  resolution: 448
+
+benchmark:
+  name: videomme
+  parquet_path: /home2/ycj/Datas/VideoMME/videomme/test-00000-of-00001.parquet
+  video_dir: /home2/ycj/Datas/VideoMME/videos
+  subtitle_dir: /home2/ycj/Datas/VideoMME/subtitle
+  duration_groups:
+    - long
+
+eval:
+  benchmark: videomme
+  output_dir: ${paths.outputs_root}/results/videommeL

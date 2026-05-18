@@ -1,9 +1,10 @@
-"""bge-reranker-v2-m3 cross-encoder reranker.
+"""Rerankers for RAG pipelines.
 
-Implemented directly on top of transformers (AutoModelForSequenceClassification) to avoid
-FlagEmbedding's dependency on the legacy `tokenizer.prepare_for_model` API, which was
-removed in transformers 5.x.
+BGEReranker  : bge-reranker-v2-m3 cross-encoder (transformers)
+LLMReranker  : listwise LLM reranker — asks an LLM to select the top-k most
+               relevant chunks from the coarse candidate set.
 """
+
 from __future__ import annotations
 
 from typing import List, Sequence, Tuple
@@ -58,3 +59,43 @@ class BGEReranker:
         scores = self.score(pairs)
         order = sorted(range(len(scores)), key=lambda i: -scores[i])[:top_k]
         return [(i, scores[i]) for i in order]
+
+
+_LLM_RERANK_SYS = """You are a relevance ranker for a video QA retrieval system.
+Given a question and numbered evidence chunks, return the indices of the most relevant chunks in order of relevance (most relevant first).
+Return ONLY a JSON object: {"selected": [i, j, k, ...]}
+Use only the indices shown. Do not explain."""
+
+
+class LLMReranker:
+    """Listwise reranker: asks an LLM to select the top-k most relevant chunks."""
+
+    def __init__(self, llm):
+        self.llm = llm
+
+    def rerank(self, query: str, candidates: Sequence[str], top_k: int = 8):
+        """Return list of (idx, score) same interface as BGEReranker.rerank."""
+        import json, re
+        n = len(candidates)
+        formatted = "\n".join(f"[{i}] {c}" for i, c in enumerate(candidates))
+        user = (
+            f"Question: {query}\n\n"
+            f"Evidence chunks:\n{formatted}\n\n"
+            f"Select the {min(top_k, n)} most relevant chunk indices."
+        )
+        messages = [
+            {"role": "system", "content": _LLM_RERANK_SYS},
+            {"role": "user",   "content": user},
+        ]
+        raw = self.llm.chat(messages, max_new_tokens=128, enable_thinking=False)
+        m = re.search(r'\{.*?\}', raw, re.DOTALL)
+        if m:
+            try:
+                selected = json.loads(m.group()).get("selected", [])
+                selected = [int(i) for i in selected if 0 <= int(i) < n][:top_k]
+                if selected:
+                    return [(i, 1.0 - rank * 0.01) for rank, i in enumerate(selected)]
+            except Exception:
+                pass
+        # Fallback: return first top_k
+        return [(i, 1.0) for i in range(min(top_k, n))]

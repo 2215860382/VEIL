@@ -1,13 +1,17 @@
-"""Qwen3-VL client — supports frames-list and full video-file modes.
+"""Vision–language model wrapper. Checkpoint comes from ``model_path`` (or API id via ``api_model``).
 
-Frames mode is used by:
-  * memory builder (per-segment frames),
-  * answerer when reading evidence-clip frames.
+**Frames** (``chat_with_frames``): list of images — memory builder, answerer over evidence frames.
 
-Video-file mode is used by Direct Video QA baseline only.
+**Whole video file** (``chat_with_video``): local path; uses ``qwen_vl_utils`` + HF processor stack
+as implemented today (swap implementation if you move to a different VL family).
+
+**API** (``api_url``): JPEG base64 ``image_url`` messages to a vLLM/OpenAI-compatible server.
 """
 from __future__ import annotations
 
+import base64
+import threading
+import io
 from typing import List, Sequence
 
 import numpy as np
@@ -33,6 +37,12 @@ def _to_pil(frame, max_pixels: int | None = None) -> Image.Image:
     return img
 
 
+def _pil_to_b64(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
 class VLMClient:
     def __init__(
         self,
@@ -41,21 +51,40 @@ class VLMClient:
         device: str = "cuda:0",
         attn_impl: str = "sdpa",
         max_new_tokens: int = 512,
+        api_url: str | None = None,
+        api_model: str | None = None,
     ):
-        from transformers import AutoProcessor, AutoModelForImageTextToText
-
         self.model_path = model_path
         self.default_max_new_tokens = max_new_tokens
+        self._api_endpoints: list[str] | None = None
+        self._api_rr = 0
+        self._api_lock = threading.Lock()
+        self._api_model = api_model or model_path
+        self.model = None
+        self.processor = None
 
-        self.processor = AutoProcessor.from_pretrained(model_path)
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            dtype=_DTYPE_MAP.get(dtype, torch.bfloat16),
-            attn_implementation=attn_impl,
-            device_map=device,
-        )
-        self.model.eval()
-        self.device = next(self.model.parameters()).device
+        if api_url:
+            import requests as _req
+            self._requests = _req
+            bases = [b.strip() for b in api_url.split(",") if b.strip()]
+            self._api_endpoints = [b.rstrip("/") + "/v1/chat/completions" for b in bases]
+            if not api_model:
+                try:
+                    r = _req.get(bases[0].rstrip("/") + "/v1/models", timeout=10)
+                    self._api_model = r.json()["data"][0]["id"]
+                except Exception:
+                    self._api_model = model_path
+        else:
+            from transformers import AutoProcessor, AutoModelForImageTextToText
+            self.processor = AutoProcessor.from_pretrained(model_path)
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_path,
+                dtype=_DTYPE_MAP.get(dtype, torch.bfloat16),
+                attn_implementation=attn_impl,
+                device_map=device,
+            )
+            self.model.eval()
+            self.device = next(self.model.parameters()).device
 
     @torch.inference_mode()
     def chat_with_frames(
@@ -65,13 +94,49 @@ class VLMClient:
         max_new_tokens: int | None = None,
         temperature: float = 0.0,
         max_pixels: int | None = None,
+        enable_thinking: bool = False,
     ) -> str:
         """Multi-image chat. `frames` is a sequence of np arrays or PIL images."""
+        if self._api_endpoints:
+            return self._chat_with_frames_api(frames, prompt, max_new_tokens, temperature, max_pixels, enable_thinking)
         pil_frames = [_to_pil(f, max_pixels=max_pixels) for f in frames]
         content = [{"type": "image", "image": img} for img in pil_frames]
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
         return self._generate(messages, max_new_tokens=max_new_tokens, temperature=temperature)
+
+    def _chat_with_frames_api(
+        self,
+        frames: Sequence,
+        prompt: str,
+        max_new_tokens: int | None = None,
+        temperature: float = 0.0,
+        max_pixels: int | None = None,
+        enable_thinking: bool = False,
+    ) -> str:
+        pil_frames = [_to_pil(f, max_pixels=max_pixels) for f in frames]
+        content = [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_pil_to_b64(img)}"}}
+            for img in pil_frames
+        ]
+        content.append({"type": "text", "text": prompt})
+        payload = {
+            "model": self._api_model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": max_new_tokens or self.default_max_new_tokens,
+            "temperature": temperature if temperature > 0 else 0.0,
+            # Qwen3-family models default to thinking-on; disable unless caller opts in.
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
+        }
+        with self._api_lock:
+            ep = self._api_endpoints[self._api_rr % len(self._api_endpoints)]
+            self._api_rr += 1
+        resp = self._requests.post(ep, json=payload, timeout=300)
+        resp.raise_for_status()
+        result = resp.json()["choices"][0]["message"]["content"]
+        if "</think>" in result:
+            result = result.split("</think>", 1)[1]
+        return result.strip()
 
     @torch.inference_mode()
     def chat_with_video(
@@ -81,13 +146,12 @@ class VLMClient:
         max_new_tokens: int | None = None,
         temperature: float = 0.0,
         fps: float = 1.0,
-        max_pixels: int = 128 * 28 * 28,    # qwen_vl_utils video default
+        max_pixels: int = 128 * 28 * 28,
         min_pixels: int = 64 * 28 * 28,
     ) -> str:
-        """Single-video chat using qwen_vl_utils for frame sampling/preprocessing.
+        """Single-video chat: delegates frame packing to ``qwen_vl_utils`` + processor (current VL stack).
 
-        Note: qwen_vl_utils enforces max_pixels >= min_pixels. For very small max_pixels
-        we also lower min_pixels to keep the assertion happy.
+        ``qwen_vl_utils`` requires ``max_pixels >= min_pixels``; we shrink ``min_pixels`` when needed.
         """
         if max_pixels < min_pixels:
             min_pixels = max(28 * 28, max_pixels // 2)
@@ -111,7 +175,7 @@ class VLMClient:
     def _generate(self, messages, max_new_tokens=None, temperature=0.0, with_video=False) -> str:
         from qwen_vl_utils import process_vision_info
 
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         image_inputs, video_inputs = process_vision_info(messages)
         proc_kwargs = dict(text=[text], padding=True, return_tensors="pt")
         if image_inputs:
@@ -123,6 +187,7 @@ class VLMClient:
         gen_kwargs = dict(
             max_new_tokens=max_new_tokens or self.default_max_new_tokens,
             do_sample=temperature > 0,
+            repetition_penalty=1.3,
         )
         if temperature > 0:
             gen_kwargs["temperature"] = temperature

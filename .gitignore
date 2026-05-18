@@ -21,7 +21,14 @@ outputs/
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# One-off temp frame dirs (python tempfile leaks)
+tmp*/
+
+# Root nohup from ad-hoc runs
+nohup.out
