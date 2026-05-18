@@ -109,8 +109,10 @@ def get_rubric(question: str, task_type: Optional[str] = None) -> str:
 def _format_rubric_as_text(d: dict) -> str:
     lines = []
     for crit in d.get("rubric_criteria") or []:
+        weight = crit.get("weight", 1.0)
+        wtxt = f" [weight={weight}]" if float(weight) != 1.0 else ""
         lines.append(
-            f"  Criterion [{crit['name']}]: {crit['description']} "
+            f"  Criterion [{crit['name']}] {wtxt}: {crit['description']} "
             f"(1={crit['score_1']}; 0.5={crit['score_half']}; 0={crit['score_0']})"
         )
     rule = d.get("scoring_rule", "average")
@@ -122,6 +124,77 @@ def _format_rubric_as_text(d: dict) -> str:
 # ── Verifier prompt ────────────────────────────────────────────────────────────
 
 VERIFIER_SYS = """\
+You judge whether retrieved video-segment evidence is sufficient to answer a multiple-choice question.
+Follow these FIVE steps strictly, then output ONE strict JSON object — no prose, no markdown fences.
+
+## Step 1 — Evidence Attribution (internal)
+For each evidence chunk [E1]...[En], judge its role for EACH answer option:
+  support  : the evidence directly supports that option
+  refute   : the evidence directly contradicts or rules out that option
+  neutral  : the evidence has no clear effect on that option
+  conflict : the evidence conflicts with other evidence on a key fact for that option
+Use this step internally to reason about the evidence.
+Do NOT output per-evidence attribution.
+
+## Step 2 — Per-Option Status
+Using the internal evidence attribution, judge EACH answer option:
+  verified    : evidence clearly supports this option
+  excluded    : evidence clearly rules out this option
+  unclear     : evidence is insufficient to decide
+  conflicting : evidence for this option contains unresolved conflict
+Output "option_status" as an object mapping each option letter to one of these labels.
+Important:
+  - option_status is explicit per-option evidence judgment.
+  - conflicting means evidence conflict, NOT that two answer options are mutually exclusive.
+  - If evidence clearly supports one option and the options are mutually exclusive, you may mark
+    other options excluded, but only if there is no unresolved conflict.
+
+## Step 3 — Rubric Criteria Scoring
+For each criterion in the Rubric assign a score:
+  1.0 = fully satisfied   0.5 = partially satisfied   0.0 = not satisfied
+Rubric scoring may use the internal evidence attribution and option_status. For criteria such as
+option_disambiguation, use option_status as supporting judgment.
+
+## Step 4 — Aggregate Score & Label
+Compute "score" using the scoring rule stated in the Rubric (average or min).
+Do NOT let option_status directly participate in score aggregation; only criterion scores aggregate.
+Set "label":
+  • "sufficient"   if score ≥ threshold stated in the Rubric
+  • "insufficient" otherwise
+
+## Step 5 — Reasoning & Missing Evidence
+Write 1-2 sentences in "reasoning" explaining your decision.
+If insufficient, output a SEMI-STRUCTURED "missing_evidence_analysis" object based on low-scoring
+rubric criteria, unclear options, and conflicting options.
+This object will be used directly as guidance for the next retrieval query.
+Use these fields:
+  - "focus_options": list of option letters still needing evidence (e.g. ["A","C"]); [] if the gap is global
+  - "analysis": one dense, actionable sentence or short paragraph describing what evidence is still needed next
+  - "time_scope": a concrete time range if needed (e.g. "first 60 seconds of the video"), otherwise null
+  - "conflict_fact": the exact conflicting fact to resolve if there is an unresolved contradiction, otherwise null
+Make "analysis" specific:
+  - Preserve cross-option relations when multiple options remain entangled
+  - For temporal gaps: name the events whose order must be established
+  - For fact verification: state the exact claim that must be checked
+  - If multiple facts are missing, keep them in one coherent repair directive rather than splitting into isolated bullet-like goals
+
+Return ONLY this JSON (fill every field; use actual criterion names from the Rubric):
+{
+  "option_status":    {"A": "verified", "B": "excluded"},
+  "criteria":         {"<criterion_name>": 0.0},
+  "score":            0.0,
+  "label":            "sufficient" or "insufficient",
+  "reasoning":        "...",
+  "missing_evidence_analysis": {
+    "focus_options": ["A"],
+    "analysis": "Need direct evidence clarifying whether Whitehead's very first flight attempt succeeded or failed, and whether later successful flights are being conflated with the first attempt.",
+    "time_scope": null,
+    "conflict_fact": null
+  }
+}"""
+
+
+VERIFIER_SYS_WITH_ATTR = """\
 You judge whether retrieved video-segment evidence is sufficient to answer a multiple-choice question.
 Follow these FIVE steps strictly, then output ONE strict JSON object — no prose, no markdown fences.
 
@@ -153,7 +226,7 @@ Important:
 For each criterion in the Rubric assign a score:
   1.0 = fully satisfied   0.5 = partially satisfied   0.0 = not satisfied
 Rubric scoring may use Evidence Attribution and option_status. For criteria such as
-wrong_options_excluded or option_disambiguation, use option_status as supporting judgment.
+option_disambiguation, use option_status as supporting judgment.
 
 ## Step 4 — Aggregate Score & Label
 Compute "score" using the scoring rule stated in the Rubric (average or min).
@@ -164,14 +237,14 @@ Set "label":
 
 ## Step 5 — Reasoning & Missing Evidence
 Write 1-2 sentences in "reasoning" explaining your decision.
-If insufficient, write ONE concrete, actionable sentence in "missing_evidence" based on low-scoring
-rubric criteria, unclear options, and conflicting options. Be specific:
-  - If a time range is needed: state it (e.g., "Need evidence from the first 60 seconds of the video covering what the man in the black shirt is doing")
-  - If an event ordering is needed: name the events (e.g., "Need to know whether 'Aeneas' was created before or after 'The Rape of Persephone'")
-  - If a specific fact is needed: state it precisely (e.g., "Need a direct statement on whether Whitehead's very first flight attempt succeeded or failed")
-  - If multiple options need independent verification: list what each option requires (e.g., "Need to verify option A: was Russia inhabited by nomadic tribes before 2000BC?")
-  - If evidence conflicts: state the exact conflicting fact and which option it affects.
-  This sentence will be used directly as guidance for the next retrieval query — make it actionable.
+If insufficient, output a SEMI-STRUCTURED "missing_evidence_analysis" object based on low-scoring
+rubric criteria, unclear options, and conflicting options.
+This object will be used directly as guidance for the next retrieval query.
+Use these fields:
+  - "focus_options": list of option letters still needing evidence (e.g. ["A","C"]); [] if the gap is global
+  - "analysis": one dense, actionable sentence or short paragraph describing what evidence is still needed next
+  - "time_scope": a concrete time range if needed (e.g. "first 60 seconds of the video"), otherwise null
+  - "conflict_fact": the exact conflicting fact to resolve if there is an unresolved contradiction, otherwise null
 
 Return ONLY this JSON (fill every field; use actual criterion names from the Rubric):
 {
@@ -181,7 +254,12 @@ Return ONLY this JSON (fill every field; use actual criterion names from the Rub
   "score":            0.0,
   "label":            "sufficient" or "insufficient",
   "reasoning":        "...",
-  "missing_evidence": null,
+  "missing_evidence_analysis": {
+    "focus_options": ["A"],
+    "analysis": "Need direct evidence clarifying whether Whitehead's very first flight attempt succeeded or failed, and whether later successful flights are being conflated with the first attempt.",
+    "time_scope": null,
+    "conflict_fact": null
+  },
   "key_ids":          [1],
   "distractor_ids":   []
 }"""
@@ -202,7 +280,11 @@ Look at the evidence chain overall and decide whether it is enough to confidentl
 
 ## Step 2 — Reasoning & Missing Evidence
 Write 1-2 sentences explaining your overall judgment.
-If insufficient, write ONE concrete sentence in "missing_evidence" describing what is needed next.
+If insufficient, output a SEMI-STRUCTURED "missing_evidence_analysis" object with:
+  - "focus_options": []
+  - "analysis": one dense, actionable sentence or short paragraph describing what evidence is still needed next
+  - "time_scope": concrete time range if needed, otherwise null
+  - "conflict_fact": exact conflicting fact if any, otherwise null
 
 Return ONLY this JSON:
 {
@@ -210,7 +292,12 @@ Return ONLY this JSON:
   "score":            0.0,
   "reasoning":        "...",
   "label":            "sufficient" or "insufficient",
-  "missing_evidence": null
+  "missing_evidence_analysis": {
+    "focus_options": [],
+    "analysis": "Need direct evidence establishing whether event X happened before or after event Y.",
+    "time_scope": null,
+    "conflict_fact": null
+  }
 }"""
 
 
@@ -222,11 +309,27 @@ def _format_rubric_for_user(rubric: dict) -> str:
 
     lines = [f"### Rubric Criteria  (scoring: {rule} of scores; sufficient if score ≥ {thr})"]
     for c in crits:
-        lines.append(f"  [{c['name']}]  {c['description']}")
+        weight = c.get("weight", 1.0)
+        weight_suffix = f" [weight={weight}]" if float(weight) != 1.0 else ""
+        lines.append(f"  [{c['name']}] {weight_suffix}  {c['description']}")
         lines.append(f"    1.0 → {c['score_1']}")
         lines.append(f"    0.5 → {c['score_half']}")
         lines.append(f"    0.0 → {c['score_0']}")
     return "\n".join(lines)
+
+
+def _criterion_weights(rubric: dict) -> Dict[str, float]:
+    weights: Dict[str, float] = {}
+    for crit in rubric.get("rubric_criteria") or []:
+        name = str(crit.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            weight = float(crit.get("weight", 1.0))
+        except (TypeError, ValueError):
+            weight = 1.0
+        weights[name] = max(weight, 0.0)
+    return weights
 
 
 def _format_evidence(evidence_texts: List[str]) -> str:
@@ -252,6 +355,7 @@ class Verifier:
         rubric: str | dict,
         keyframe_images=(),
         use_rubric_judgment: bool = True,
+        include_evidence_attribution: bool = False,
     ) -> Dict:
         """Judge evidence sufficiency with rubric-guided structured reasoning.
 
@@ -261,10 +365,10 @@ class Verifier:
 
         Returns dict with keys:
             label           – "sufficient" | "insufficient"
-            missing_evidence – None or {"type", "description"}
+            missing_evidence_analysis – None or semi-structured repair guidance
             score           – float aggregate of rubric criteria
             criteria        – {criterion_name: score} (empty for legacy rubric)
-            evidence_attribution – per-evidence, per-option support/refute/neutral/conflict
+            evidence_attribution – optional per-evidence, per-option support/refute/neutral/conflict
             option_status   – per-option verified/excluded/unclear/conflicting judgment
             reasoning       – brief explanation string
         """
@@ -280,7 +384,7 @@ class Verifier:
             sys_prompt = VERIFIER_SYS_NORUBRIC
             rubric_section = ""
         else:
-            sys_prompt = VERIFIER_SYS
+            sys_prompt = VERIFIER_SYS_WITH_ATTR if include_evidence_attribution else VERIFIER_SYS
             rubric_section = (
                 rubric_dict["_legacy_text"]
                 if "_legacy_text" in rubric_dict
@@ -306,7 +410,11 @@ class Verifier:
         ]
         if keyframe_images and getattr(self.llm, '_api_endpoints', None):
             messages[-1] = _inject_images(messages[-1], keyframe_images)
-        raw    = self.llm.chat(messages, max_new_tokens=640, enable_thinking=False)
+        if not use_rubric_judgment:
+            max_new_tokens = 256
+        else:
+            max_new_tokens = 640
+        raw    = self.llm.chat(messages, max_new_tokens=max_new_tokens, enable_thinking=False)
         parsed = extract_json(raw)
 
         # ── Extract fields ─────────────────────────────────────────────────────
@@ -335,22 +443,62 @@ class Verifier:
             if rule == "min":
                 agg_score = min(criteria_scores.values())
             else:
-                agg_score = statistics.mean(criteria_scores.values())
+                weights = _criterion_weights(rubric_dict)
+                total_weight = 0.0
+                weighted_sum = 0.0
+                for name, value in criteria_scores.items():
+                    w = weights.get(name, 1.0)
+                    total_weight += w
+                    weighted_sum += w * value
+                agg_score = (weighted_sum / total_weight) if total_weight > 0 else statistics.mean(criteria_scores.values())
             score = agg_score
         else:
             score = raw_score
 
         reasoning = as_str(parsed.get("reasoning", ""))
 
-        # missing_evidence — plain string (or legacy dict with "description" key)
-        raw_missing = parsed.get("missing_evidence")
+        # missing_evidence_analysis — semi-structured object preferred; string kept for compatibility
+        raw_missing = parsed.get("missing_evidence_analysis")
+        if raw_missing is None:
+            # Backward compatibility with older verifier outputs.
+            raw_missing = parsed.get("missing_evidence")
         if label == "sufficient" or not raw_missing:
             missing = None
+        elif isinstance(raw_missing, dict):
+            focus_options = raw_missing.get("focus_options")
+            if not isinstance(focus_options, list):
+                focus_options = []
+            focus_options = [
+                as_str(x).strip().upper()[:1]
+                for x in focus_options
+                if as_str(x).strip()
+            ]
+
+            analysis = as_str(raw_missing.get("analysis", "")).strip()
+            time_scope = as_str(raw_missing.get("time_scope", "")).strip() or None
+            conflict_fact = as_str(raw_missing.get("conflict_fact", "")).strip() or None
+
+            # Backward compatibility for older dict outputs.
+            if not analysis:
+                desc = as_str(raw_missing.get("description", "")).strip()
+                if desc:
+                    analysis = desc
+            if not analysis:
+                query_goals = raw_missing.get("query_goals")
+                if not isinstance(query_goals, list):
+                    query_goals = []
+                query_goals = [as_str(x).strip() for x in query_goals if as_str(x).strip()]
+                if query_goals:
+                    analysis = " ; ".join(query_goals)
+
+            missing = {
+                "focus_options": focus_options,
+                "analysis": analysis or None,
+                "time_scope": time_scope,
+                "conflict_fact": conflict_fact,
+            }
         elif isinstance(raw_missing, str):
             missing = raw_missing or None
-        elif isinstance(raw_missing, dict):
-            # legacy format: {"type": "...", "description": "..."}
-            missing = as_str(raw_missing.get("description", "")) or None
         else:
             missing = None
 
@@ -379,7 +527,7 @@ class Verifier:
 
         key_ids        = _parse_id_list(parsed.get("key_ids"))
         distractor_ids = _parse_id_list(parsed.get("distractor_ids"))
-        if use_rubric_judgment and label == "sufficient" and not key_ids:
+        if include_evidence_attribution and use_rubric_judgment and label == "sufficient" and not key_ids:
             # fallback: treat all evidence as key when sufficient and no attribution given
             key_ids = list(range(1, len(evidence_texts) + 1))
 
@@ -395,7 +543,7 @@ class Verifier:
 
         return {
             "label":            label,
-            "missing_evidence": missing,
+            "missing_evidence_analysis": missing,
             "score":           round(score, 4),
             "criteria":        criteria_scores,
             "reasoning":       reasoning,
@@ -404,4 +552,3 @@ class Verifier:
             "distractor_ids":  distractor_ids,
             "option_status":   option_status,
         }
-

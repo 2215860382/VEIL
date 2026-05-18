@@ -1,19 +1,13 @@
-"""VEIL — iterative evidence retrieval (Subq decomposition + Verifier + Unified Planner).
+"""VEIL — iterative evidence retrieval main loop.
 
-Per iteration retrieves multiple sub-question queries in parallel:
-  iter 0 : sub-question decomposition (LLM-decomposed or option-grounded)
-  iter ≥1: Unified Planner — given the verifier's structured signals
-           (option_status / failed rubric criteria / missing_evidence / key+distractor ids),
-           decides targeted (1-4 queries) vs broadcast (uniform timeline coverage).
+Planner (iter-0 decomposition + iter≥1 unified planner + query safety nets) lives in
+``reasoning/planner.py``. Verifier lives in ``reasoning/verifier.py``. This file owns
+only the main loop, retrieval primitives, evidence dedup, oracle override, and the
+rubric-based final evidence rerank.
 
 Per-iteration retrieval: each sub-question independently fetches BGE coarse top-k
 (optionally SigLIP-fused) → optional reranker top-k → de-dup against accumulated
-evidence (BGE cosine ≥ ev_dedup_threshold).
-
-Safety nets on iter ≥1 query generation:
-  - Jaccard ≥ ``dedup_thresh`` vs prior queries → drop the query.
-  - BGE cosine ≥ ``query_drift_threshold`` vs accumulated evidence → drop the query.
-  - All targeted queries dropped → fall back to broadcast for this iter.
+evidence (BGE cosine ≥ ``ev_dedup_threshold``).
 
 Call-site variants (``run_experiments.py --pipelines``):
   ``veil_coarse8``  : coarse top-8 only (no reranker)
@@ -29,281 +23,11 @@ import numpy as np
 
 from experiments.pipelines._keyframes import keyframe_path, load_keyframe_pil
 from memory.schema import MemoryBank
+from reasoning.planner import Planner
 from reasoning.verifier import Verifier, get_rubric_dict
 
 
-# ── Iter-0: sub-question decomposition ────────────────────────────────────────
-
-_SUBQ_SYS = """You are a question decomposer for a video question-answering system.
-Decompose the given multiple-choice question into 2-4 atomic sub-questions, each targeting a \
-specific piece of information needed to evaluate one or more answer options.
-
-Rules:
-- Each sub-question must be self-contained and retrievable from video evidence.
-- For "which is NOT correct" / "which is incorrect" questions: generate one sub-question per option.
-- For other questions: identify the key atomic facts needed and generate one sub-question per fact.
-- Sub-questions must be SHORT (≤15 words), specific, and different from each other.
-- Do NOT include option letters in the sub-questions.
-- Return ONLY a JSON array of strings, e.g.: ["sub-question 1", "sub-question 2"]"""
-
-
-def _decompose_into_subquestions(
-    question: str,
-    candidates: List[str],
-    llm,
-) -> List[str]:
-    """Iter-0: decompose a question into 2-4 atomic sub-questions."""
-    import json as _json
-    opts = "\n".join(f"  ({chr(ord('A')+i)}) {c}" for i, c in enumerate(candidates))
-    user = (
-        f"Question: {question}\n"
-        f"Options:\n{opts}\n\n"
-        "Decompose into atomic sub-questions. Return ONLY a JSON array of strings."
-    )
-    messages = [
-        {"role": "system", "content": _SUBQ_SYS},
-        {"role": "user",   "content": user},
-    ]
-    raw = llm.chat(messages, max_new_tokens=200, enable_thinking=False)
-    m = re.search(r'\[.*\]', raw, re.DOTALL)
-    if m:
-        try:
-            qs = _json.loads(m.group())
-            return [str(q).strip() for q in qs if str(q).strip()][:4]
-        except Exception:
-            pass
-    return [question]
-
-
-def _option_grounded_subquestions(question: str, candidates: List[str]) -> List[str]:
-    """Iter-0 alternative: one verification query per answer option (deterministic)."""
-    letters = [chr(ord("A") + i) for i in range(len(candidates))]
-    return [
-        (
-            f"For option ({letter}) {candidate}: retrieve concrete evidence that supports, "
-            f"refutes, or makes unclear whether this option answers the question: {question}"
-        )
-        for letter, candidate in zip(letters, candidates)
-    ]
-
-
-def _option_grounded_repair_subquestions(
-    question: str,
-    candidates: List[str],
-    missing_description: str,
-) -> List[str]:
-    """Iter >=1 alternative: one repair query per answer option (deterministic)."""
-    letters = [chr(ord("A") + i) for i in range(len(candidates))]
-    missing = missing_description.strip() or "current evidence is insufficient"
-    return [
-        (
-            f"For option ({letter}) {candidate}: retrieve additional evidence that resolves "
-            f"this insufficiency for the question '{question}': {missing}"
-        )
-        for letter, candidate in zip(letters, candidates)
-    ]
-
-
-# ── Iter ≥1: Unified Planner ─────────────────────────────────────────────────
-
-_PLANNER_UNIFIED_SYS = """You are a retrieval strategy planner for a video question-answering system.
-Decide the BEST next retrieval strategy to find evidence for answering the question.
-
-## Strategies
-
-**targeted** — 1-4 focused queries. You decide how many:
-  - Use 1 query when the answer requires one specific fact or entity.
-  - Use 2-4 queries (sub-questions) when:
-    - Answer options name distinct items each needing independent evidence
-      (e.g., options are different colors / actions / counts / entities → one query per option)
-    - The question involves multiple distinct events or comparisons needing separate retrieval
-    - "Which is NOT correct?" → one query per option to verify/falsify each
-  Each query must be ≤15 words, self-contained, and target a distinct retrievable fact.
-
-**broadcast** — Uniform sampling across the uncovered video timeline (no query needed).
-  Use when:
-  - Evidence must cover the WHOLE video (main theme, synopsis, overall narrative)
-  - Temporal ordering requires seeing events spread across the full duration
-  - Missing analysis indicates broad timeline coverage is needed
-  - Targeted search has been tried multiple times without finding sufficient coverage
-
-## Rules
-- Do NOT generate queries similar to ones already tried (see plan history).
-- For broadcast: set queries to [].
-
-Return ONLY a JSON object:
-{
-  "strategy": "targeted" | "broadcast",
-  "queries": ["..."],
-  "reasoning": "<one sentence>"
-}"""
-
-
-def _plan_next(
-    question: str,
-    candidates: List[str],
-    evidence_texts: List[str],
-    missing_analysis: str,
-    llm,
-    plan_history: List[dict] = (),
-    allow_broadcast: bool = True,
-    option_status: Optional[dict] = None,
-    failed_criteria: Optional[dict] = None,
-    prune_satisfied: bool = False,
-) -> dict:
-    """Unified planner for iter ≥1: pick {targeted (n queries), broadcast}.
-
-    Returns ``{"strategy": "targeted"|"broadcast", "queries": [...], "reasoning": "..."}``.
-    """
-    import json as _json
-    opts_lines = []
-    for i, c in enumerate(candidates):
-        letter = chr(ord('A')+i)
-        tag = ""
-        if option_status:
-            s = option_status.get(letter)
-            if s == "verified":   tag = " [VERIFIED]"
-            elif s == "excluded": tag = " [EXCLUDED]"
-            elif s == "unclear":  tag = " [UNCLEAR]"
-            elif s == "conflicting": tag = " [CONFLICTING]"
-        opts_lines.append(f"  ({letter}) {c}{tag}")
-    opts = "\n".join(opts_lines)
-
-    parts = [f"Question: {question}", f"Options:\n{opts}"]
-    if option_status:
-        unresolved = [k for k, v in option_status.items() if v in ("unclear", "conflicting")]
-        if unresolved:
-            parts.append(
-                f"NOTE: Options {unresolved} are still unresolved (UNCLEAR or CONFLICTING) — generate queries that target ONLY these options. "
-                f"Do NOT generate queries for options already marked VERIFIED or EXCLUDED."
-            )
-    if failed_criteria:
-        lines = [f"  - {name}: {score}" for name, score in failed_criteria.items()]
-        parts.append(
-            "Failed or weak rubric criteria to repair:\n" + "\n".join(lines) +
-            "\nGenerate queries that directly repair these criteria."
-        )
-    if not allow_broadcast:
-        parts.append('NOTE: "broadcast" is NOT allowed for this call. Always output strategy="targeted".')
-    if prune_satisfied and plan_history:
-        parts.append(
-            "NOTE: Review the previously tried queries against the CURRENT evidence. "
-            "For each previous query, judge whether its target fact is now adequately covered by the evidence. "
-            "Do NOT regenerate queries whose target is already satisfied. "
-            "Only generate queries for facts that remain unresolved."
-        )
-
-    if plan_history:
-        lines = []
-        for h in plan_history:
-            strat = h.get("strategy", "targeted")
-            qs    = h.get("queries") or []
-            label = "[broadcast]" if strat == "broadcast" else " | ".join(f'"{q}"' for q in qs)
-            lines.append(f"  [{strat}] {label}")
-        parts.append("Already tried (do NOT repeat):\n" + "\n".join(lines))
-
-    if evidence_texts:
-        covered = _extract_covered_times(evidence_texts)
-        if covered:
-            parts.append(f"Evidence covers video segments: {covered}")
-        ev_sample = "\n".join(f"  [E{i+1}] {t[:200]}" for i, t in enumerate(evidence_texts[:5]))
-        parts.append(f"Current evidence (sample):\n{ev_sample}")
-
-    if missing_analysis:
-        parts.append(f"Still missing: {missing_analysis}")
-
-    parts.append("Output the retrieval strategy JSON now.")
-
-    messages = [
-        {"role": "system", "content": _PLANNER_UNIFIED_SYS},
-        {"role": "user",   "content": "\n\n".join(parts)},
-    ]
-    raw = llm.chat(messages, max_new_tokens=200, enable_thinking=False)
-    m = re.search(r'\{.*\}', raw, re.DOTALL)
-    if m:
-        try:
-            d        = _json.loads(m.group())
-            strategy = str(d.get("strategy", "targeted")).lower()
-            if strategy not in ("targeted", "broadcast"):
-                strategy = "targeted"
-            if not allow_broadcast and strategy == "broadcast":
-                strategy = "targeted"
-            queries  = [str(q).strip() for q in (d.get("queries") or []) if str(q).strip()]
-            if strategy != "broadcast" and not queries:
-                strategy = "targeted"
-                queries  = [question]
-            return {
-                "strategy":  strategy,
-                "queries":   queries,
-                "reasoning": str(d.get("reasoning", "")),
-            }
-        except Exception:
-            pass
-    return {"strategy": "targeted", "queries": [question], "reasoning": "parse_failed"}
-
-
-# ── Verifier → planner repair context ────────────────────────────────────────
-
-def _failed_criteria(criteria: Optional[dict], threshold: float = 1.0) -> dict:
-    """Return rubric criteria that are not fully satisfied."""
-    failed = {}
-    if not isinstance(criteria, dict):
-        return failed
-    for name, score in criteria.items():
-        try:
-            val = float(score)
-        except (TypeError, ValueError):
-            val = 0.0
-        if val < threshold:
-            failed[str(name)] = val
-    return failed
-
-
-def _planner_repair_context(verdict: dict, use_rubric_judgment: bool) -> tuple[str, dict | None]:
-    """Build the only verifier-derived context the planner may use."""
-    missing = verdict.get("missing_evidence") or ""
-    if isinstance(missing, dict):
-        missing = missing.get("description", "") or ""
-    missing = str(missing)
-    reasoning = str(verdict.get("reasoning") or "")
-
-    if not use_rubric_judgment:
-        parts = []
-        if reasoning:
-            parts.append(f"Verifier reasoning: {reasoning}")
-        if missing:
-            parts.append(f"Missing evidence: {missing}")
-        return "\n".join(parts), None
-
-    failed = _failed_criteria(verdict.get("criteria"))
-    status = verdict.get("option_status") or {}
-    unresolved = {k: v for k, v in status.items() if v in ("unclear", "conflicting")}
-
-    parts = []
-    if failed:
-        parts.append("Failed or weak rubric criteria: " +
-                     "; ".join(f"{k}={v}" for k, v in failed.items()))
-    if unresolved:
-        parts.append("Unclear/conflicting options: " +
-                     "; ".join(f"{k}={v}" for k, v in unresolved.items()))
-    if missing:
-        parts.append(f"Missing evidence: {missing}")
-    return "\n".join(parts), failed
-
-
 # ── Broadcast (uniform timeline sampling) ────────────────────────────────────
-
-_BROADCAST_KEYWORDS = frozenset({
-    "throughout", "entire video", "whole video", "all segment",
-    "timeline", "every segment", "coverage across", "sequence of events",
-    "chronolog", "overview of", "synopsis",
-})
-
-
-def _needs_broadcast(missing_desc: str) -> bool:
-    s = (missing_desc or "").lower()
-    return any(kw in s for kw in _BROADCAST_KEYWORDS)
-
 
 def _broadcast_retrieve(
     bank: MemoryBank,
@@ -327,17 +51,6 @@ def _broadcast_retrieve(
             ids.append(c.chunk_id)
             vecs.append(c.v_semantic or [])
     return texts, ids, vecs
-
-
-def _extract_covered_times(evidence_texts: List[str]) -> str:
-    """Extract time ranges present in evidence texts to inform the planner."""
-    pattern = r'\[(\d+)s[-–](\d+)s\]'
-    secs = sorted({(int(m.group(1)), int(m.group(2)))
-                   for t in evidence_texts
-                   for m in re.finditer(pattern, t)})
-    def fmt(s: int) -> str:
-        return f"{s//60}:{s%60:02d}"
-    return ", ".join(f"{fmt(a)}-{fmt(b)}" for a, b in secs) if secs else ""
 
 
 # ── Oracle mode (debug upper bound) ──────────────────────────────────────────
@@ -436,18 +149,7 @@ def _rerank_by_rubric(
     return list(range(len(evidence_texts)))
 
 
-# ── Query / chunk de-dup ─────────────────────────────────────────────────────
-
-def _jaccard(a: str, b: str) -> float:
-    sa, sb = set(a.lower().split()), set(b.lower().split())
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
-
-
-def _too_similar(new_q: str, prev_queries: List[str], threshold: float = 0.5) -> bool:
-    return any(_jaccard(new_q, pq) >= threshold for pq in prev_queries)
-
+# ── Chunk-level evidence dedup ───────────────────────────────────────────────
 
 def _dedup_by_similarity(
     new_texts: List[str],
@@ -475,9 +177,9 @@ def _dedup_by_similarity(
     return kept_t, kept_i, kept_v
 
 
-# ── Single-query retrieval primitive ─────────────────────────────────────────
+# ── Query-driven retrieval (per sub-question) ────────────────────────────────
 
-def _retrieve_once(
+def _query_retrieve(
     query: str,
     bank: MemoryBank,
     embedder,
@@ -553,7 +255,6 @@ def run_veil(
     per_subq_k:            Optional[int] = None,
     use_subquestions:      bool         = False,
     force_option_subquestions: bool     = False,
-    option_subquestions_each_iter: bool = False,
     rubric_rerank:         bool         = False,
     evidence_attribution:  bool         = False,
     use_oracle:            bool         = False,
@@ -567,6 +268,7 @@ def run_veil(
     falls back to broadcast.
     """
     verifier = Verifier(llm)
+    planner  = Planner(llm)
     rubric   = get_rubric_dict(question, task_type)
 
     vis_query = f"A video frame showing {question} Possible answers: {' or '.join(candidates)}"
@@ -583,15 +285,9 @@ def run_veil(
     chunk_by_id = {c.chunk_id: c for c in bank.chunks}
 
     # ── Iter-0 plan: sub-question decomposition ──────────────────────────────
-    if force_option_subquestions:
-        iter0_queries = _option_grounded_subquestions(question, candidates)
-    else:
-        iter0_queries = _decompose_into_subquestions(question, candidates, llm)
-    current_plan: dict = {
-        "strategy":  "targeted",
-        "queries":   iter0_queries,
-        "reasoning": "iter0_decompose",
-    }
+    current_plan: dict = planner.decompose_iter0(
+        question, candidates, force_option=force_option_subquestions,
+    )
 
     for it in range(max_iter):
         do_broadcast      = (current_plan["strategy"] == "broadcast")
@@ -610,7 +306,7 @@ def run_veil(
             # Each sub-question independently retrieves final_top_k chunks.
             for q in queries_this_iter:
                 vq = vis_query if it == 0 else q
-                t, i, v = _retrieve_once(
+                t, i, v = _query_retrieve(
                     q, bank, embedder, reranker,
                     coarse_top_k, final_top_k, seen_ids,
                     siglip=siglip, text_alpha=text_alpha, vis_query=vq,
@@ -647,7 +343,8 @@ def run_veil(
         # ── Verifier ─────────────────────────────────────────────────────────
         verdict = verifier.verify(question, candidates, all_evidence_texts, rubric,
                                   keyframe_images=all_keyframes,
-                                  use_rubric_judgment=use_rubric_judgment)
+                                  use_rubric_judgment=use_rubric_judgment,
+                                  include_evidence_attribution=evidence_attribution)
 
         # ── Oracle mode: override label/missing based on gold answerer check ─
         if use_oracle and gold_answer:
@@ -662,13 +359,13 @@ def run_veil(
             _pred = _oracle_result.get("answer", "")
             if _pred == gold_letter:
                 verdict["label"] = "sufficient"
-                verdict["missing_evidence"] = None
+                verdict["missing_evidence_analysis"] = None
                 verdict["reasoning"] = f"Oracle: pred={_pred} == gold ({verdict.get('reasoning','')})"
             else:
                 _missing = _oracle_analyze_missing(
                     question, candidates, all_evidence_texts, gold_letter, _pred, llm)
                 verdict["label"] = "insufficient"
-                verdict["missing_evidence"] = _missing
+                verdict["missing_evidence_analysis"] = _missing
                 verdict["reasoning"] = f"Oracle: pred={_pred} != gold={gold_letter} ({verdict.get('reasoning','')})"
 
         # ── Evidence attribution: remove distractors from accumulated set ────
@@ -692,7 +389,7 @@ def run_veil(
             "score":                      verdict.get("score"),
             "criteria":                   verdict.get("criteria"),
             "reasoning":                  verdict.get("reasoning"),
-            "missing_evidence_analysis":  verdict.get("missing_evidence") or None,
+            "missing_evidence_analysis":  verdict.get("missing_evidence_analysis") or None,
             "key_ids":                    verdict.get("key_ids"),
             "distractor_ids":             verdict.get("distractor_ids"),
             "option_status":              verdict.get("option_status"),
@@ -706,48 +403,20 @@ def run_veil(
             break
 
         # ── Plan next iter ───────────────────────────────────────────────────
-        m_desc, failed = _planner_repair_context(verdict, use_rubric_judgment=use_rubric_judgment)
-
-        if option_subquestions_each_iter and force_option_subquestions:
-            next_plan = {
-                "strategy": "targeted",
-                "queries": _option_grounded_repair_subquestions(question, candidates, m_desc),
-                "reasoning": "option4_repair",
-            }
-        elif keyword_broadcast and _needs_broadcast(m_desc):
-            next_plan = {"strategy": "broadcast", "queries": [], "reasoning": "keyword_trigger"}
-        else:
-            opt_status = (verdict.get("option_status")
-                          if (use_rubric_judgment and use_option_status) else None)
-            next_plan = _plan_next(
-                question, candidates, all_evidence_texts, m_desc, llm, plan_history,
-                allow_broadcast=not keyword_broadcast,
-                option_status=opt_status,
-                failed_criteria=failed if use_rubric_judgment else None,
-                prune_satisfied=prune_satisfied,
-            )
+        next_plan, m_desc, _failed = planner.plan_next(
+            question, candidates, all_evidence_texts, verdict, plan_history,
+            keyword_broadcast=keyword_broadcast,
+            use_rubric_judgment=use_rubric_judgment,
+            use_option_status=use_option_status,
+            prune_satisfied=prune_satisfied,
+        )
 
         # ── Filter targeted queries; fall back to broadcast if all dropped ───
-        if next_plan["strategy"] == "targeted" and not (
-            option_subquestions_each_iter and force_option_subquestions
-        ):
-            ev_mat = (np.array(all_ev_vecs, dtype=np.float32)
-                      if query_drift_threshold is not None and all_ev_vecs else None)
-            kept: List[str] = []
-            for q in next_plan["queries"]:
-                if _too_similar(q, prev_queries, dedup_thresh):
-                    continue
-                if ev_mat is not None:
-                    qv    = embedder.encode([q])[0]
-                    drift = float(np.max(ev_mat @ qv))
-                    if drift >= query_drift_threshold:
-                        continue
-                kept.append(q)
-            if kept:
-                next_plan["queries"] = kept
-            else:
-                next_plan = {"strategy": "broadcast", "queries": [],
-                             "reasoning": "all_targeted_filtered"}
+        next_plan = planner.filter_targeted_queries(
+            next_plan, prev_queries, embedder, all_ev_vecs,
+            dedup_thresh=dedup_thresh,
+            drift_threshold=query_drift_threshold,
+        )
 
         plan_history.append({
             "strategy":         next_plan["strategy"],
