@@ -42,6 +42,7 @@ templates:
         score_0:    "Entity is absent or described in a way that matches none of the options"
 
       - name: option_disambiguation
+        weight: 2.0
         description: "Evidence distinguishes one answer option from plausible competitors"
         score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
         score_half: "One option is supported, but some competing options remain unclear"
@@ -72,6 +73,7 @@ templates:
         score_0:    "Action is absent or described in a way that matches none of the options"
 
       - name: option_disambiguation
+        weight: 2.0
         description: "Evidence distinguishes one answer option from plausible competitors"
         score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
         score_half: "One option is supported, but some competing options remain unclear"
@@ -108,6 +110,7 @@ templates:
         score_0:    "Required events are largely absent; evidence covers only a small fraction of what is needed"
 
       - name: option_disambiguation
+        weight: 2.0
         description: "Evidence distinguishes one answer option from plausible competitors"
         score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
         score_half: "One option is supported, but some competing options remain unclear"
@@ -132,6 +135,7 @@ templates:
         score_0:    "No specific count found"
 
       - name: option_disambiguation
+        weight: 2.0
         description: "Evidence distinguishes one answer option from plausible competitors"
         score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
         score_half: "One option is supported, but some competing options remain unclear"
@@ -156,6 +160,7 @@ templates:
         score_0:    "Topic is absent from evidence"
 
       - name: option_disambiguation
+        weight: 2.0
         description: "Evidence distinguishes one answer option from plausible competitors"
         score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
         score_half: "One option is supported, but some competing options remain unclear"
@@ -186,6 +191,7 @@ templates:
         score_0:    "Text content is absent or unrelated"
 
       - name: option_disambiguation
+        weight: 2.0
         description: "Evidence distinguishes one answer option from plausible competitors"
         score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
         score_half: "One option is supported, but some competing options remain unclear"
@@ -210,6 +216,7 @@ templates:
         score_0:    "Evidence is off-topic or misses the required specific fact entirely"
 
       - name: option_disambiguation
+        weight: 2.0
         description: "Evidence distinguishes one answer option from plausible competitors"
         score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
         score_half: "One option is supported, but some competing options remain unclear"

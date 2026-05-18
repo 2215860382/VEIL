@@ -53,8 +53,6 @@ ALL_PIPELINES = (
     # ablation: force one option-grounded sub-question per answer option in iter0
     "veil_option4_init_27b",
     "veil_option4_subq_27b",
-    # ablation: force option-grounded sub-questions in iter0 and repair rounds
-    "veil_option4_repair_subq_27b",
     # oracle upper bound (early stop when gold answerer matches)
     "veil_oracle_27b",
     # ablation: swap cross-encoder → LLM listwise reranker
@@ -68,7 +66,6 @@ _VEIL_27B_ANS     = frozenset({"veil_coarse8_27b", "veil_coarse64_27b", "veil_re
                                 "veil_rubric_repair_dynamic_27b",
                                 "veil_option4_init_27b",
                                 "veil_option4_subq_27b",
-                                "veil_option4_repair_subq_27b",
                                 "veil_oracle_27b"})
 _VEIL_PIPES       = _VEIL_VL_ANS | _VEIL_27B_ANS
 # 27B answerer pipelines — use Answerer(vlm) so the 27B VLM sees keyframes too.
@@ -123,6 +120,10 @@ def main():
                     help="Pipeline names; also accepts dynamic coarse{N}_27b and coarse{N}_27b_rubric")
     ap.add_argument("--filter-from", default=None,
                     help="JSONL with video_id keys; only run those videos")
+    ap.add_argument("--sample-start", type=int, default=None,
+                    help="Optional inclusive lower bound on sample_idx")
+    ap.add_argument("--sample-end",   type=int, default=None,
+                    help="Optional exclusive upper bound on sample_idx")
     ap.add_argument("--vlm-gpu",        default="cuda:0")
     ap.add_argument("--bge-gpu",        default="cuda:3")
     ap.add_argument("--llm-gpu",        default="cuda:1")
@@ -221,6 +222,10 @@ def main():
             time.sleep(60)
 
     samples = load_samples(cfg, filter_vids)
+    if args.sample_start is not None:
+        samples = [s for s in samples if int(s.sample_idx) >= args.sample_start]
+    if args.sample_end is not None:
+        samples = [s for s in samples if int(s.sample_idx) < args.sample_end]
     log.info("loaded %d samples (%d videos)", len(samples),
              len({s.video_id for s in samples}))
 
@@ -518,16 +523,6 @@ def main():
                          siglip=siglip, text_alpha=va, keyframe_dir=kf_dir,
                          answer_evidence_cap=aek,
                          rubric_rerank=True, force_option_subquestions=True)
-        elif pipeline == "veil_option4_repair_subq_27b":
-            # Iter0 and repair rounds force one option-grounded query per answer option.
-            r = run_veil(s.question, s.candidates, bank, embedder, text_answerer_27b, llm,
-                         task_type=s.question_type,
-                         reranker=None, coarse_top_k=8, final_top_k=8,
-                         max_iter=veil_max_iter, dedup_thresh=veil_dedup,
-                         siglip=siglip, text_alpha=va, keyframe_dir=kf_dir,
-                         answer_evidence_cap=aek,
-                         rubric_rerank=True, force_option_subquestions=True,
-                         option_subquestions_each_iter=True)
         elif pipeline == "veil_oracle_27b":
             # Oracle upper bound: stop iterating once gold answerer matches.
             r = run_veil(s.question, s.candidates, bank, embedder, text_answerer_27b, llm,
