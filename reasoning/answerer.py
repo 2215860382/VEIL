@@ -1,91 +1,148 @@
-"""Answerer — produce final letter-choice given evidence.
-
-Two backends:
-  * VLAnswerer: Qwen3-VL, sees evidence text + (optional) frames from selected segments.
-  * TextAnswerer: Qwen3-8B, sees only evidence text.
-"""
+"""Answerer — produce final letter-choice given evidence."""
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import List
 
-from utils.jsonx import as_list, as_str, extract_json
+from utils.jsonx import as_list, as_str, extract_json, _CHOICE_RE
 
-ANSWERER_SYS = """You answer a multiple-choice question about a long video, using ONLY the retrieved evidence (and optionally the corresponding frames if shown).
-Pick exactly one option. Explain briefly which evidence chunks support your choice.
 
-Return ONLY a strict JSON object with these keys:
-- "answer":   one letter, exactly one of A/B/C/D (or up to the number of options shown).
-- "evidence": list of evidence ids cited from the input (e.g. ["E1", "E3"]).
-- "rationale": one sentence justifying the answer, citing the evidence.
+def _inject_images(message: dict, pil_images) -> dict:
+    """Replace str content with [image_url…, text] for multimodal API calls."""
+    import base64, io
+    valid = [img for img in pil_images if img is not None]
+    if not valid:
+        return message
+    content = []
+    for img in valid:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        content.append({"type": "image_url",
+                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    content.append({"type": "text", "text": message["content"]})
+    return {"role": message["role"], "content": content}
+
+
+ANSWERER_SYS = """You answer a multiple-choice question about a long video using retrieved evidence (text summaries, speech transcripts, and keyframe images if shown).
+
+Evidence blocks are tagged [E1], [E2], … Each block has a timestamp, a visual summary, and optional speech transcript.
+
+Steps:
+1. CLASSIFY the question and apply the matching strategy:
+   - OVERVIEW (main topic / theme / purpose of the whole video): synthesize ALL evidence for the dominant theme; do not anchor on a single detail.
+   - TEMPORAL (order / sequence / timing): extract timestamps, reconstruct chronological order using first/then/after/finally; eliminate options whose order contradicts the timestamps.
+   - COUNT (how many): prefer the explicitly stated number if present; if not explicit, use the count most directly supported by evidence; always commit to the best available answer.
+   - OCR (on-screen text / number / score / label): find the exact transcribed text; match character-by-character; do not paraphrase.
+   - SPATIAL (location / position / layout): use position descriptions (left/right, foreground/background, above/below).
+   - ATTRIBUTE (color / material / appearance / state): find the specific attribute stated; if not explicit, use the most strongly implied attribute.
+   - OBJECT (which object / who / what entity): find the specific name or identifier; a similar category is not sufficient.
+   - ACTION (what someone does / how a process works): find the specific action with subject and manner; match the described steps exactly.
+   - CAUSE (why / what leads to / reason for): find causal evidence ("because", "in order to", "which causes"); choose the option whose cause is directly stated.
+   - NEGATION (which is NOT / which does NOT): verify each option against evidence independently; the answer is the option that lacks support or is contradicted — not the one least mentioned.
+
+2. For each option, check whether the evidence directly supports or contradicts it.
+3. Prefer the option most SPECIFICALLY and DIRECTLY supported — not just thematically related.
+4. When evidence is limited or incomplete, commit to the option with the strongest partial support rather than defaulting to a random choice. Sparse evidence still carries signal.
+5. For NEGATION questions: explicitly verify each option; the answer is the one NOT supported or explicitly contradicted, not just less mentioned.
+6. Write 1-2 sentences of reasoning.
+7. Output a JSON object with keys "answer", "evidence", "rationale".
+
+Output format (reasoning first, then JSON):
+Reasoning: <question type + your 1-2 sentence analysis>
+{"answer": "<letter>", "evidence": ["E1", ...], "rationale": "<one sentence>"}
 """
+
+ANSWERER_SYS_RETRY = """Output ONLY a JSON object. No explanation, no preamble.
+{"answer": "<letter>", "evidence": [], "rationale": ""}"""
 
 
 def _normalize(raw: dict) -> dict:
+    ans = as_str(raw.get("answer", "")).strip().lstrip("(").rstrip(")")
+    letter = ans[:1].upper() if ans else ""
+    if letter not in ("A", "B", "C", "D", "E", "F"):
+        letter = ""
     return {
-        "answer":    as_str(raw.get("answer", ""))[:1].upper(),
+        "answer":    letter,
         "evidence":  as_list(raw.get("evidence", [])),
         "rationale": as_str(raw.get("rationale", "")),
     }
 
 
-def _format_evidence(evidence_texts: List[str]) -> str:
+def _format_evidence(evidence_texts: List[str], offset: int = 0) -> str:
     if not evidence_texts:
         return "(no evidence)"
-    return "\n".join(f"[E{i+1}] {t}" for i, t in enumerate(evidence_texts))
+    return "\n".join(f"[E{i+1+offset}] {t}" for i, t in enumerate(evidence_texts))
 
 
 def _format_options(candidates: List[str]) -> str:
     return "\n".join(f"  ({chr(ord('A')+i)}) {c}" for i, c in enumerate(candidates))
 
 
-class TextAnswerer:
-    """LLM-only answerer: feed evidence text → answer. Used for the auxiliary 'Ours-TextAnswer' setup."""
-
-    def __init__(self, llm):
-        self.llm = llm
-
-    def answer(self, question: str, candidates: List[str], evidence_texts: List[str]) -> dict:
-        user = (
-            f"Question: {question}\n"
-            f"Options:\n{_format_options(candidates)}\n\n"
-            f"Evidence:\n{_format_evidence(evidence_texts)}\n\n"
-            "Return the JSON now."
-        )
-        messages = [
-            {"role": "system", "content": ANSWERER_SYS},
-            {"role": "user", "content": user},
-        ]
-        raw = self.llm.chat(messages, max_new_tokens=256, enable_thinking=False)
-        return _normalize(extract_json(raw))
+def _call(model, prompt: str, frames: list, max_new_tokens: int) -> str:
+    """Unified model call: API path uses chat_with_frames; local path uses _generate."""
+    if getattr(model, '_api_endpoints', None):
+        return model.chat_with_frames(frames, prompt, max_new_tokens=max_new_tokens)
+    elif frames and hasattr(model, 'chat_with_frames'):
+        return model.chat_with_frames(frames, prompt, max_new_tokens=max_new_tokens)
+    else:
+        msgs = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        return model._generate(msgs, max_new_tokens=max_new_tokens)
 
 
-class VLAnswerer:
-    """VLM answerer: feed evidence text + (optional) frames from selected chunks → answer."""
-
-    def __init__(self, vlm):
-        self.vlm = vlm
+class Answerer:
+    def __init__(self, model):
+        self.model = model
 
     def answer(
         self,
         question: str,
         candidates: List[str],
         evidence_texts: List[str],
-        evidence_frames: Sequence[Sequence] = (),
+        keyframe_images=(),
+        max_evidence_chars: int = 80000,
+        focused_texts: List[str] = (),
     ) -> dict:
+        all_texts = list(evidence_texts) + list(focused_texts)
+        if all_texts and max_evidence_chars:
+            per = max_evidence_chars // len(all_texts)
+            evidence_texts = [t[:per] for t in evidence_texts]
+            focused_texts  = [t[:per] for t in focused_texts]
+
+        if focused_texts:
+            ev_section = (
+                "## Targeted Evidence (retrieved to fill specific gaps — prioritize for the key question):\n"
+                + _format_evidence(focused_texts) + "\n\n"
+                + "## Background Evidence:\n"
+                + _format_evidence(evidence_texts, offset=len(focused_texts))
+            )
+        else:
+            ev_section = _format_evidence(evidence_texts)
+
         prompt = (
             f"{ANSWERER_SYS}\n\n"
             f"Question: {question}\n"
             f"Options:\n{_format_options(candidates)}\n\n"
-            f"Evidence:\n{_format_evidence(evidence_texts)}\n\n"
+            f"Evidence:\n{ev_section}\n\n"
             "Return the JSON now."
         )
-        flat_frames = []
-        for fl in evidence_frames:
-            flat_frames.extend(fl)
-        if flat_frames:
-            raw = self.vlm.chat_with_frames(flat_frames, prompt, max_new_tokens=256)
-        else:
-            # No frames provided — degrade gracefully to text-only via VLM.
-            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-            raw = self.vlm._generate(messages, max_new_tokens=256)
-        return _normalize(extract_json(raw))
+        frames = [img for img in keyframe_images if img is not None]
+        raw = _call(self.model, prompt, frames, max_new_tokens=1024)
+
+        result = _normalize(extract_json(raw))
+        if not result["answer"]:
+            m = _CHOICE_RE.search(raw)
+            if m:
+                result["answer"] = m.group(1).upper()
+        if not result["answer"]:
+            letters = ", ".join(chr(ord("A") + i) for i in range(len(candidates)))
+            retry_prompt = (
+                f"{ANSWERER_SYS_RETRY}\n\n"
+                f"Question: {question}\n"
+                f"Options:\n{_format_options(candidates)}\n\n"
+                f"IMPORTANT: Return JSON with \"answer\" set to exactly one of: {letters}."
+            )
+            raw2 = _call(self.model, retry_prompt, frames, max_new_tokens=128)
+            result = _normalize(extract_json(raw2))
+        return result
+
+

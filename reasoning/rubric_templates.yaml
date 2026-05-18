@@ -1,0 +1,237 @@
+# VEIL Verifier rubric templates.
+#
+# Structure: each template is a dict with:
+#   rubric_criteria  – named 0/0.5/1 criteria
+#   scoring_rule     – "average" or "min"
+#   sufficient_threshold – score >= this → sufficient
+#
+# type_aliases: exact question_type string → template key
+# keyword_rules: question text keywords → template key (checked after type_aliases)
+
+type_aliases:
+  "Object Reasoning":     object_visual
+  "Object Recognition":   object_visual
+  "Attribute Perception": object_visual
+  "Spatial Perception":   object_visual
+  "Spatial Reasoning":    object_visual
+  "Action Reasoning":     action
+  "Action Recognition":   action
+  "Temporal Reasoning":   temporal
+  "Temporal Perception":  temporal
+  "Counting Problem":     counting
+  "Information Synopsis": synopsis
+  "OCR Problems":         ocr
+
+keyword_rules:
+  - keywords: ["how many", "how often", "number of", "count", "times does", "times is"]
+    qtype: counting
+  - keywords: ["when", "before", "after", "first", "last", "then", "order", "sequence", "which happens"]
+    qtype: temporal
+  - keywords: ["what text", "what does it say", "what is written", "sign reads", "caption", "subtitle"]
+    qtype: ocr
+
+templates:
+
+  # ── Object / Visual identification ──────────────────────────────────────────
+  object_visual:
+    rubric_criteria:
+      - name: specific_entity_described
+        description: "Evidence describes the specific visual entity or attribute that identifies one answer option"
+        score_1:    "Evidence directly states the specific entity, color, appearance, or attribute that maps to exactly one option"
+        score_half: "Entity is mentioned but visual details are vague or do not clearly distinguish between options"
+        score_0:    "Entity is absent or described in a way that matches none of the options"
+
+      - name: option_disambiguation
+        description: "Evidence distinguishes one answer option from plausible competitors"
+        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
+        score_half: "One option is supported, but some competing options remain unclear"
+        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
+
+      - name: evidence_consistency
+        description: "Evidence does not contain unresolved contradictions on key facts"
+        score_1:    "No unresolved contradiction on key facts"
+        score_half: "Minor inconsistency but does not affect answer"
+        score_0:    "Unresolved contradiction affects answer or option choice"
+
+      - name: evidence_grounding
+        description: "Evidence concretely grounds the selected answer"
+        score_1:    "Concrete retrieved evidence directly supports the answer"
+        score_half: "Partially grounded but some inference remains"
+        score_0:    "Vague, generic, or unsupported"
+
+    scoring_rule: average
+    sufficient_threshold: 0.75
+
+  # ── Action / Behavior reasoning ─────────────────────────────────────────────
+  action:
+    rubric_criteria:
+      - name: action_described
+        description: "Evidence describes the specific action with clear subject and manner that maps to one option"
+        score_1:    "Action is explicitly described with specific subject, manner, and detail identifying exactly one option"
+        score_half: "Action is mentioned but without clear specifics connecting it to one option over others"
+        score_0:    "Action is absent or described in a way that matches none of the options"
+
+      - name: option_disambiguation
+        description: "Evidence distinguishes one answer option from plausible competitors"
+        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
+        score_half: "One option is supported, but some competing options remain unclear"
+        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
+
+      - name: evidence_consistency
+        description: "Evidence does not contain unresolved contradictions on key facts"
+        score_1:    "No unresolved contradiction on key facts"
+        score_half: "Minor inconsistency but does not affect answer"
+        score_0:    "Unresolved contradiction affects answer or option choice"
+
+      - name: evidence_grounding
+        description: "Evidence concretely grounds the selected answer"
+        score_1:    "Concrete retrieved evidence directly supports the answer"
+        score_half: "Partially grounded but some inference remains"
+        score_0:    "Vague, generic, or unsupported"
+
+    scoring_rule: average
+    sufficient_threshold: 0.75
+
+  # ── Temporal reasoning ───────────────────────────────────────────────────────
+  temporal:
+    rubric_criteria:
+      - name: temporal_grounding
+        description: "Evidence anchors events to specific timestamps or a clear before/after sequence"
+        score_1:    "Explicit timestamps or unambiguous before/after sequence for the relevant event(s)"
+        score_half: "Some temporal language present but ordering is incomplete or ambiguous"
+        score_0:    "No temporal grounding despite the question requiring it"
+
+      - name: event_coverage
+        description: "Evidence covers ALL events or time periods needed to answer the ordering/timing question"
+        score_1:    "All required events, transitions, or time periods are explicitly described in evidence"
+        score_half: "Most required events covered but at least one key event or period is missing"
+        score_0:    "Required events are largely absent; evidence covers only a small fraction of what is needed"
+
+      - name: option_disambiguation
+        description: "Evidence distinguishes one answer option from plausible competitors"
+        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
+        score_half: "One option is supported, but some competing options remain unclear"
+        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
+
+      - name: evidence_consistency
+        description: "Evidence does not contain unresolved contradictions on key facts"
+        score_1:    "No unresolved contradiction on key facts"
+        score_half: "Minor inconsistency but does not affect answer"
+        score_0:    "Unresolved contradiction affects answer or option choice"
+
+    scoring_rule: average
+    sufficient_threshold: 0.75
+
+  # ── Counting ─────────────────────────────────────────────────────────────────
+  counting:
+    rubric_criteria:
+      - name: count_specificity
+        description: "Evidence states the exact count of the specific thing being asked about"
+        score_1:    "Exact count is stated and matches the scope of the question without ambiguity"
+        score_half: "A number is present but may refer to a different scope, partial count, or is approximate"
+        score_0:    "No specific count found"
+
+      - name: option_disambiguation
+        description: "Evidence distinguishes one answer option from plausible competitors"
+        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
+        score_half: "One option is supported, but some competing options remain unclear"
+        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
+
+      - name: evidence_consistency
+        description: "Evidence does not contain unresolved contradictions on key facts"
+        score_1:    "No unresolved contradiction on key facts"
+        score_half: "Minor inconsistency but does not affect answer"
+        score_0:    "Unresolved contradiction affects answer or option choice"
+
+    scoring_rule: min
+    sufficient_threshold: 0.75
+
+  # ── Information synopsis ──────────────────────────────────────────────────────
+  synopsis:
+    rubric_criteria:
+      - name: main_topic_identified
+        description: "Evidence clearly identifies the central theme, topic, or purpose that the question asks about"
+        score_1:    "Central topic is explicitly and specifically described in evidence with concrete details"
+        score_half: "Topic is partially covered or only implicitly referenced"
+        score_0:    "Topic is absent from evidence"
+
+      - name: option_disambiguation
+        description: "Evidence distinguishes one answer option from plausible competitors"
+        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
+        score_half: "One option is supported, but some competing options remain unclear"
+        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
+
+      - name: evidence_consistency
+        description: "Evidence does not contain unresolved contradictions on key facts"
+        score_1:    "No unresolved contradiction on key facts"
+        score_half: "Minor inconsistency but does not affect answer"
+        score_0:    "Unresolved contradiction affects answer or option choice"
+
+      - name: evidence_grounding
+        description: "Evidence concretely grounds the selected answer"
+        score_1:    "Concrete retrieved evidence directly supports the answer"
+        score_half: "Partially grounded but some inference remains"
+        score_0:    "Vague, generic, or unsupported"
+
+    scoring_rule: average
+    sufficient_threshold: 0.75
+
+  # ── OCR / Text reading ────────────────────────────────────────────────────────
+  ocr:
+    rubric_criteria:
+      - name: text_content_found
+        description: "Evidence explicitly states or very closely paraphrases the relevant on-screen text"
+        score_1:    "Exact text is quoted or very closely paraphrased with no ambiguity"
+        score_half: "Text is partially mentioned or paraphrased with uncertainty"
+        score_0:    "Text content is absent or unrelated"
+
+      - name: option_disambiguation
+        description: "Evidence distinguishes one answer option from plausible competitors"
+        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
+        score_half: "One option is supported, but some competing options remain unclear"
+        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
+
+      - name: evidence_consistency
+        description: "Evidence does not contain unresolved contradictions on key facts"
+        score_1:    "No unresolved contradiction on key facts"
+        score_half: "Minor inconsistency but does not affect answer"
+        score_0:    "Unresolved contradiction affects answer or option choice"
+
+    scoring_rule: min
+    sufficient_threshold: 0.75
+
+  # ── Default (catch-all) ───────────────────────────────────────────────────────
+  default:
+    rubric_criteria:
+      - name: answer_content_found
+        description: "Evidence contains the specific fact, entity, or value needed to identify the correct option"
+        score_1:    "Evidence directly states the specific fact that maps to exactly one option"
+        score_half: "Evidence is topic-relevant but the specific fact is implicit or uncertain"
+        score_0:    "Evidence is off-topic or misses the required specific fact entirely"
+
+      - name: option_disambiguation
+        description: "Evidence distinguishes one answer option from plausible competitors"
+        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
+        score_half: "One option is supported, but some competing options remain unclear"
+        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
+
+      - name: factual_specificity
+        description: "Evidence provides concrete, specific details rather than vague generalities"
+        score_1:    "Specific facts, names, numbers, events, or direct quotes cited"
+        score_half: "Partially specific; some vague language remains"
+        score_0:    "Entirely vague or non-committal"
+
+      - name: evidence_consistency
+        description: "Evidence does not contain unresolved contradictions on key facts"
+        score_1:    "No unresolved contradiction on key facts"
+        score_half: "Minor inconsistency but does not affect answer"
+        score_0:    "Unresolved contradiction affects answer or option choice"
+
+      - name: evidence_grounding
+        description: "Evidence concretely grounds the selected answer"
+        score_1:    "Concrete retrieved evidence directly supports the answer"
+        score_half: "Partially grounded but some inference remains"
+        score_0:    "Vague, generic, or unsupported"
+
+    scoring_rule: average
+    sufficient_threshold: 0.65
