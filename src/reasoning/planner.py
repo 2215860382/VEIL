@@ -238,7 +238,7 @@ def _failed_criteria(criteria: Optional[dict], threshold: float = 1.0) -> dict:
     return failed
 
 
-def _planner_repair_context(verdict: dict, use_rubric_judgment: bool) -> Tuple[str, Optional[dict]]:
+def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> Tuple[str, Optional[dict]]:
     """Build the only verifier-derived context the planner may use."""
     missing = verdict.get("missing_evidence_analysis") or ""
     missing_lines: List[str] = []
@@ -259,7 +259,7 @@ def _planner_repair_context(verdict: dict, use_rubric_judgment: bool) -> Tuple[s
     else:
         missing = str(missing)
 
-    if not use_rubric_judgment:
+    if not rubric_judgment:
         parts = []
         if missing:
             parts.append(f"Missing evidence analysis: {missing}")
@@ -326,13 +326,26 @@ class Planner:
         candidates: List[str],
         *,
         force_option: bool = False,
+        decompose: bool = True,
     ) -> dict:
-        """Iter-0 plan: LLM atomic-fact decomposition (default) or per-option queries."""
+        """Iter-0 plan.
+
+        Three modes (force_option wins over decompose):
+          - force_option=True            -> one option-grounded query per candidate
+          - decompose=True  (default)    -> LLM splits the question into 2-4 atomic sub-queries
+          - decompose=False              -> single query == original question (no decomposition)
+        """
         if force_option:
             return {
                 "strategy":  "targeted",
                 "queries":   _option_grounded_subquestions(question, candidates),
                 "reasoning": "iter0_option_grounded",
+            }
+        if not decompose:
+            return {
+                "strategy":  "targeted",
+                "queries":   [question],
+                "reasoning": "iter0_no_decompose",
             }
         return {
             "strategy":  "targeted",
@@ -343,10 +356,10 @@ class Planner:
     def repair_context(
         self,
         verdict: dict,
-        use_rubric_judgment: bool,
+        rubric_judgment: bool,
     ) -> Tuple[str, Optional[dict]]:
         """Project a verifier verdict into (missing_description, failed_criteria)."""
-        return _planner_repair_context(verdict, use_rubric_judgment)
+        return _planner_repair_context(verdict, rubric_judgment)
 
     def plan_next(
         self,
@@ -357,8 +370,7 @@ class Planner:
         plan_history: List[dict],
         *,
         keyword_broadcast: bool = True,
-        use_rubric_judgment: bool = True,
-        use_option_status: bool = True,
+        rubric_judgment: bool = True,
         prune_satisfied: bool = False,
     ) -> Tuple[dict, str, Optional[dict]]:
         """Pick the next iter plan from the verifier verdict.
@@ -366,19 +378,18 @@ class Planner:
         Returns (plan, missing_description, failed_criteria).
         The latter two are also returned so callers can record them in the trace.
         """
-        m_desc, failed = _planner_repair_context(verdict, use_rubric_judgment)
+        m_desc, failed = _planner_repair_context(verdict, rubric_judgment)
 
         if keyword_broadcast and _needs_broadcast(m_desc):
             plan = {"strategy": "broadcast", "queries": [], "reasoning": "keyword_trigger"}
             return plan, m_desc, failed
 
-        opt_status = (verdict.get("option_status")
-                      if (use_rubric_judgment and use_option_status) else None)
+        opt_status = verdict.get("option_status") if rubric_judgment else None
         plan = _plan_next(
             question, candidates, evidence_texts, m_desc, self.llm, plan_history,
             allow_broadcast=not keyword_broadcast,
             option_status=opt_status,
-            failed_criteria=failed if use_rubric_judgment else None,
+            failed_criteria=failed if rubric_judgment else None,
             prune_satisfied=prune_satisfied,
         )
         return plan, m_desc, failed

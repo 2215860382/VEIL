@@ -354,8 +354,8 @@ class Verifier:
         evidence_texts: List[str],
         rubric: str | dict,
         keyframe_images=(),
-        use_rubric_judgment: bool = True,
-        include_evidence_attribution: bool = False,
+        rubric_judgment: bool = True,
+        explicit_attribution: bool = False,
     ) -> Dict:
         """Judge evidence sufficiency with rubric-guided structured reasoning.
 
@@ -379,12 +379,12 @@ class Verifier:
         else:
             rubric_dict = rubric
 
-        if not use_rubric_judgment:
+        if not rubric_judgment:
             # No rubric: LLM makes holistic sufficient/insufficient judgment
             sys_prompt = VERIFIER_SYS_NORUBRIC
             rubric_section = ""
         else:
-            sys_prompt = VERIFIER_SYS_WITH_ATTR if include_evidence_attribution else VERIFIER_SYS
+            sys_prompt = VERIFIER_SYS_WITH_ATTR if explicit_attribution else VERIFIER_SYS
             rubric_section = (
                 rubric_dict["_legacy_text"]
                 if "_legacy_text" in rubric_dict
@@ -410,7 +410,7 @@ class Verifier:
         ]
         if keyframe_images and getattr(self.llm, '_api_endpoints', None):
             messages[-1] = _inject_images(messages[-1], keyframe_images)
-        if not use_rubric_judgment:
+        if not rubric_judgment:
             max_new_tokens = 256
         else:
             max_new_tokens = 640
@@ -527,7 +527,7 @@ class Verifier:
 
         key_ids        = _parse_id_list(parsed.get("key_ids"))
         distractor_ids = _parse_id_list(parsed.get("distractor_ids"))
-        if include_evidence_attribution and use_rubric_judgment and label == "sufficient" and not key_ids:
+        if explicit_attribution and rubric_judgment and label == "sufficient" and not key_ids:
             # fallback: treat all evidence as key when sufficient and no attribution given
             key_ids = list(range(1, len(evidence_texts) + 1))
 
