@@ -248,15 +248,13 @@ def run_veil(
     query_drift_threshold: float | None = 0.70,
     answer_evidence_cap:   int | None   = None,
     keyword_broadcast:     bool         = True,
-    use_option_status:     bool         = True,
     prune_satisfied:       bool         = False,
-    use_rubric_judgment:   bool         = True,
-    chunks_per_iter:       Optional[int] = None,
-    per_subq_k:            Optional[int] = None,
-    use_subquestions:      bool         = False,
+    rubric_judgment:       bool         = True,
+    iter0_decompose:       bool         = True,
     force_option_subquestions: bool     = False,
     rubric_rerank:         bool         = False,
-    evidence_attribution:  bool         = False,
+    explicit_attribution:  bool         = False,
+    prune_distractors:     bool         = False,
     use_oracle:            bool         = False,
     gold_answer:           str          = "",
 ) -> dict:
@@ -284,9 +282,15 @@ def run_veil(
     iterations:         List[dict]        = []
     chunk_by_id = {c.chunk_id: c for c in bank.chunks}
 
+    # Pruning distractors requires the verifier to actually emit distractor_ids.
+    if prune_distractors and not explicit_attribution:
+        explicit_attribution = True
+
     # ── Iter-0 plan: sub-question decomposition ──────────────────────────────
     current_plan: dict = planner.decompose_iter0(
-        question, candidates, force_option=force_option_subquestions,
+        question, candidates,
+        force_option=force_option_subquestions,
+        decompose=iter0_decompose,
     )
 
     for it in range(max_iter):
@@ -343,10 +347,14 @@ def run_veil(
         # ── Verifier ─────────────────────────────────────────────────────────
         verdict = verifier.verify(question, candidates, all_evidence_texts, rubric,
                                   keyframe_images=all_keyframes,
-                                  use_rubric_judgment=use_rubric_judgment,
-                                  include_evidence_attribution=evidence_attribution)
+                                  rubric_judgment=rubric_judgment,
+                                  explicit_attribution=explicit_attribution)
 
-        # ── Oracle mode: override label/missing based on gold answerer check ─
+        # ── Oracle mode: gold-aware overrides for label / missing / option_status ─
+        # Criteria (and score) are deliberately NOT overridden — keeping them
+        # honest so the trace exposes cases where rubric judged "insufficient"
+        # while the answerer actually hit gold (a diagnostic signal for rubric
+        # tuning).
         if use_oracle and gold_answer:
             gold_letter = chr(65 + candidates.index(gold_answer)) if gold_answer in candidates else ""
             if len(all_evidence_texts) > 1:
@@ -367,9 +375,15 @@ def run_veil(
                 verdict["label"] = "insufficient"
                 verdict["missing_evidence_analysis"] = _missing
                 verdict["reasoning"] = f"Oracle: pred={_pred} != gold={gold_letter} ({verdict.get('reasoning','')})"
+            # Perfect option_status: gold -> verified, others -> excluded.
+            if gold_letter:
+                verdict["option_status"] = {
+                    chr(65 + i): ("verified" if c == gold_answer else "excluded")
+                    for i, c in enumerate(candidates)
+                }
 
-        # ── Evidence attribution: remove distractors from accumulated set ────
-        if evidence_attribution:
+        # ── Prune distractors flagged by the verifier ────────────────────────
+        if prune_distractors:
             dist_set = {i - 1 for i in (verdict.get("distractor_ids") or [])
                         if 1 <= i <= len(all_evidence_texts)}
             if dist_set:
@@ -406,8 +420,7 @@ def run_veil(
         next_plan, m_desc, _failed = planner.plan_next(
             question, candidates, all_evidence_texts, verdict, plan_history,
             keyword_broadcast=keyword_broadcast,
-            use_rubric_judgment=use_rubric_judgment,
-            use_option_status=use_option_status,
+            rubric_judgment=rubric_judgment,
             prune_satisfied=prune_satisfied,
         )
 
