@@ -7,9 +7,9 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from reasoning.answerer import Answerer
-from models.vlm_client import VLMClient
-from experiments.pipelines._keyframes import load_keyframe_pil, keyframe_path
+from src.reasoning.answerer import Answerer
+from src.models.vlm_client import VLMClient
+from src.pipelines._keyframes import load_keyframe_pil, keyframe_path
 
 MEM_DIR = Path("/home2/ycj/Project/VEIL/outputs/memory/videomme_L_27b_27b")
 CLASSMATE_INPUT = "/home2/ycj/Project/VedioSifter/data/coarse_retrieval_bge.jsonl"

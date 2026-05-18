@@ -1,8 +1,8 @@
 import json, sys, time, types
 sys.path.insert(0, '/home2/ycj/Project/VEIL')
-from reasoning.answerer import ANSWERER_SYS, _normalize, _format_options, _format_evidence
-from utils.jsonx import extract_json
-from models.llm_client import LLMClient
+from src.reasoning.answerer import ANSWERER_SYS, _normalize, _format_options, _format_evidence
+from src.utils.jsonx import extract_json
+from src.models.llm_client import LLMClient
 
 INPUT = '/home2/ycj/Project/VedioSifter/data/coarse_retrieval_bge.jsonl'
 questions = [json.loads(l) for l in open(INPUT)][:15]

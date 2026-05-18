@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import List
 
-from utils.jsonx import as_list, as_str, extract_json, _CHOICE_RE
+from src.utils.jsonx import as_list, as_str, extract_json, _CHOICE_RE
 
 
 def _inject_images(message: dict, pil_images) -> dict:

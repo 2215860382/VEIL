@@ -38,7 +38,7 @@ mkdir -p "$RUN_DIR"
   echo "=== $(date -Is) ==="
   echo "OUT=$OUT MEM=$MEM FILTER=$FILTER LLM_API=$LLM_API BGE=$BGE_GPU SIGLIP=$SIGLIP_GPU RERANK=$RERANKER_GPU"
   "$PYTHON" experiments/run_experiments.py \
-  --config experiments/configs/videomme_memory_bank.yaml \
+  --config configs/videomme_memory_bank.yaml \
   --memory-dir "$MEM" \
   --filter-from "$FILTER" \
   --pipelines direct_27b coarse64_27b coarse8_27b rerank_rag8_27b veil_coarse8_27b \

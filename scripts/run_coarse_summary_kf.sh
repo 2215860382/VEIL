@@ -25,7 +25,7 @@ BGE_GPU="${BGE_GPU:-cuda:0}"
 SIGLIP_GPU="${SIGLIP_GPU:-cuda:0}"
 
 BASE_ARGS=(
-  --config experiments/configs/videomme_memory_bank.yaml
+  --config configs/videomme_memory_bank.yaml
   --memory-dir "$MEM"
   --filter-from "$FILTER"
   --vlm-api-url "$LLM_API"

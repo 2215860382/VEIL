@@ -8,8 +8,8 @@ from typing import List
 
 import numpy as np
 
-from experiments.pipelines._keyframes import load_keyframes
-from memory.schema import MemoryBank
+from src.pipelines._keyframes import load_keyframes
+from src.memory.core.schema import MemoryBank
 
 
 def run_coarse_rag(
@@ -62,7 +62,7 @@ def run_coarse_rag(
         top_idx = top_idx[:cap]
 
     if rubric_rerank and llm is not None and rubric is not None and len(top_idx) > 1:
-        from experiments.pipelines.veil import _rerank_by_rubric
+        from src.pipelines.veil import _rerank_by_rubric
         ordered_texts = [texts_ev[i] for i in top_idx]
         order = _rerank_by_rubric(question, candidates, ordered_texts, rubric, llm)
         top_idx = top_idx[[int(i) for i in order]]

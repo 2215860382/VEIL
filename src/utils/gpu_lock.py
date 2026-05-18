@@ -1,7 +1,7 @@
 """Pre-allocate remaining GPU memory after models are loaded.
 
 Usage:
-    from utils.gpu_lock import lock_gpu, release_gpu
+    from src.utils.gpu_lock import lock_gpu, release_gpu
 
     # After loading all models on a device:
     _lock = lock_gpu("cuda:0", reserve_fraction=0.95)
@@ -21,7 +21,7 @@ _log = None
 def _get_log():
     global _log
     if _log is None:
-        from utils.logging import get_logger
+        from src.utils.logging import get_logger
         _log = get_logger("gpu_lock")
     return _log
 

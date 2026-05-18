@@ -7,9 +7,9 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from reasoning.answerer import Answerer, ANSWERER_SYS
-from utils.jsonx import extract_json, as_str, as_list
-from models.llm_client import LLMClient
+from src.reasoning.answerer import Answerer, ANSWERER_SYS
+from src.utils.jsonx import extract_json, as_str, as_list
+from src.models.llm_client import LLMClient
 
 
 def fmt_evidence(chunk: dict) -> str:
