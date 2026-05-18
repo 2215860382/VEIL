@@ -21,10 +21,10 @@ from typing import List, Optional, Set
 
 import numpy as np
 
-from experiments.pipelines._keyframes import keyframe_path, load_keyframe_pil
-from memory.schema import MemoryBank
-from reasoning.planner import Planner
-from reasoning.verifier import Verifier, get_rubric_dict
+from src.pipelines._keyframes import keyframe_path, load_keyframe_pil
+from src.memory.core.schema import MemoryBank
+from src.reasoning.planner import Planner
+from src.reasoning.verifier import Verifier, get_rubric_dict
 
 
 # ── Broadcast (uniform timeline sampling) ────────────────────────────────────
@@ -117,7 +117,7 @@ def _rerank_by_rubric(
     if len(evidence_texts) <= 1:
         return list(range(len(evidence_texts)))
 
-    from reasoning.verifier import _format_rubric_as_text
+    from src.reasoning.verifier import _format_rubric_as_text
     opts    = "\n".join(f"({chr(65+i)}) {c}" for i, c in enumerate(candidates))
     ev_fmt  = "\n".join(f"[E{i+1}] {t[:300]}" for i, t in enumerate(evidence_texts))
     rubric_text = _format_rubric_as_text(rubric)

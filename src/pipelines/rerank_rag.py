@@ -5,8 +5,8 @@ from typing import List
 
 import numpy as np
 
-from experiments.pipelines._keyframes import load_keyframes
-from memory.schema import MemoryBank
+from src.pipelines._keyframes import load_keyframes
+from src.memory.core.schema import MemoryBank
 
 
 def run_rerank_rag(

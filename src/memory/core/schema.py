@@ -57,7 +57,7 @@ class MemoryBank(BaseModel):
     # Effective temporal chunk length (seconds) for event / dense builders.
     chunk_sec: Optional[float] = None
     stride_sec: Optional[float] = None
-    # Provenance from memory.build.similarity (similarity-based grouping).
+    # Provenance from src.memory.similarity (similarity-based grouping).
     vlm_caption_model: Optional[str] = None
     vlm_summary_model: Optional[str] = None
     vlm_caption_backend: Optional[str] = None  # "local" | "api"
@@ -69,7 +69,7 @@ class MemoryBank(BaseModel):
     subtitle_dir: Optional[str] = None
     subtitle_file_present: Optional[bool] = None
     subtitle_cue_count: Optional[int] = None
-    # Fixed-frame bank metadata (memory.build.fixedframe).
+    # Fixed-frame bank metadata (src.memory.fixedframe).
     frames_per_chunk: Optional[int] = None
     frame_positions_within_chunk: Optional[List[float]] = None
     chunking_readme_zh: Optional[str] = None

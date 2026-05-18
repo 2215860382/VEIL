@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 import yaml
 
-from utils.jsonx import as_str, extract_json
+from src.utils.jsonx import as_str, extract_json
 
 
 def _inject_images(message: dict, pil_images) -> dict:

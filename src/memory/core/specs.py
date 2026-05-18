@@ -1,9 +1,9 @@
 """Canonical benchmark paths, output dirs, and default hyper-parameters for memory builders.
 
-Not used by ``experiments/run_experiments.py`` (that reads ``experiments/configs/*.yaml``); it exists so
-``memory.build.similarity`` / ``memory.build.fixedframe`` do not duplicate path logic.
+Not used by ``experiments/run_experiments.py`` (that reads ``configs/*.yaml``); it exists so
+``src.memory.similarity`` / ``src.memory.fixedframe`` do not duplicate path logic.
 
-Eval / baselines use ``experiments/configs/*.yaml``. Builders load this module unless paths are
+Eval / baselines use ``configs/*.yaml``. Builders load this module unless paths are
 overridden via CLI flags or ``--config`` YAML.
 """
 from __future__ import annotations
@@ -77,7 +77,7 @@ def similarity_memory_cache_dir(name: BenchName) -> Path:
 
 
 def cfg_for_similarity_build(name: BenchName, bge_device: str = "cuda:0") -> dict[str, Any]:
-    """Minimal config dict for ``memory.build.similarity`` (benchmark + embedder + out dir)."""
+    """Minimal config dict for ``src.memory.similarity`` (benchmark + embedder + out dir)."""
     bench = benchmark_mlvu() if name == "mlvu" else benchmark_videomme()
     out = str(similarity_memory_cache_dir(name))
     return {
@@ -102,7 +102,7 @@ FIXEDFRAME_MODE_PARAMS: dict[str, dict[str, float | int]] = {
 
 
 def cfg_for_fixedframe_build(name: BenchName) -> dict[str, Any]:
-    """Benchmark + paths for ``memory.build.fixedframe`` CLI."""
+    """Benchmark + paths for ``src.memory.fixedframe`` CLI."""
     bench = benchmark_mlvu() if name == "mlvu" else benchmark_videomme()
     return {
         "paths": {"outputs_root": str(_OUTPUTS_ROOT)},

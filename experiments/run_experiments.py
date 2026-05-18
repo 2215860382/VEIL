@@ -13,7 +13,7 @@ Pipelines (all use Answerer — multimodal, summary + ASR + keyframe images):
 Usage:
     cd /home2/ycj/Project/VEIL
     PYTHONPATH=. python experiments/run_experiments.py \\
-        --config experiments/configs/mlvu_memory_bank.yaml \\
+        --config configs/mlvu_memory_bank.yaml \\
         --pipelines coarse8 coarse64 rerank_rag8 veil_coarse8 veil_rerank8 \\
         --filter-from outputs/results/mlvu/some_subset.jsonl \\
         --vlm-gpu cuda:0 --bge-gpu cuda:3 --llm-gpu cuda:1 \\
@@ -32,8 +32,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from utils.config import load_config
-from utils.logging import get_logger
+from src.config import load_config
+from src.utils.logging import get_logger
 
 log = get_logger("run_experiments")
 
@@ -87,7 +87,7 @@ def _dynamic_coarse_27b(pipeline: str) -> tuple[int, bool] | None:
 def load_samples(cfg: dict, filter_video_ids: set | None = None):
     bench = cfg["benchmark"]["name"]
     if bench == "mlvu":
-        from dataloader.mlvu import load_mlvu
+        from src.dataloader.mlvu import load_mlvu
         b = cfg["benchmark"]
         samples = load_mlvu(
             json_dir=b["json_dir"],
@@ -95,7 +95,7 @@ def load_samples(cfg: dict, filter_video_ids: set | None = None):
             json_files=b["json_files"],
         )
     elif bench == "videomme":
-        from dataloader.videomme import load_videomme
+        from src.dataloader.videomme import load_videomme
         b = cfg["benchmark"]
         samples = load_videomme(
             parquet_path=b["parquet_path"],
@@ -254,8 +254,8 @@ def main():
 
     if needs_vlm:
         t0 = time.time()
-        from models.vlm_client import VLMClient
-        from reasoning.answerer import Answerer
+        from src.models.vlm_client import VLMClient
+        from src.reasoning.answerer import Answerer
         vlm_api_url = getattr(args, "vlm_api_url", None)
         vlm_model   = args.vlm_model or cfg["models"]["vlm"]["model_path"]
         if vlm_api_url:
@@ -269,7 +269,7 @@ def main():
         log.info("  VLM ready (%.1fs)", time.time() - t0)
 
     if needs_bge:
-        from models.embedder import BGEM3Embedder
+        from src.models.embedder import BGEM3Embedder
         log.info("loading BGE-M3 on %s ...", args.bge_gpu)
         t0 = time.time()
         embedder = BGEM3Embedder(
@@ -280,7 +280,7 @@ def main():
         log.info("  BGE-M3 ready (%.1fs)", time.time() - t0)
 
     if needs_reranker:
-        from models.reranker import BGEReranker
+        from src.models.reranker import BGEReranker
         reranker_dev = args.reranker_gpu if args.reranker_gpu is not None else args.bge_gpu
         log.info("loading BGE reranker on %s ...", reranker_dev)
         t0 = time.time()
@@ -293,7 +293,7 @@ def main():
 
     shared_api_llm = None
     if args.llm_api_url and (needs_llm or needs_27b_ans):
-        from models.llm_client import LLMClient
+        from src.models.llm_client import LLMClient
         api_model = args.llm_api_model or "Qwen3.5-27B"
         log.info("loading shared API LLM %s @ %s ...", api_model, args.llm_api_url)
         t0 = time.time()
@@ -305,8 +305,8 @@ def main():
         log.info("  API LLM ready (%.1fs)", time.time() - t0)
 
     if needs_llm:
-        from models.llm_client import LLMClient
-        from models.reranker import LLMReranker
+        from src.models.llm_client import LLMClient
+        from src.models.reranker import LLMReranker
         if shared_api_llm is not None:
             llm = shared_api_llm
             log.info("planner / LLM-rerank use API LLM")
@@ -333,7 +333,7 @@ def main():
         log.info("27B answerer = Answerer(vlm)")
 
     if needs_siglip and siglip_device:
-        from models.siglip_embedder import SigLIPEmbedder
+        from src.models.siglip_embedder import SigLIPEmbedder
         siglip_model = "/home2/ycj/Models/google/siglip-large-patch16-384"
         log.info("loading SigLIP on %s (dual-path coarse/veil when v_visual present) ...", siglip_device)
         t0 = time.time()
@@ -372,7 +372,7 @@ def main():
         with _cache_lock:
             if video_path in _frame_cache:
                 return _frame_cache[video_path]
-        from memory.sample_frames import sample_frames
+        from src.memory.core.sample_frames import sample_frames
         fs = cfg.get("frame_sampling", {})
         sv = sample_frames(video_path,
                            fps=fs.get("fps", 1),
@@ -389,18 +389,18 @@ def main():
         bp = memory_dir / f"{video_id}.json"
         if not bp.exists():
             return None
-        from memory.schema import MemoryBank
+        from src.memory.core.schema import MemoryBank
         bank = MemoryBank.load(bp)
         with _cache_lock:
             _bank_cache[video_id] = bank
         return bank
 
     # ── Pipeline dispatch ──────────────────────────────────────────────────────
-    from experiments.pipelines.direct_video_qa import run_direct_video_qa
-    from experiments.pipelines.coarse_rag import run_coarse_rag
-    from experiments.pipelines.rerank_rag import run_rerank_rag
-    from experiments.pipelines.veil import run_veil
-    from eval.parse_answer import parse_letter
+    from src.pipelines.direct_video_qa import run_direct_video_qa
+    from src.pipelines.coarse_rag import run_coarse_rag
+    from src.pipelines.rerank_rag import run_rerank_rag
+    from src.pipelines.veil import run_veil
+    from src.eval.parse_answer import parse_letter
 
     aek = args.answer_evidence_k
 
@@ -422,7 +422,7 @@ def main():
             top_k, use_rubric_rerank = dyn_coarse
             rubric = None
             if use_rubric_rerank:
-                from reasoning.verifier import get_rubric_dict
+                from src.reasoning.verifier import get_rubric_dict
                 rubric = get_rubric_dict(s.question, s.question_type)
             r = run_coarse_rag(s.question, s.candidates, bank, embedder, text_answerer_27b,
                                top_k=top_k, siglip=siglip, text_alpha=va, keyframe_dir=kf_dir,
