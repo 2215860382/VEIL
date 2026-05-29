@@ -236,10 +236,10 @@ def run_veil(
     llm,
     task_type:     Optional[str] = None,
     reranker                     = None,
-    coarse_top_k:  int           = 64,
+    coarse_top_k:  int           = 8,
     final_top_k:   int           = 8,
     max_iter:      int           = 3,
-    dedup_thresh:  float         = 0.5,
+    dedup_thresh:  float         = 0.9,
     siglip                       = None,
     text_alpha:    float         = 0.6,
     keyframe_dir                 = None,
@@ -247,16 +247,19 @@ def run_veil(
     ev_dedup_threshold:    float = 0.85,
     query_drift_threshold: float | None = 0.70,
     answer_evidence_cap:   int | None   = None,
-    keyword_broadcast:     bool         = True,
+    answer_keyframe_cap:   int | None   = 16,
+    verifier_evidence_cap: int | None   = None,
     prune_satisfied:       bool         = False,
     rubric_judgment:       bool         = True,
-    iter0_decompose:       bool         = True,
     force_option_subquestions: bool     = False,
+    verifier_attr:         bool         = False,
+    verifier_opstatus:     bool         = False,
     rubric_rerank:         bool         = False,
     explicit_attribution:  bool         = False,
     prune_distractors:     bool         = False,
     use_oracle:            bool         = False,
     gold_answer:           str          = "",
+    oracle_no_second_rerank: bool       = False,
 ) -> dict:
     """Iter-0 sub-question decomposition + iter ≥1 unified-planner repair.
 
@@ -276,24 +279,45 @@ def run_veil(
     all_ev_vecs:        List[List[float]] = []
     all_keyframes:      List              = []
     all_kf_vecs:        List[List[float]] = []
+    all_kf_chunk_ids:   List[int]         = []
     seen_ids:           Set[int]          = set()
-    prev_queries:       List[str]         = [question]
-    plan_history:       List[dict]        = []
+    plan_history:       List[List[str]]   = [[question]]  # seed with original question for dedup
     iterations:         List[dict]        = []
     chunk_by_id = {c.chunk_id: c for c in bank.chunks}
 
-    # Pruning distractors requires the verifier to actually emit distractor_ids.
-    if prune_distractors and not explicit_attribution:
+    # Pruning distractors requires distractor_ids from the verifier.
+    # verifier_opstatus already outputs distractor_ids; only fall back to explicit_attribution otherwise.
+    if prune_distractors and not explicit_attribution and not verifier_opstatus:
         explicit_attribution = True
 
     # ── Iter-0 plan: sub-question decomposition ──────────────────────────────
     current_plan: dict = planner.decompose_iter0(
         question, candidates,
         force_option=force_option_subquestions,
-        decompose=iter0_decompose,
     )
+    plan_history.append(current_plan["queries"])
+    last_verdict: dict = {}
+    gold_letter = (chr(65 + candidates.index(gold_answer))
+                   if use_oracle and gold_answer and gold_answer in candidates else "")
+    oracle_frozen_result: Optional[dict] = None
 
     for it in range(max_iter):
+
+        # ── Plan (iter ≥ 1): generate new queries from last verdict + history ─
+        if it > 0:
+            next_plan, m_desc, _weak = planner.plan_next(
+                question, candidates, all_evidence_texts, last_verdict, plan_history,
+                rubric_judgment=rubric_judgment,
+                prune_satisfied=prune_satisfied,
+            )
+            next_plan = planner.filter_targeted_queries(
+                next_plan, plan_history, embedder, all_ev_vecs,
+                dedup_thresh=dedup_thresh,
+                drift_threshold=query_drift_threshold,
+            )
+            plan_history.append(next_plan["queries"])
+            current_plan = next_plan
+
         do_broadcast      = (current_plan["strategy"] == "broadcast")
         queries_this_iter = current_plan["queries"] if not do_broadcast else []
 
@@ -302,12 +326,8 @@ def run_veil(
 
         if do_broadcast:
             new_texts, new_ids, new_vecs = _broadcast_retrieve(bank, seen_ids, n=final_top_k)
-            new_texts, new_ids, new_vecs = _dedup_by_similarity(
-                new_texts, new_ids, new_vecs, all_ev_vecs, ev_dedup_threshold)
-            seen_ids.update(new_ids)
             iter_query = "[broadcast]"
         else:
-            # Each sub-question independently retrieves final_top_k chunks.
             for q in queries_this_iter:
                 vq = vis_query if it == 0 else q
                 t, i, v = _query_retrieve(
@@ -315,15 +335,14 @@ def run_veil(
                     coarse_top_k, final_top_k, seen_ids,
                     siglip=siglip, text_alpha=text_alpha, vis_query=vq,
                 )
-                t, i, v = _dedup_by_similarity(t, i, v, all_ev_vecs + new_vecs, ev_dedup_threshold)
                 new_texts.extend(t); new_ids.extend(i); new_vecs.extend(v)
                 seen_ids.update(i)
             iter_query = (" | ".join(queries_this_iter) if len(queries_this_iter) > 1
                           else (queries_this_iter[0] if queries_this_iter else ""))
 
         new_texts, new_ids, new_vecs = _dedup_by_similarity(
-            new_texts, new_ids, new_vecs, all_ev_vecs, ev_dedup_threshold,
-        )
+            new_texts, new_ids, new_vecs, all_ev_vecs, ev_dedup_threshold)
+        seen_ids.update(new_ids)
         all_evidence_texts.extend(new_texts)
         all_chunk_ids.extend(new_ids)
         all_ev_vecs.extend(new_vecs)
@@ -343,48 +362,78 @@ def run_veil(
                         continue
                 all_keyframes.append(img)
                 all_kf_vecs.append(c.v_visual if c.v_visual else [])
+                all_kf_chunk_ids.append(cid)
 
-        # ── Verifier ─────────────────────────────────────────────────────────
-        verdict = verifier.verify(question, candidates, all_evidence_texts, rubric,
-                                  keyframe_images=all_keyframes,
+        # ── Verifier ──────────────────────────────────────────────────────────
+        if verifier_evidence_cap is not None and len(all_evidence_texts) > verifier_evidence_cap:
+            order = _rerank_by_rubric(question, candidates, all_evidence_texts, rubric, llm)
+            top_k = min(verifier_evidence_cap, len(all_evidence_texts))
+            ev_for_verifier = [all_evidence_texts[i] for i in order[:top_k]]
+        else:
+            ev_for_verifier = all_evidence_texts
+
+        kf_for_verifier = all_keyframes
+        if answer_keyframe_cap is not None and len(kf_for_verifier) > answer_keyframe_cap:
+            kf_for_verifier = kf_for_verifier[:answer_keyframe_cap]
+
+        last_verdict = verifier.verify(question, candidates, ev_for_verifier, rubric,
+                                  keyframe_images=kf_for_verifier,
                                   rubric_judgment=rubric_judgment,
-                                  explicit_attribution=explicit_attribution)
+                                  explicit_attribution=explicit_attribution,
+                                  verifier_attr=verifier_attr,
+                                  verifier_opstatus=verifier_opstatus)
 
-        # ── Oracle mode: gold-aware overrides for label / missing / option_status ─
-        # Criteria (and score) are deliberately NOT overridden — keeping them
-        # honest so the trace exposes cases where rubric judged "insufficient"
-        # while the answerer actually hit gold (a diagnostic signal for rubric
-        # tuning).
-        if use_oracle and gold_answer:
-            gold_letter = chr(65 + candidates.index(gold_answer)) if gold_answer in candidates else ""
-            if len(all_evidence_texts) > 1:
+        # ── Oracle check (post-verifier) ──────────────────────────────────────
+        # Oracle uses the same evidence/keyframe caps as the final answerer.
+        # The stable variant can freeze this exact answer order to avoid a second
+        # rerank changing the final prediction after oracle already succeeded.
+        oracle_pred = ""
+        if use_oracle and gold_letter:
+            oracle_ev_texts = list(all_evidence_texts)
+            oracle_ev_ids   = list(all_chunk_ids)
+            if len(oracle_ev_texts) > 1:
                 _order = _rerank_by_rubric(question, candidates, all_evidence_texts, rubric, llm)
-                _ev_sorted = [all_evidence_texts[i] for i in _order]
+                oracle_ev_texts = [oracle_ev_texts[i] for i in _order]
+                oracle_ev_ids   = [oracle_ev_ids[i]   for i in _order]
+            if answer_evidence_cap is not None:
+                top_k = min(answer_evidence_cap, len(oracle_ev_texts))
+                oracle_ev_texts = oracle_ev_texts[:top_k]
+                oracle_ev_ids   = oracle_ev_ids[:top_k]
+
+            kf_for_oracle = all_keyframes
+            if answer_keyframe_cap is not None and len(kf_for_oracle) > answer_keyframe_cap:
+                kf_for_oracle = kf_for_oracle[:answer_keyframe_cap]
+
+            oracle_pred = answerer.answer(question, candidates, oracle_ev_texts,
+                                          keyframe_images=kf_for_oracle).get("answer", "")
+
+            last_verdict["reasoning"] = (
+                f"Oracle: pred={oracle_pred or '?'} "
+                f"{'==' if oracle_pred == gold_letter else '!='} gold={gold_letter}"
+            )
+            if oracle_pred == gold_letter:
+                last_verdict["label"] = "FULLY_SUFFICIENT"
+                last_verdict["missing_evidence_analysis"] = None
+                last_verdict["unknown_options"] = []
+                if oracle_no_second_rerank:
+                    oracle_frozen_result = {
+                        "answer": oracle_pred,
+                        "evidence_texts": oracle_ev_texts,
+                        "evidence_chunk_ids": oracle_ev_ids,
+                    }
             else:
-                _ev_sorted = all_evidence_texts
-            _oracle_result = answerer.answer(question, candidates, _ev_sorted,
-                                             keyframe_images=all_keyframes)
-            _pred = _oracle_result.get("answer", "")
-            if _pred == gold_letter:
-                verdict["label"] = "sufficient"
-                verdict["missing_evidence_analysis"] = None
-                verdict["reasoning"] = f"Oracle: pred={_pred} == gold ({verdict.get('reasoning','')})"
-            else:
-                _missing = _oracle_analyze_missing(
-                    question, candidates, all_evidence_texts, gold_letter, _pred, llm)
-                verdict["label"] = "insufficient"
-                verdict["missing_evidence_analysis"] = _missing
-                verdict["reasoning"] = f"Oracle: pred={_pred} != gold={gold_letter} ({verdict.get('reasoning','')})"
-            # Perfect option_status: gold -> verified, others -> excluded.
-            if gold_letter:
-                verdict["option_status"] = {
-                    chr(65 + i): ("verified" if c == gold_answer else "excluded")
-                    for i, c in enumerate(candidates)
+                last_verdict["label"] = "INSUFFICIENT"
+                last_verdict["missing_evidence_analysis"] = _oracle_analyze_missing(
+                    question, candidates, all_evidence_texts, gold_letter, oracle_pred, llm)
+                last_verdict["option_judgment"] = {
+                    chr(65 + i): ("unknown" if chr(65 + i) == gold_letter else "false")
+                    for i in range(len(candidates))
                 }
+                last_verdict["unknown_options"] = [gold_letter]
 
         # ── Prune distractors flagged by the verifier ────────────────────────
         if prune_distractors:
-            dist_set = {i - 1 for i in (verdict.get("distractor_ids") or [])
+            dist_set = {i - 1 for i in (last_verdict.get("distractor_ids") or [])
                         if 1 <= i <= len(all_evidence_texts)}
             if dist_set:
                 keep = [i for i in range(len(all_evidence_texts)) if i not in dist_set]
@@ -392,68 +441,55 @@ def run_veil(
                 all_chunk_ids      = [all_chunk_ids[i]      for i in keep]
                 all_ev_vecs        = [all_ev_vecs[i]        for i in keep]
                 if all_keyframes:
-                    all_keyframes  = [all_keyframes[i]      for i in keep]
+                    keep_cids = set(all_chunk_ids)
+                    kf_keep = [j for j, cid in enumerate(all_kf_chunk_ids) if cid in keep_cids]
+                    all_keyframes    = [all_keyframes[j]    for j in kf_keep]
+                    all_kf_vecs      = [all_kf_vecs[j]      for j in kf_keep]
+                    all_kf_chunk_ids = [all_kf_chunk_ids[j] for j in kf_keep]
 
         # ── Trace ────────────────────────────────────────────────────────────
         iterations.append({
-            "iter":                       it,
-            "query":                      iter_query,
-            "new_ids":                    new_ids,
-            "verdict":                    verdict["label"],
-            "score":                      verdict.get("score"),
-            "criteria":                   verdict.get("criteria"),
-            "reasoning":                  verdict.get("reasoning"),
-            "missing_evidence_analysis":  verdict.get("missing_evidence_analysis") or None,
-            "key_ids":                    verdict.get("key_ids"),
-            "distractor_ids":             verdict.get("distractor_ids"),
-            "option_status":              verdict.get("option_status"),
-            "plan_strategy":              current_plan.get("strategy"),
-            "plan_reasoning":             current_plan.get("reasoning"),
+            "iter":                      it,
+            "query":                     iter_query,
+            "new_ids":                   new_ids,
+            "verdict":                   last_verdict["label"],
+            "option_judgment":           last_verdict.get("option_judgment"),
+            "unknown_options":           last_verdict.get("unknown_options"),
+            "option_rubric_scores":      last_verdict.get("option_rubric_scores"),
+            "weak_rubric_criteria":      last_verdict.get("weak_rubric_criteria"),
+            "missing_evidence_analysis": last_verdict.get("missing_evidence_analysis") or None,
+            "oracle_pred":               oracle_pred or None,
+            "plan_strategy":             current_plan.get("strategy"),
+            "plan_reasoning":            current_plan.get("reasoning"),
         })
 
-        if verdict["label"] == "sufficient":
+        if last_verdict["label"] in ("sufficient", "FULLY_SUFFICIENT", "ANSWER_SUFFICIENT"):
             break
-        if it == max_iter - 1:
-            break
-
-        # ── Plan next iter ───────────────────────────────────────────────────
-        next_plan, m_desc, _failed = planner.plan_next(
-            question, candidates, all_evidence_texts, verdict, plan_history,
-            keyword_broadcast=keyword_broadcast,
-            rubric_judgment=rubric_judgment,
-            prune_satisfied=prune_satisfied,
-        )
-
-        # ── Filter targeted queries; fall back to broadcast if all dropped ───
-        next_plan = planner.filter_targeted_queries(
-            next_plan, prev_queries, embedder, all_ev_vecs,
-            dedup_thresh=dedup_thresh,
-            drift_threshold=query_drift_threshold,
-        )
-
-        plan_history.append({
-            "strategy":         next_plan["strategy"],
-            "queries":          next_plan["queries"],
-            "missing_analysis": m_desc,
-        })
-        prev_queries.extend(next_plan["queries"])
-        current_plan = next_plan
 
     # ── Answer ───────────────────────────────────────────────────────────────
-    ev_texts = all_evidence_texts
-    ev_ids   = all_chunk_ids
-    if answer_evidence_cap is not None:
-        cap      = min(answer_evidence_cap, len(ev_texts))
-        ev_texts = ev_texts[:cap]
-        ev_ids   = ev_ids[:cap]
+    if oracle_frozen_result is not None:
+        ev_texts = list(oracle_frozen_result["evidence_texts"])
+        ev_ids   = list(oracle_frozen_result["evidence_chunk_ids"])
+        result = {"answer": oracle_frozen_result["answer"], "evidence": [], "rationale": ""}
+    else:
+        ev_texts = all_evidence_texts
+        ev_ids   = all_chunk_ids
+        if answer_evidence_cap is not None:
+            cap      = min(answer_evidence_cap, len(ev_texts))
+            ev_texts = ev_texts[:cap]
+            ev_ids   = ev_ids[:cap]
 
-    if rubric_rerank and len(ev_texts) > 1:
-        order    = _rerank_by_rubric(question, candidates, ev_texts, rubric, llm)
-        ev_texts = [ev_texts[i] for i in order]
-        ev_ids   = [ev_ids[i]   for i in order]
+        if rubric_rerank and len(ev_texts) > 1:
+            order    = _rerank_by_rubric(question, candidates, ev_texts, rubric, llm)
+            ev_texts = [ev_texts[i] for i in order]
+            ev_ids   = [ev_ids[i]   for i in order]
 
-    result = answerer.answer(question, candidates, ev_texts,
-                             keyframe_images=all_keyframes)
+        kf_for_answer = all_keyframes
+        if answer_keyframe_cap is not None and len(kf_for_answer) > answer_keyframe_cap:
+            kf_for_answer = kf_for_answer[:answer_keyframe_cap]
+
+        result = answerer.answer(question, candidates, ev_texts,
+                                 keyframe_images=kf_for_answer)
     result["evidence_chunk_ids"] = ev_ids
     result["evidence_texts"]     = ev_texts
     result["trace_iters"]        = iterations

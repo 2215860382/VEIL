@@ -1,244 +1,203 @@
 # VEIL Verifier rubric templates.
 #
-# Structure: each template is a dict with:
-#   rubric_criteria  – named 0/0.5/1 criteria
-#   scoring_rule     – "average" or "min"
-#   sufficient_threshold – score >= this → sufficient
+# Structure:
+#   general   – 5 criteria applied to EVERY question (G1-G5)
+#   templates – type-specific criteria; combined with general at runtime
+#
+# Final criteria = general.rubric_criteria + templates.<type>.rubric_criteria
+# Scoring rule and threshold come from the matched type template;
+# general's own rule/threshold apply when no type matches.
 #
 # type_aliases: exact question_type string → template key
 # keyword_rules: question text keywords → template key (checked after type_aliases)
 
+# ── General rubric (G1-G5, every question) ───────────────────────────────────
+general:
+  rubric_criteria:
+    - name: evidence_coverage
+      description: "Evidence covers the key facts needed to judge the question"
+      score_1:    "Key facts are substantially and completely covered"
+      score_half: "Partial coverage of key facts; important information still missing"
+      score_0:    "Only background or loosely related segments; facts needed for judgment are absent"
+
+    - name: evidence_consistency
+      description: "Evidence chain is internally consistent with no conflicting descriptions"
+      score_1:    "Evidence is internally consistent"
+      score_half: "Minor uncertainty or vague expression; no clear contradiction"
+      score_0:    "Evidence contains conflicting descriptions of key facts"
+
+    - name: entity_consistency
+      description: "Persons, objects, locations, and event subjects are consistently identified across evidence"
+      score_1:    "Key entities are consistent and traceable across evidence chunks"
+      score_half: "Entities are largely consistent but with some ambiguity or unclear references"
+      score_0:    "Entities are confused; cannot confirm whether they refer to the same object"
+
+    - name: evidence_specificity
+      description: "Evidence is sufficiently specific rather than only general descriptions"
+      score_1:    "Evidence includes explicit actions, objects, time, location, or state information"
+      score_half: "Evidence has some specific information but remains coarse"
+      score_0:    "Evidence is too general to support precise judgment"
+
+    - name: noise_resistance
+      description: "Evidence is not dominated by irrelevant, surface-relevant, or misleading content"
+      score_1:    "Evidence focuses on key facts with no obvious distraction"
+      score_half: "Some irrelevant information present but does not seriously affect judgment"
+      score_0:    "Evidence is primarily surface-relevant or distracting content"
+
+  scoring_rule: average
+  sufficient_threshold: 0.75
+
 type_aliases:
-  "Object Reasoning":     object_visual
-  "Object Recognition":   object_visual
-  "Attribute Perception": object_visual
-  "Spatial Perception":   object_visual
-  "Spatial Reasoning":    object_visual
+  "Object Reasoning":     visual_detail
+  "Object Recognition":   visual_detail
+  "Attribute Perception": visual_detail
+  "Counting Problem":     visual_detail
+  "OCR Problems":         visual_detail
   "Action Reasoning":     action
   "Action Recognition":   action
   "Temporal Reasoning":   temporal
   "Temporal Perception":  temporal
-  "Counting Problem":     counting
-  "Information Synopsis": synopsis
-  "OCR Problems":         ocr
+  "Spatial Perception":   spatial
+  "Spatial Reasoning":    spatial
 
 keyword_rules:
-  - keywords: ["how many", "how often", "number of", "count", "times does", "times is"]
-    qtype: counting
-  - keywords: ["when", "before", "after", "first", "last", "then", "order", "sequence", "which happens"]
+  - keywords: ["why", "how did", "cause", "reason", "result", "led to", "because", "due to"]
+    qtype: causal
+  - keywords: ["when", "before", "after", "first", "last", "then", "order", "sequence", "which happens", "followed by"]
     qtype: temporal
-  - keywords: ["what text", "what does it say", "what is written", "sign reads", "caption", "subtitle"]
-    qtype: ocr
+  - keywords: ["changed from", "turned into", "final state", "end state", "become", "end up", "transition"]
+    qtype: state_transition
+  - keywords: ["where", "location", "position", "left of", "right of", "next to", "behind", "in front of", "entered", "spatial"]
+    qtype: spatial
+  - keywords: ["what color", "how many", "how does it look", "shape", "appearance", "color", "what text", "what does it say", "what is written"]
+    qtype: visual_detail
+  - keywords: ["what happened", "what did", "what is doing", "what action", "what event"]
+    qtype: action
 
 templates:
 
-  # ── Object / Visual identification ──────────────────────────────────────────
-  object_visual:
-    rubric_criteria:
-      - name: specific_entity_described
-        description: "Evidence describes the specific visual entity or attribute that identifies one answer option"
-        score_1:    "Evidence directly states the specific entity, color, appearance, or attribute that maps to exactly one option"
-        score_half: "Entity is mentioned but visual details are vague or do not clearly distinguish between options"
-        score_0:    "Entity is absent or described in a way that matches none of the options"
-
-      - name: option_disambiguation
-        weight: 2.0
-        description: "Evidence distinguishes one answer option from plausible competitors"
-        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
-        score_half: "One option is supported, but some competing options remain unclear"
-        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
-
-      - name: evidence_consistency
-        description: "Evidence does not contain unresolved contradictions on key facts"
-        score_1:    "No unresolved contradiction on key facts"
-        score_half: "Minor inconsistency but does not affect answer"
-        score_0:    "Unresolved contradiction affects answer or option choice"
-
-      - name: evidence_grounding
-        description: "Evidence concretely grounds the selected answer"
-        score_1:    "Concrete retrieved evidence directly supports the answer"
-        score_half: "Partially grounded but some inference remains"
-        score_0:    "Vague, generic, or unsupported"
-
-    scoring_rule: average
-    sufficient_threshold: 0.75
-
-  # ── Action / Behavior reasoning ─────────────────────────────────────────────
-  action:
-    rubric_criteria:
-      - name: action_described
-        description: "Evidence describes the specific action with clear subject and manner that maps to one option"
-        score_1:    "Action is explicitly described with specific subject, manner, and detail identifying exactly one option"
-        score_half: "Action is mentioned but without clear specifics connecting it to one option over others"
-        score_0:    "Action is absent or described in a way that matches none of the options"
-
-      - name: option_disambiguation
-        weight: 2.0
-        description: "Evidence distinguishes one answer option from plausible competitors"
-        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
-        score_half: "One option is supported, but some competing options remain unclear"
-        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
-
-      - name: evidence_consistency
-        description: "Evidence does not contain unresolved contradictions on key facts"
-        score_1:    "No unresolved contradiction on key facts"
-        score_half: "Minor inconsistency but does not affect answer"
-        score_0:    "Unresolved contradiction affects answer or option choice"
-
-      - name: evidence_grounding
-        description: "Evidence concretely grounds the selected answer"
-        score_1:    "Concrete retrieved evidence directly supports the answer"
-        score_half: "Partially grounded but some inference remains"
-        score_0:    "Vague, generic, or unsupported"
-
-    scoring_rule: average
-    sufficient_threshold: 0.75
-
-  # ── Temporal reasoning ───────────────────────────────────────────────────────
+  # ── Temporal / Order (T1-T2) ─────────────────────────────────────────────────
   temporal:
     rubric_criteria:
-      - name: temporal_grounding
-        description: "Evidence anchors events to specific timestamps or a clear before/after sequence"
-        score_1:    "Explicit timestamps or unambiguous before/after sequence for the relevant event(s)"
-        score_half: "Some temporal language present but ordering is incomplete or ambiguous"
-        score_0:    "No temporal grounding despite the question requiring it"
+      - name: temporal_coverage
+        description: "Evidence covers the key segments needed to judge temporal order"
+        score_1:    "Before/after events and key transition points are all covered"
+        score_half: "Some events covered but key temporal relationships are missing"
+        score_0:    "Segments needed for temporal ordering are absent"
 
-      - name: event_coverage
-        description: "Evidence covers ALL events or time periods needed to answer the ordering/timing question"
-        score_1:    "All required events, transitions, or time periods are explicitly described in evidence"
-        score_half: "Most required events covered but at least one key event or period is missing"
-        score_0:    "Required events are largely absent; evidence covers only a small fraction of what is needed"
-
-      - name: option_disambiguation
-        weight: 2.0
-        description: "Evidence distinguishes one answer option from plausible competitors"
-        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
-        score_half: "One option is supported, but some competing options remain unclear"
-        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
-
-      - name: evidence_consistency
-        description: "Evidence does not contain unresolved contradictions on key facts"
-        score_1:    "No unresolved contradiction on key facts"
-        score_half: "Minor inconsistency but does not affect answer"
-        score_0:    "Unresolved contradiction affects answer or option choice"
+      - name: temporal_consistency
+        description: "Evidence clearly establishes the before/after relationship between events"
+        score_1:    "Temporal order is explicit and unambiguous"
+        score_half: "Temporal order is partially inferable but not stated directly"
+        score_0:    "Temporal order is absent, ambiguous, or contradictory"
 
     scoring_rule: average
-    sufficient_threshold: 0.75
+    sufficient_threshold: 0.80
 
-  # ── Counting ─────────────────────────────────────────────────────────────────
-  counting:
+  # ── Causal / Why-How (C1-C3) ─────────────────────────────────────────────────
+  causal:
     rubric_criteria:
-      - name: count_specificity
-        description: "Evidence states the exact count of the specific thing being asked about"
-        score_1:    "Exact count is stated and matches the scope of the question without ambiguity"
-        score_half: "A number is present but may refer to a different scope, partial count, or is approximate"
-        score_0:    "No specific count found"
+      - name: cause_event_coverage
+        description: "Evidence covers the cause event"
+        score_1:    "Cause event is explicitly present in evidence"
+        score_half: "Cause event is implied but incomplete"
+        score_0:    "Cause event is absent"
 
-      - name: option_disambiguation
-        weight: 2.0
-        description: "Evidence distinguishes one answer option from plausible competitors"
-        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
-        score_half: "One option is supported, but some competing options remain unclear"
-        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
+      - name: effect_event_coverage
+        description: "Evidence covers the effect or result event"
+        score_1:    "Effect event is explicitly present in evidence"
+        score_half: "Effect event is partially present or incompletely described"
+        score_0:    "Effect event is absent"
 
-      - name: evidence_consistency
-        description: "Evidence does not contain unresolved contradictions on key facts"
-        score_1:    "No unresolved contradiction on key facts"
-        score_half: "Minor inconsistency but does not affect answer"
-        score_0:    "Unresolved contradiction affects answer or option choice"
-
-    scoring_rule: min
-    sufficient_threshold: 0.75
-
-  # ── Information synopsis ──────────────────────────────────────────────────────
-  synopsis:
-    rubric_criteria:
-      - name: main_topic_identified
-        description: "Evidence clearly identifies the central theme, topic, or purpose that the question asks about"
-        score_1:    "Central topic is explicitly and specifically described in evidence with concrete details"
-        score_half: "Topic is partially covered or only implicitly referenced"
-        score_0:    "Topic is absent from evidence"
-
-      - name: option_disambiguation
-        weight: 2.0
-        description: "Evidence distinguishes one answer option from plausible competitors"
-        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
-        score_half: "One option is supported, but some competing options remain unclear"
-        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
-
-      - name: evidence_consistency
-        description: "Evidence does not contain unresolved contradictions on key facts"
-        score_1:    "No unresolved contradiction on key facts"
-        score_half: "Minor inconsistency but does not affect answer"
-        score_0:    "Unresolved contradiction affects answer or option choice"
-
-      - name: evidence_grounding
-        description: "Evidence concretely grounds the selected answer"
-        score_1:    "Concrete retrieved evidence directly supports the answer"
-        score_half: "Partially grounded but some inference remains"
-        score_0:    "Vague, generic, or unsupported"
+      - name: causal_link_completeness
+        description: "Evidence connects cause and effect rather than only showing the two events separately"
+        score_1:    "Causal chain is explicit and complete"
+        score_half: "Causal relationship can be inferred but lacks direct connection"
+        score_0:    "Only related events present with no causal linkage"
 
     scoring_rule: average
-    sufficient_threshold: 0.75
+    sufficient_threshold: 0.80
 
-  # ── OCR / Text reading ────────────────────────────────────────────────────────
-  ocr:
+  # ── State Transition (S1-S3) ─────────────────────────────────────────────────
+  state_transition:
     rubric_criteria:
-      - name: text_content_found
-        description: "Evidence explicitly states or very closely paraphrases the relevant on-screen text"
-        score_1:    "Exact text is quoted or very closely paraphrased with no ambiguity"
-        score_half: "Text is partially mentioned or paraphrased with uncertainty"
-        score_0:    "Text content is absent or unrelated"
+      - name: initial_state_coverage
+        description: "Evidence covers the state before the transition"
+        score_1:    "Initial state is explicitly described"
+        score_half: "Initial state is partially visible or inferable"
+        score_0:    "Initial state is absent"
 
-      - name: option_disambiguation
-        weight: 2.0
-        description: "Evidence distinguishes one answer option from plausible competitors"
-        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
-        score_half: "One option is supported, but some competing options remain unclear"
-        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
+      - name: transition_process_coverage
+        description: "Evidence covers the process of state change"
+        score_1:    "Transition process is explicitly described"
+        score_half: "Only before/after states visible; transition process is incomplete"
+        score_0:    "Transition process is absent"
 
-      - name: evidence_consistency
-        description: "Evidence does not contain unresolved contradictions on key facts"
-        score_1:    "No unresolved contradiction on key facts"
-        score_half: "Minor inconsistency but does not affect answer"
-        score_0:    "Unresolved contradiction affects answer or option choice"
-
-    scoring_rule: min
-    sufficient_threshold: 0.75
-
-  # ── Default (catch-all) ───────────────────────────────────────────────────────
-  default:
-    rubric_criteria:
-      - name: answer_content_found
-        description: "Evidence contains the specific fact, entity, or value needed to identify the correct option"
-        score_1:    "Evidence directly states the specific fact that maps to exactly one option"
-        score_half: "Evidence is topic-relevant but the specific fact is implicit or uncertain"
-        score_0:    "Evidence is off-topic or misses the required specific fact entirely"
-
-      - name: option_disambiguation
-        weight: 2.0
-        description: "Evidence distinguishes one answer option from plausible competitors"
-        score_1:    "Exactly one option is clearly supported, and all plausible competing options are excluded or incompatible"
-        score_half: "One option is supported, but some competing options remain unclear"
-        score_0:    "Multiple options remain plausible, unclear, supported, or conflicting"
-
-      - name: factual_specificity
-        description: "Evidence provides concrete, specific details rather than vague generalities"
-        score_1:    "Specific facts, names, numbers, events, or direct quotes cited"
-        score_half: "Partially specific; some vague language remains"
-        score_0:    "Entirely vague or non-committal"
-
-      - name: evidence_consistency
-        description: "Evidence does not contain unresolved contradictions on key facts"
-        score_1:    "No unresolved contradiction on key facts"
-        score_half: "Minor inconsistency but does not affect answer"
-        score_0:    "Unresolved contradiction affects answer or option choice"
-
-      - name: evidence_grounding
-        description: "Evidence concretely grounds the selected answer"
-        score_1:    "Concrete retrieved evidence directly supports the answer"
-        score_half: "Partially grounded but some inference remains"
-        score_0:    "Vague, generic, or unsupported"
+      - name: final_state_coverage
+        description: "Evidence covers the state after the transition"
+        score_1:    "Final state is explicitly described"
+        score_half: "Final state is partially visible or ambiguous"
+        score_0:    "Final state is absent"
 
     scoring_rule: average
-    sufficient_threshold: 0.65
+    sufficient_threshold: 0.80
+
+  # ── Visual Detail (V1-V3) ─────────────────────────────────────────────────────
+  visual_detail:
+    rubric_criteria:
+      - name: visual_observability
+        description: "Evidence can directly observe the key visual information"
+        score_1:    "Key visual information is clearly visible in evidence"
+        score_half: "Partially visible; occlusion, blur, or angle limitations present"
+        score_0:    "Key visual information is not visible"
+
+      - name: attribute_specificity
+        description: "Evidence includes sufficiently specific visual attributes"
+        score_1:    "Color, quantity, position, shape, or other attributes are explicitly stated"
+        score_half: "Attributes are partially explicit but some remain vague"
+        score_0:    "Key attribute information is missing"
+
+      - name: visual_entity_consistency
+        description: "The visual target object is consistently and stably identified across evidence"
+        score_1:    "Target entity is clearly and consistently identified"
+        score_half: "Target entity is mostly identifiable but with some ambiguity"
+        score_0:    "Target entity is confused or cannot be confirmed"
+
+    scoring_rule: average
+    sufficient_threshold: 0.80
+
+  # ── Action / Event (A1-A2) ───────────────────────────────────────────────────
+  action:
+    rubric_criteria:
+      - name: action_visibility
+        description: "Evidence clearly shows the key action"
+        score_1:    "Key action is completely and directly visible in evidence"
+        score_half: "Action is partially visible or can only be indirectly inferred"
+        score_0:    "Key action is not visible in evidence"
+
+      - name: event_completion
+        description: "Evidence covers whether the event started, progressed, or completed"
+        score_1:    "Event completion status is explicitly clear"
+        score_half: "Event occurrence is partially observed but completion status is unclear"
+        score_0:    "Cannot confirm whether event occurred or was completed"
+
+    scoring_rule: average
+    sufficient_threshold: 0.80
+
+  # ── Spatial / Location (L1-L2) ───────────────────────────────────────────────
+  spatial:
+    rubric_criteria:
+      - name: location_grounding
+        description: "Evidence clearly identifies the key location or scene"
+        score_1:    "Location is explicitly identified in evidence"
+        score_half: "Location is partially inferable but not directly stated"
+        score_0:    "Location information is absent"
+
+      - name: spatial_relation
+        description: "Evidence clearly shows the positional or directional relationship between objects"
+        score_1:    "Spatial relationship between objects is explicitly described"
+        score_half: "Spatial relationship is partially visible or contains ambiguity"
+        score_0:    "Spatial relationship cannot be determined from evidence"
+
+    scoring_rule: average
+    sufficient_threshold: 0.80

@@ -132,6 +132,17 @@ class VLMClient:
             ep = self._api_endpoints[self._api_rr % len(self._api_endpoints)]
             self._api_rr += 1
         resp = self._requests.post(ep, json=payload, timeout=300)
+        if resp.status_code in (400, 500) and pil_frames:
+            import logging
+            logging.getLogger(__name__).warning(
+                "VLM API %s error with %d frames — retrying without images",
+                resp.status_code, len(pil_frames),
+            )
+            payload["messages"] = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+            with self._api_lock:
+                ep = self._api_endpoints[self._api_rr % len(self._api_endpoints)]
+                self._api_rr += 1
+            resp = self._requests.post(ep, json=payload, timeout=300)
         resp.raise_for_status()
         result = resp.json()["choices"][0]["message"]["content"]
         if "</think>" in result:

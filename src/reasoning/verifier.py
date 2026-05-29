@@ -42,47 +42,49 @@ def _inject_images(message: dict, pil_images) -> dict:
 # ── YAML loading ───────────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=1)
-def _rubric_config() -> Tuple[Dict, Dict[str, str], List[Tuple[List[str], str]]]:
+def _rubric_config() -> Tuple[Dict, Dict, Dict[str, str], List[Tuple[List[str], str]]]:
     path = Path(__file__).with_name("rubric_templates.yaml")
     if not path.is_file():
-        raise FileNotFoundError(
-            f"VEIL rubric templates missing: {path}"
-        )
+        raise FileNotFoundError(f"VEIL rubric templates missing: {path}")
     with path.open(encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
+    general: Dict = data.get("general") or {}
+    if not general.get("rubric_criteria"):
+        raise ValueError("rubric_templates.yaml must define general.rubric_criteria")
+
     templates: Dict = {}
     for k, v in (data.get("templates") or {}).items():
-        templates[k] = v  # dict or str (str = legacy flat template)
+        templates[k] = v
 
     aliases: Dict[str, str] = dict(data.get("type_aliases") or {})
     rules_raw = data.get("keyword_rules") or []
     keyword_rules: List[Tuple[List[str], str]] = []
     for row in rules_raw:
         kws = row.get("keywords") or []
-        qtype = row.get("qtype", "default")
+        qtype = row.get("qtype", "")
         if isinstance(kws, str):
             kws = [kws]
         keyword_rules.append((list(kws), str(qtype)))
 
-    if "default" not in templates:
-        raise ValueError("rubric_templates.yaml must define templates.default")
-    return templates, aliases, keyword_rules
+    return general, templates, aliases, keyword_rules
 
 
 def get_rubric_dict(question: str, task_type: Optional[str] = None) -> dict:
-    """Return the structured rubric dict for the given question / task type.
+    """Return the combined rubric dict for the given question / task type.
 
-    The dict has keys: rubric_criteria, scoring_rule, sufficient_threshold
-    (all from the YAML template).
+    Always includes general criteria. If a type-specific template matches,
+    its criteria are appended and its scoring_rule / sufficient_threshold apply.
+    Falls back to general's scoring_rule / sufficient_threshold when no type matches.
     """
-    templates, aliases, keyword_rules = _rubric_config()
+    general, templates, aliases, keyword_rules = _rubric_config()
 
-    key = "default"
+    # Resolve type-specific template key
+    key: Optional[str] = None
     if task_type:
-        key = aliases.get(task_type, key)
-    if key not in templates:
-        key = "default"
+        key = aliases.get(task_type)
+        if key not in templates:
+            key = None
 
     # keyword_rules override (question-text based routing)
     q_lower = (question or "").lower()
@@ -91,11 +93,15 @@ def get_rubric_dict(question: str, task_type: Optional[str] = None) -> dict:
             key = qtype
             break
 
-    tpl = templates[key]
-    if isinstance(tpl, str):
-        # Legacy flat-string template: wrap in a minimal dict so callers don't break.
-        return {"_legacy_text": tpl, "scoring_rule": "average", "sufficient_threshold": 0.5}
-    return tpl
+    if key is not None:
+        tpl = templates[key]
+        return {
+            "rubric_criteria": general["rubric_criteria"] + (tpl.get("rubric_criteria") or []),
+            "scoring_rule":         tpl.get("scoring_rule",         general.get("scoring_rule", "average")),
+            "sufficient_threshold": tpl.get("sufficient_threshold", general.get("sufficient_threshold", 0.75)),
+        }
+    # No type match: general only
+    return dict(general)
 
 
 def get_rubric(question: str, task_type: Optional[str] = None) -> str:
@@ -124,8 +130,50 @@ def _format_rubric_as_text(d: dict) -> str:
 # ── Verifier prompt ────────────────────────────────────────────────────────────
 
 VERIFIER_SYS = """\
+You evaluate whether retrieved video evidence is sufficient to judge each answer option.
+Output ONE strict JSON object — no prose, no markdown fences.
+
+## Step 1 — Per-Option Evidence Sufficiency Scoring
+For each answer option, convert it into a proposition and score each rubric criterion:
+  1.0 = evidence fully sufficient to judge this option on this criterion
+        (clearly confirms OR clearly rules it out — both count as sufficient)
+  0.5 = evidence partially sufficient — some relevant information present but incomplete
+  0.0 = evidence insufficient to judge this option on this criterion
+
+Score whether the evidence ALLOWS JUDGMENT of this option, not whether it supports it.
+Evidence that clearly rules out an option scores as high as evidence that clearly confirms it.
+When unsure between 1.0 and 0.5, choose 0.5; between 0.5 and 0.0, choose 0.0.
+
+## Step 2 — Option Judgment
+Based on the overall evidence for each option:
+  true    : evidence clearly establishes this option is correct
+  false   : evidence clearly establishes this option is incorrect
+  unknown : evidence is insufficient to determine whether this option is correct or not
+
+## Step 3 — Missing Evidence Analysis
+If any option is "unknown", write ONE actionable sentence in "missing_evidence_analysis"
+naming the specific fact, time range, or event still needed to resolve it.
+Leave it empty string if no option is unknown.
+
+Return ONLY this JSON (use actual criterion names from the Rubric):
+{
+  "option_criteria_scores": {
+    "A": {"<criterion>": 0.0, ...},
+    "B": {"<criterion>": 0.0, ...}
+  },
+  "option_judgment": {
+    "A": "true|false|unknown",
+    "B": "true|false|unknown"
+  },
+  "missing_evidence_analysis": "..."
+}"""
+
+VERIFIER_SYS_WITH_ATTR = VERIFIER_SYS
+
+
+VERIFIER_SYS_NORUBRIC_ATTR = """\
 You judge whether retrieved video-segment evidence is sufficient to answer a multiple-choice question.
-Follow these FIVE steps strictly, then output ONE strict JSON object — no prose, no markdown fences.
+No rubric scoring. Follow these THREE steps, then output ONE strict JSON object.
 
 ## Step 1 — Evidence Attribution (internal)
 For each evidence chunk [E1]...[En], judge its role for EACH answer option:
@@ -133,135 +181,90 @@ For each evidence chunk [E1]...[En], judge its role for EACH answer option:
   refute   : the evidence directly contradicts or rules out that option
   neutral  : the evidence has no clear effect on that option
   conflict : the evidence conflicts with other evidence on a key fact for that option
-Use this step internally to reason about the evidence.
-Do NOT output per-evidence attribution.
+Use this step internally to reason about the evidence. Do NOT output per-evidence attribution.
 
-## Step 2 — Per-Option Status
-Using the internal evidence attribution, judge EACH answer option:
-  verified    : evidence clearly supports this option
-  excluded    : evidence clearly rules out this option
-  unclear     : evidence is insufficient to decide
-  conflicting : evidence for this option contains unresolved conflict
-Output "option_status" as an object mapping each option letter to one of these labels.
-Important:
-  - option_status is explicit per-option evidence judgment.
-  - conflicting means evidence conflict, NOT that two answer options are mutually exclusive.
-  - If evidence clearly supports one option and the options are mutually exclusive, you may mark
-    other options excluded, but only if there is no unresolved conflict.
-
-## Step 3 — Rubric Criteria Scoring
-For each criterion in the Rubric assign a score:
-  1.0 = fully satisfied   0.5 = partially satisfied   0.0 = not satisfied
-Rubric scoring may use the internal evidence attribution and option_status. For criteria such as
-option_disambiguation, use option_status as supporting judgment.
-
-## Step 4 — Aggregate Score & Label
-Compute "score" using the scoring rule stated in the Rubric (average or min).
-Do NOT let option_status directly participate in score aggregation; only criterion scores aggregate.
-Set "label":
-  • "sufficient"   if score ≥ threshold stated in the Rubric
+## Step 2 — Holistic Sufficiency Judgment
+Based on your internal evidence attribution, decide whether the evidence is sufficient to confidently pick an answer.
+  • "sufficient"   if you are confident the evidence supports a specific option
   • "insufficient" otherwise
 
-## Step 5 — Reasoning & Missing Evidence
+## Step 3 — Reasoning & Missing Evidence
 Write 1-2 sentences in "reasoning" explaining your decision.
-If insufficient, output a SEMI-STRUCTURED "missing_evidence_analysis" object based on low-scoring
-rubric criteria, unclear options, and conflicting options.
-This object will be used directly as guidance for the next retrieval query.
-Use these fields:
-  - "focus_options": list of option letters still needing evidence (e.g. ["A","C"]); [] if the gap is global
-  - "analysis": one dense, actionable sentence or short paragraph describing what evidence is still needed next
-  - "time_scope": a concrete time range if needed (e.g. "first 60 seconds of the video"), otherwise null
-  - "conflict_fact": the exact conflicting fact to resolve if there is an unresolved contradiction, otherwise null
-Make "analysis" specific:
-  - Preserve cross-option relations when multiple options remain entangled
-  - For temporal gaps: name the events whose order must be established
-  - For fact verification: state the exact claim that must be checked
-  - If multiple facts are missing, keep them in one coherent repair directive rather than splitting into isolated bullet-like goals
+If insufficient, output a SEMI-STRUCTURED "missing_evidence_analysis" object with:
+  - "focus_options": []
+  - "analysis": one dense, actionable sentence describing what evidence is still needed
+  - "time_scope": concrete time range if needed, otherwise null
+  - "conflict_fact": exact conflicting fact if any, otherwise null
 
-Return ONLY this JSON (fill every field; use actual criterion names from the Rubric):
+Return ONLY this JSON:
 {
-  "option_status":    {"A": "verified", "B": "excluded"},
-  "criteria":         {"<criterion_name>": 0.0},
+  "criteria":         {},
   "score":            0.0,
-  "label":            "sufficient" or "insufficient",
   "reasoning":        "...",
+  "label":            "sufficient" or "insufficient",
   "missing_evidence_analysis": {
-    "focus_options": ["A"],
-    "analysis": "Need direct evidence clarifying whether Whitehead's very first flight attempt succeeded or failed, and whether later successful flights are being conflated with the first attempt.",
+    "focus_options": [],
+    "analysis": "...",
     "time_scope": null,
     "conflict_fact": null
   }
 }"""
 
 
-VERIFIER_SYS_WITH_ATTR = """\
+VERIFIER_SYS_NORUBRIC_ATTR_OPSTATUS = """\
 You judge whether retrieved video-segment evidence is sufficient to answer a multiple-choice question.
-Follow these FIVE steps strictly, then output ONE strict JSON object — no prose, no markdown fences.
+No rubric scoring. Follow these FOUR steps, then output ONE strict JSON object.
 
-## Step 1 — Evidence Attribution
+## Step 1 — Evidence Attribution (internal)
 For each evidence chunk [E1]...[En], judge its role for EACH answer option:
   support  : the evidence directly supports that option
   refute   : the evidence directly contradicts or rules out that option
   neutral  : the evidence has no clear effect on that option
   conflict : the evidence conflicts with other evidence on a key fact for that option
-Output "evidence_attribution" as an object keyed by evidence id, then option letter.
-Also output compatibility summaries:
-  "key_ids"        : evidence ids that directly help identify the answer or exclude wrong options
-  "distractor_ids" : evidence ids that are misleading, contradictory, or conflict-heavy
+Use this step internally to reason about the evidence. Do NOT output per-evidence attribution.
 
-## Step 2 — Per-Option Status
-Using Evidence Attribution, judge EACH answer option:
-  verified    : evidence clearly supports this option
-  excluded    : evidence clearly rules out this option
-  unclear     : evidence is insufficient to decide
-  conflicting : evidence for this option contains unresolved conflict
+## Step 2 — Per-Option Status & Distractor Identification
+Using the internal evidence attribution, judge EACH answer option:
+  verified    : evidence EXPLICITLY states the specific fact that maps to this option
+  excluded    : evidence EXPLICITLY contradicts or rules out this option with a concrete fact
+  unclear     : evidence is insufficient, ambiguous, or only implied — DEFAULT when in doubt
+  conflicting : evidence for this option contains unresolved contradiction
 Output "option_status" as an object mapping each option letter to one of these labels.
-Important:
-  - option_status is explicit per-option evidence judgment.
-  - conflicting means evidence conflict, NOT that two answer options are mutually exclusive.
-  - If evidence clearly supports one option and the options are mutually exclusive, you may mark
-    other options excluded, but only if there is no unresolved conflict.
+Also output "distractor_ids": list of evidence chunk numbers (1-indexed) that are misleading,
+contradictory, or conflict-heavy across options.
+RULES:
+  - Use "verified" when the evidence clearly supports an option, including by direct inference or strong implication.
+  - Use "excluded" when the evidence contradicts or makes an option implausible, including by mutual exclusivity.
+  - Use "unclear" only when the evidence is genuinely ambiguous or absent for that option.
 
-## Step 3 — Rubric Criteria Scoring
-For each criterion in the Rubric assign a score:
-  1.0 = fully satisfied   0.5 = partially satisfied   0.0 = not satisfied
-Rubric scoring may use Evidence Attribution and option_status. For criteria such as
-option_disambiguation, use option_status as supporting judgment.
-
-## Step 4 — Aggregate Score & Label
-Compute "score" using the scoring rule stated in the Rubric (average or min).
-Do NOT let option_status directly participate in score aggregation; only criterion scores aggregate.
-Set "label":
-  • "sufficient"   if score ≥ threshold stated in the Rubric
+## Step 3 — Holistic Sufficiency Judgment
+Based on option_status, decide whether the evidence is sufficient holistically.
+Do NOT apply a rubric score threshold — use your own judgment about whether you can confidently answer.
+  • "sufficient"   if you can identify a clear answer from the evidence
   • "insufficient" otherwise
 
-## Step 5 — Reasoning & Missing Evidence
+## Step 4 — Reasoning & Missing Evidence
 Write 1-2 sentences in "reasoning" explaining your decision.
-If insufficient, output a SEMI-STRUCTURED "missing_evidence_analysis" object based on low-scoring
-rubric criteria, unclear options, and conflicting options.
-This object will be used directly as guidance for the next retrieval query.
-Use these fields:
-  - "focus_options": list of option letters still needing evidence (e.g. ["A","C"]); [] if the gap is global
-  - "analysis": one dense, actionable sentence or short paragraph describing what evidence is still needed next
-  - "time_scope": a concrete time range if needed (e.g. "first 60 seconds of the video"), otherwise null
-  - "conflict_fact": the exact conflicting fact to resolve if there is an unresolved contradiction, otherwise null
+If insufficient, output a SEMI-STRUCTURED "missing_evidence_analysis" object with:
+  - "focus_options": list of option letters still unclear or conflicting (e.g. ["A","C"])
+  - "analysis": one dense, actionable sentence describing what evidence is still needed
+  - "time_scope": concrete time range if needed, otherwise null
+  - "conflict_fact": exact conflicting fact if any, otherwise null
 
-Return ONLY this JSON (fill every field; use actual criterion names from the Rubric):
+Return ONLY this JSON:
 {
-  "evidence_attribution": {"E1": {"A": "support", "B": "refute"}},
-  "option_status":    {"A": "verified", "B": "excluded"},
-  "criteria":         {"<criterion_name>": 0.0},
+  "criteria":         {},
   "score":            0.0,
-  "label":            "sufficient" or "insufficient",
+  "option_status":    {"A": "unclear", "B": "unclear"},
+  "distractor_ids":   [],
   "reasoning":        "...",
+  "label":            "sufficient" or "insufficient",
   "missing_evidence_analysis": {
     "focus_options": ["A"],
-    "analysis": "Need direct evidence clarifying whether Whitehead's very first flight attempt succeeded or failed, and whether later successful flights are being conflated with the first attempt.",
+    "analysis": "...",
     "time_scope": null,
     "conflict_fact": null
-  },
-  "key_ids":          [1],
-  "distractor_ids":   []
+  }
 }"""
 
 
@@ -356,199 +359,192 @@ class Verifier:
         keyframe_images=(),
         rubric_judgment: bool = True,
         explicit_attribution: bool = False,
+        verifier_attr: bool = False,
+        verifier_opstatus: bool = False,
+        margin_threshold: float = 0.20,
     ) -> Dict:
-        """Judge evidence sufficiency with rubric-guided structured reasoning.
+        """Judge evidence sufficiency with rubric-guided per-option scoring.
 
-        Args:
-            rubric: Either the structured dict from get_rubric_dict() (preferred)
-                    or a legacy text string (backward-compat).
+        rubric_judgment=True (default):
+            LLM scores each rubric criterion per option; Python computes
+            option_scores, option_status, label, and weak_rubric_criteria.
+            label: "FULLY_SUFFICIENT" | "ANSWER_SUFFICIENT" | "INSUFFICIENT"
 
-        Returns dict with keys:
-            label           – "sufficient" | "insufficient"
-            missing_evidence_analysis – None or semi-structured repair guidance
-            score           – float aggregate of rubric criteria
-            criteria        – {criterion_name: score} (empty for legacy rubric)
-            evidence_attribution – optional per-evidence, per-option support/refute/neutral/conflict
-            option_status   – per-option verified/excluded/unclear/conflicting judgment
-            reasoning       – brief explanation string
+        rubric_judgment=False:
+            Legacy no-rubric path; label: "sufficient" | "insufficient"
         """
-        # Accept both dict and string rubric.
         if isinstance(rubric, str):
             rubric_dict = {"_legacy_text": rubric, "scoring_rule": "average",
                            "sufficient_threshold": 0.5}
         else:
             rubric_dict = rubric
 
+        # ── No-rubric path (unchanged) ─────────────────────────────────────────
         if not rubric_judgment:
-            # No rubric: LLM makes holistic sufficient/insufficient judgment
-            sys_prompt = VERIFIER_SYS_NORUBRIC
-            rubric_section = ""
-        else:
-            sys_prompt = VERIFIER_SYS_WITH_ATTR if explicit_attribution else VERIFIER_SYS
-            rubric_section = (
-                rubric_dict["_legacy_text"]
-                if "_legacy_text" in rubric_dict
-                else _format_rubric_for_user(rubric_dict)
-            )
+            if verifier_opstatus:
+                sys_prompt = VERIFIER_SYS_NORUBRIC_ATTR_OPSTATUS
+            elif verifier_attr:
+                sys_prompt = VERIFIER_SYS_NORUBRIC_ATTR
+            else:
+                sys_prompt = VERIFIER_SYS_NORUBRIC
+            opts = "\n".join(f"  ({chr(ord('A')+i)}) {c}" for i, c in enumerate(candidates))
+            ev   = _format_evidence(evidence_texts)
+            user = "\n\n".join([
+                f"Question: {question}", f"Options:\n{opts}",
+                f"Evidence Chain:\n{ev}", "Return the JSON now.",
+            ])
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user",   "content": user},
+            ]
+            if keyframe_images and getattr(self.llm, '_api_endpoints', None):
+                messages[-1] = _inject_images(messages[-1], keyframe_images)
+            max_new_tokens = 512 if verifier_opstatus else (384 if verifier_attr else 256)
+            raw    = self.llm.chat(messages, max_new_tokens=max_new_tokens, enable_thinking=False)
+            parsed = extract_json(raw)
+            label  = as_str(parsed.get("label", "insufficient")).lower()
+            if label not in ("sufficient", "insufficient"):
+                label = "insufficient"
+            raw_missing = parsed.get("missing_evidence_analysis") or parsed.get("missing_evidence")
+            missing = raw_missing if raw_missing else None
+            raw_opts = parsed.get("option_status") or {}
+            option_status: Dict[str, str] = {}
+            if isinstance(raw_opts, dict):
+                for k, v in raw_opts.items():
+                    key = as_str(k).strip().upper()[:1]
+                    val = as_str(v).strip().lower()
+                    if key and val in ("verified", "excluded", "unclear", "conflicting"):
+                        option_status[key] = val
+            return {
+                "label": label, "option_status": option_status,
+                "option_scores": {}, "option_criteria_scores": {},
+                "weak_rubric_criteria": [],
+                "missing_evidence_analysis": missing if label == "insufficient" else None,
+                "score": 0.0, "criteria": {}, "reasoning": as_str(parsed.get("reasoning", "")),
+                "evidence_attribution": {}, "key_ids": [], "distractor_ids": [],
+            }
 
+        # ── Rubric path ────────────────────────────────────────────────────────
+        rubric_section = (
+            rubric_dict["_legacy_text"]
+            if "_legacy_text" in rubric_dict
+            else _format_rubric_for_user(rubric_dict)
+        )
         opts = "\n".join(f"  ({chr(ord('A')+i)}) {c}" for i, c in enumerate(candidates))
         ev   = _format_evidence(evidence_texts)
-
-        user_parts = [
-            f"Question: {question}",
-            f"Options:\n{opts}",
-        ]
-        if rubric_section:
-            user_parts.append(f"Rubric:\n{rubric_section}")
-        user_parts.append(f"Evidence Chain:\n{ev}")
-        user_parts.append("Return the JSON now.")
-        user = "\n\n".join(user_parts)
-
+        user = "\n\n".join([
+            f"Question: {question}", f"Options:\n{opts}",
+            f"Rubric:\n{rubric_section}", f"Evidence Chain:\n{ev}",
+            "Return the JSON now.",
+        ])
         messages = [
-            {"role": "system", "content": sys_prompt},
+            {"role": "system", "content": VERIFIER_SYS},
             {"role": "user",   "content": user},
         ]
         if keyframe_images and getattr(self.llm, '_api_endpoints', None):
             messages[-1] = _inject_images(messages[-1], keyframe_images)
-        if not rubric_judgment:
-            max_new_tokens = 256
-        else:
-            max_new_tokens = 640
-        raw    = self.llm.chat(messages, max_new_tokens=max_new_tokens, enable_thinking=False)
+        raw    = self.llm.chat(messages, max_new_tokens=800, enable_thinking=False)
         parsed = extract_json(raw)
 
-        # ── Extract fields ─────────────────────────────────────────────────────
-        label = as_str(parsed.get("label", "insufficient")).lower()
-        if label not in ("sufficient", "insufficient"):
-            label = "insufficient"
-
-        # Criteria scores
-        raw_criteria = parsed.get("criteria")
-        criteria_scores: Dict[str, float] = {}
-        if isinstance(raw_criteria, dict):
-            for k, v in raw_criteria.items():
-                try:
-                    criteria_scores[k] = float(v)
-                except (TypeError, ValueError):
-                    criteria_scores[k] = 0.0
-
-        # Aggregate score
-        try:
-            raw_score = float(parsed.get("score", 0.0))
-        except (TypeError, ValueError):
-            raw_score = 0.0
-
-        if criteria_scores:
-            rule = rubric_dict.get("scoring_rule", "average")
-            if rule == "min":
-                agg_score = min(criteria_scores.values())
-            else:
-                weights = _criterion_weights(rubric_dict)
-                total_weight = 0.0
-                weighted_sum = 0.0
-                for name, value in criteria_scores.items():
-                    w = weights.get(name, 1.0)
-                    total_weight += w
-                    weighted_sum += w * value
-                agg_score = (weighted_sum / total_weight) if total_weight > 0 else statistics.mean(criteria_scores.values())
-            score = agg_score
-        else:
-            score = raw_score
-
-        reasoning = as_str(parsed.get("reasoning", ""))
-
-        # missing_evidence_analysis — semi-structured object preferred; string kept for compatibility
-        raw_missing = parsed.get("missing_evidence_analysis")
-        if raw_missing is None:
-            # Backward compatibility with older verifier outputs.
-            raw_missing = parsed.get("missing_evidence")
-        if label == "sufficient" or not raw_missing:
-            missing = None
-        elif isinstance(raw_missing, dict):
-            focus_options = raw_missing.get("focus_options")
-            if not isinstance(focus_options, list):
-                focus_options = []
-            focus_options = [
-                as_str(x).strip().upper()[:1]
-                for x in focus_options
-                if as_str(x).strip()
-            ]
-
-            analysis = as_str(raw_missing.get("analysis", "")).strip()
-            time_scope = as_str(raw_missing.get("time_scope", "")).strip() or None
-            conflict_fact = as_str(raw_missing.get("conflict_fact", "")).strip() or None
-
-            # Backward compatibility for older dict outputs.
-            if not analysis:
-                desc = as_str(raw_missing.get("description", "")).strip()
-                if desc:
-                    analysis = desc
-            if not analysis:
-                query_goals = raw_missing.get("query_goals")
-                if not isinstance(query_goals, list):
-                    query_goals = []
-                query_goals = [as_str(x).strip() for x in query_goals if as_str(x).strip()]
-                if query_goals:
-                    analysis = " ; ".join(query_goals)
-
-            missing = {
-                "focus_options": focus_options,
-                "analysis": analysis or None,
-                "time_scope": time_scope,
-                "conflict_fact": conflict_fact,
-            }
-        elif isinstance(raw_missing, str):
-            missing = raw_missing or None
-        else:
-            missing = None
-
-        # evidence_attribution: per-evidence, per-option support/refute/neutral/conflict
-        raw_attr = parsed.get("evidence_attribution") or {}
-        evidence_attribution: Dict[str, Dict[str, str]] = {}
-        if isinstance(raw_attr, dict):
-            for ev_key, option_map in raw_attr.items():
-                ev = as_str(ev_key).strip()
-                if not ev or not isinstance(option_map, dict):
+        # ── Parse option_criteria_scores ───────────────────────────────────────
+        raw_ocs = parsed.get("option_criteria_scores") or {}
+        option_criteria_scores: Dict[str, Dict[str, float]] = {}
+        if isinstance(raw_ocs, dict):
+            for opt_key, crit_dict in raw_ocs.items():
+                opt = as_str(opt_key).strip().upper()[:1]
+                if not opt or not isinstance(crit_dict, dict):
                     continue
-                norm_map: Dict[str, str] = {}
-                for opt_key, role in option_map.items():
-                    key = as_str(opt_key).strip().upper()[:1]
-                    val = as_str(role).strip().lower()
-                    if key and val in ("support", "refute", "neutral", "conflict"):
-                        norm_map[key] = val
-                if norm_map:
-                    evidence_attribution[ev] = norm_map
+                scores: Dict[str, float] = {}
+                for cname, cscore in crit_dict.items():
+                    try:
+                        scores[str(cname).strip()] = float(cscore)
+                    except (TypeError, ValueError):
+                        scores[str(cname).strip()] = 0.0
+                if scores:
+                    option_criteria_scores[opt] = scores
 
-        # key_ids / distractor_ids (compatibility summaries for evidence attribution)
-        def _parse_id_list(raw) -> List[int]:
-            if not isinstance(raw, list):
-                return []
-            return [int(x) for x in raw if isinstance(x, (int, float)) and int(x) >= 1]
+        # ── Compute option_rubric_scores (weighted average per option) ─────────
+        weights = _criterion_weights(rubric_dict)
+        option_rubric_scores: Dict[str, float] = {}
+        for opt, crit_scores in option_criteria_scores.items():
+            total_w = weighted_sum = 0.0
+            for name, val in crit_scores.items():
+                w = weights.get(name, 1.0)
+                total_w += w
+                weighted_sum += w * val
+            option_rubric_scores[opt] = (weighted_sum / total_w) if total_w > 0 else 0.0
 
-        key_ids        = _parse_id_list(parsed.get("key_ids"))
-        distractor_ids = _parse_id_list(parsed.get("distractor_ids"))
-        if explicit_attribution and rubric_judgment and label == "sufficient" and not key_ids:
-            # fallback: treat all evidence as key when sufficient and no attribution given
-            key_ids = list(range(1, len(evidence_texts) + 1))
-
-        # option_status: per-option verified/excluded/unclear/conflicting judgment
-        raw_opts = parsed.get("option_status") or {}
-        option_status: Dict[str, str] = {}
-        if isinstance(raw_opts, dict):
-            for k, v in raw_opts.items():
+        # ── Parse LLM option_judgment, then enforce threshold ──────────────────
+        # rubric_score measures evidence sufficiency to judge an option (not support direction).
+        # Python overrides to "unknown" when rubric_score < sufficient_threshold.
+        sufficient_threshold = rubric_dict.get("sufficient_threshold", 0.75)
+        raw_judgment = parsed.get("option_judgment") or {}
+        llm_judgment: Dict[str, str] = {}
+        if isinstance(raw_judgment, dict):
+            for k, v in raw_judgment.items():
                 key = as_str(k).strip().upper()[:1]
                 val = as_str(v).strip().lower()
-                if key and val in ("verified", "excluded", "unclear", "conflicting"):
-                    option_status[key] = val
+                if key and val in ("true", "false", "unknown"):
+                    llm_judgment[key] = val
+
+        option_judgment: Dict[str, str] = {}
+        all_opts = [chr(ord('A') + i) for i in range(len(candidates))]
+        for opt in all_opts:
+            rscore = option_rubric_scores.get(opt)
+            if rscore is None or rscore < sufficient_threshold:
+                option_judgment[opt] = "unknown"
+            else:
+                option_judgment[opt] = llm_judgment.get(opt, "unknown")
+
+        # ── Compute label ──────────────────────────────────────────────────────
+        n_opts      = len(candidates)
+        true_opts   = [k for k, v in option_judgment.items() if v == "true"]
+        false_opts  = [k for k, v in option_judgment.items() if v == "false"]
+        unknown_opts = [k for k, v in option_judgment.items() if v == "unknown"]
+
+        if len(true_opts) == 1 and len(false_opts) == n_opts - 1:
+            label = "FULLY_SUFFICIENT"
+        elif len(true_opts) == 1 and unknown_opts:
+            true_score       = option_rubric_scores[true_opts[0]]
+            max_unknown_score = max(option_rubric_scores.get(u, 0.0) for u in unknown_opts)
+            margin = true_score - max_unknown_score
+            label = "ANSWER_SUFFICIENT" if margin >= margin_threshold else "INSUFFICIENT"
+        else:
+            label = "INSUFFICIENT"
+
+        # ── Weak rubric criteria (from unknown options only) ───────────────────
+        weak_rubric_criteria: List[str] = []
+        missing: Optional[str] = None
+        if label == "INSUFFICIENT" and unknown_opts:
+            crit_totals: Dict[str, float] = {}
+            crit_counts: Dict[str, int]   = {}
+            for opt in unknown_opts:
+                for crit, sc in option_criteria_scores.get(opt, {}).items():
+                    crit_totals[crit] = crit_totals.get(crit, 0.0) + sc
+                    crit_counts[crit] = crit_counts.get(crit, 0) + 1
+            if crit_totals:
+                crit_avgs = {k: crit_totals[k] / crit_counts[k] for k in crit_totals}
+                weak_rubric_criteria = [
+                    k for k, v in sorted(crit_avgs.items(), key=lambda x: x[1])
+                    if v < 0.5
+                ]
+            raw_missing = parsed.get("missing_evidence_analysis")
+            if isinstance(raw_missing, str) and raw_missing.strip():
+                missing = raw_missing.strip()
 
         return {
-            "label":            label,
+            "label":                  label,
+            "option_judgment":        option_judgment,
+            "unknown_options":        unknown_opts,
+            "option_rubric_scores":   {k: round(v, 4) for k, v in option_rubric_scores.items()},
+            "option_criteria_scores": option_criteria_scores,
+            "weak_rubric_criteria":   weak_rubric_criteria,
             "missing_evidence_analysis": missing,
-            "score":           round(score, 4),
-            "criteria":        criteria_scores,
-            "reasoning":       reasoning,
-            "evidence_attribution": evidence_attribution,
-            "key_ids":         key_ids,
-            "distractor_ids":  distractor_ids,
-            "option_status":   option_status,
+            # Legacy fields
+            "score":               round(max(option_rubric_scores.values()), 4) if option_rubric_scores else 0.0,
+            "criteria":            {},
+            "reasoning":           "",
+            "evidence_attribution": {},
+            "key_ids":             [],
+            "distractor_ids":      [],
         }

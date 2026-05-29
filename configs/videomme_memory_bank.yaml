@@ -35,7 +35,7 @@ retrieval:
 
 veil_loop:
   max_iter: 3
-  dedup_threshold: 0.85
+  dedup_threshold: 1.0
 
 frame_sampling:
   fps: 1

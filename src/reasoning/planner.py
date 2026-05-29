@@ -2,7 +2,7 @@
 
 Two-stage planning:
   iter-0: sub-question decomposition (LLM-decomposed or option-grounded).
-  iter≥1: unified planner — given verifier signals (option_status / failed rubric
+  iter≥1: unified planner — given verifier signals (unknown_options / failed rubric
           criteria / missing_evidence_analysis), pick {targeted (1-4 queries),
           broadcast (uniform timeline coverage)}.
 
@@ -63,7 +63,7 @@ def _decompose_into_subquestions(
 
 
 def _option_grounded_subquestions(question: str, candidates: List[str]) -> List[str]:
-    """Iter-0 alternative: one verification query per answer option (deterministic)."""
+    """Iter-0 alternative: one verification query per answer option."""
     letters = [chr(ord("A") + i) for i in range(len(candidates))]
     return [
         (
@@ -77,36 +77,29 @@ def _option_grounded_subquestions(question: str, candidates: List[str]) -> List[
 # ── Iter ≥1: Unified Planner ─────────────────────────────────────────────────
 
 _PLANNER_UNIFIED_SYS = """You are a retrieval strategy planner for a video question-answering system.
-Decide the BEST next retrieval strategy to find evidence for answering the question.
+Given the current evidence and what is still missing, decide the BEST next retrieval strategy.
 
 ## Strategies
 
-**targeted** — 1-4 focused queries. You decide how many:
-  - Use 1 query when the answer requires one specific fact, comparison, time relation, or entity.
-  - Use 2-4 queries (sub-questions) when:
-    - Multiple answer options are still unresolved and truly need independent evidence
-      (e.g., different colors / actions / counts / entities)
-    - The question involves multiple distinct events or comparisons needing separate retrieval
-    - "Which is NOT correct?" and several options are still unresolved
-  Each query must be ≤15 words, self-contained, and target a distinct retrievable fact.
+**targeted** — Issue 1–4 focused queries to retrieve specific missing evidence.
+  Each query must be self-contained, target a single retrievable fact,
+  and not repeat queries already tried.
 
-**broadcast** — Uniform sampling across the uncovered video timeline (no query needed).
-  Use when:
-  - Evidence must cover the WHOLE video (main theme, synopsis, overall narrative)
-  - Temporal ordering requires seeing events spread across the full duration
-  - Missing analysis indicates broad timeline coverage is needed
-  - Targeted search has been tried multiple times without finding sufficient coverage
+**broadcast** — Sample frames uniformly across the uncovered video timeline (no queries needed).
+  Use when coverage must span the ENTIRE video, including:
+  - Main theme, topic overview, synopsis, or overall narrative of the video
+  - Events spread throughout / across all segments / entire duration
+  - Chronological order, sequence of events, or timeline across the full video
+  - Targeted queries have repeatedly failed to find sufficient evidence
 
-## Rules
-- Do NOT generate queries similar to ones already tried (see plan history).
-- For broadcast: set queries to [].
-
+## Output format
 Return ONLY a JSON object:
 {
   "strategy": "targeted" | "broadcast",
   "queries": ["..."],
-  "reasoning": "<one sentence>"
-}"""
+  "reasoning": "<one sentence explaining the choice>"
+}
+For broadcast, set queries to []."""
 
 
 def _extract_covered_times(evidence_texts: List[str]) -> str:
@@ -126,44 +119,32 @@ def _plan_next(
     evidence_texts: List[str],
     missing_analysis: str,
     llm,
-    plan_history: List[dict] = (),
-    allow_broadcast: bool = True,
-    option_status: Optional[dict] = None,
-    failed_criteria: Optional[dict] = None,
+    plan_history: List[List[str]] = (),
+    unknown_options: Optional[List[str]] = None,
+    weak_rubric_criteria: Optional[dict] = None,
     prune_satisfied: bool = False,
 ) -> dict:
     """Unified planner for iter ≥1: pick {targeted (n queries), broadcast}.
 
     Returns ``{"strategy": "targeted"|"broadcast", "queries": [...], "reasoning": "..."}``.
     """
+    unknown_set = set(unknown_options or [])
     opts_lines = []
     for i, c in enumerate(candidates):
         letter = chr(ord('A')+i)
-        tag = ""
-        if option_status:
-            s = option_status.get(letter)
-            if s == "verified":   tag = " [VERIFIED]"
-            elif s == "excluded": tag = " [EXCLUDED]"
-            elif s == "unclear":  tag = " [UNCLEAR]"
-            elif s == "conflicting": tag = " [CONFLICTING]"
+        tag = " [UNKNOWN]" if letter in unknown_set else ""
         opts_lines.append(f"  ({letter}) {c}{tag}")
     opts = "\n".join(opts_lines)
 
     parts = [f"Question: {question}", f"Options:\n{opts}"]
-    if option_status:
-        unresolved = [k for k, v in option_status.items() if v in ("unclear", "conflicting")]
-        if unresolved:
-            parts.append(
-                f"Current unresolved options: {unresolved}."
-            )
-    if failed_criteria:
-        lines = [f"  - {name}: {score}" for name, score in failed_criteria.items()]
+    if unknown_options:
+        parts.append(f"Current unresolved options: {unknown_options}.")
+    if weak_rubric_criteria:
+        lines = [f"  - {name}" for name in weak_rubric_criteria]
         parts.append(
-            "Failed or weak rubric criteria to repair:\n" + "\n".join(lines) +
-            "\nGenerate queries that directly repair these criteria."
+            "Weak rubric criteria to repair:\n" + "\n".join(lines) +
+            "\nGenerate queries that directly address these criteria."
         )
-    if not allow_broadcast:
-        parts.append('NOTE: "broadcast" is NOT allowed for this call. Always output strategy="targeted".')
     if prune_satisfied and plan_history:
         parts.append(
             "NOTE: Review the previously tried queries against the CURRENT evidence. "
@@ -174,11 +155,11 @@ def _plan_next(
 
     if plan_history:
         lines = []
-        for h in plan_history:
-            strat = h.get("strategy", "targeted")
-            qs    = h.get("queries") or []
-            label = "[broadcast]" if strat == "broadcast" else " | ".join(f'"{q}"' for q in qs)
-            lines.append(f"  [{strat}] {label}")
+        for qs in plan_history:
+            if qs:
+                lines.append("  " + " | ".join(f'"{q}"' for q in qs))
+            else:
+                lines.append("  [broadcast]")
         parts.append("Already tried (do NOT repeat):\n" + "\n".join(lines))
 
     if evidence_texts:
@@ -205,8 +186,6 @@ def _plan_next(
             strategy = str(d.get("strategy", "targeted")).lower()
             if strategy not in ("targeted", "broadcast"):
                 strategy = "targeted"
-            if not allow_broadcast and strategy == "broadcast":
-                strategy = "targeted"
             queries  = [str(q).strip() for q in (d.get("queries") or []) if str(q).strip()]
             if strategy != "broadcast" and not queries:
                 strategy = "targeted"
@@ -223,76 +202,24 @@ def _plan_next(
 
 # ── Verifier → planner repair context ────────────────────────────────────────
 
-def _failed_criteria(criteria: Optional[dict], threshold: float = 1.0) -> dict:
-    """Return rubric criteria that are not fully satisfied."""
-    failed = {}
-    if not isinstance(criteria, dict):
-        return failed
-    for name, score in criteria.items():
-        try:
-            val = float(score)
-        except (TypeError, ValueError):
-            val = 0.0
-        if val < threshold:
-            failed[str(name)] = val
-    return failed
-
-
-def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> Tuple[str, Optional[dict]]:
-    """Build the only verifier-derived context the planner may use."""
-    missing = verdict.get("missing_evidence_analysis") or ""
-    missing_lines: List[str] = []
-    if isinstance(missing, dict):
-        focus_options = missing.get("focus_options") or []
-        if focus_options:
-            missing_lines.append("Focus options from missing analysis: " + ", ".join(map(str, focus_options)))
-        analysis = str(missing.get("analysis") or "").strip()
-        if analysis:
-            missing_lines.append("Missing analysis: " + analysis)
-        time_scope = str(missing.get("time_scope") or "").strip()
-        if time_scope:
-            missing_lines.append(f"Time scope from missing analysis: {time_scope}")
-        conflict_fact = str(missing.get("conflict_fact") or "").strip()
-        if conflict_fact:
-            missing_lines.append(f"Conflict fact from missing analysis: {conflict_fact}")
-        missing = "\n".join(missing_lines)
-    else:
-        missing = str(missing)
+def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> Tuple[str, Optional[List[str]]]:
+    """Build verifier-derived context for the planner."""
+    missing = str(verdict.get("missing_evidence_analysis") or "").strip()
 
     if not rubric_judgment:
-        parts = []
-        if missing:
-            parts.append(f"Missing evidence analysis: {missing}")
-        return "\n".join(parts), None
+        return (f"Missing evidence analysis: {missing}" if missing else ""), None
 
-    failed = _failed_criteria(verdict.get("criteria"))
-    status = verdict.get("option_status") or {}
-    unresolved = {k: v for k, v in status.items() if v in ("unclear", "conflicting")}
+    weak_list: List[str] = list(verdict.get("weak_rubric_criteria") or [])
+    unknown = list(verdict.get("unknown_options") or [])
 
     parts = []
-    if failed:
-        parts.append("Failed or weak rubric criteria: " +
-                     "; ".join(f"{k}={v}" for k, v in failed.items()))
-    if unresolved:
-        parts.append("Unclear/conflicting options: " +
-                     "; ".join(f"{k}={v}" for k, v in unresolved.items()))
+    if weak_list:
+        parts.append("Weak rubric criteria: " + ", ".join(weak_list))
+    if unknown:
+        parts.append("Unresolved options: " + ", ".join(unknown))
     if missing:
         parts.append(f"Missing evidence analysis: {missing}")
-    return "\n".join(parts), failed
-
-
-# ── Broadcast keyword trigger ────────────────────────────────────────────────
-
-_BROADCAST_KEYWORDS = frozenset({
-    "throughout", "entire video", "whole video", "all segment",
-    "timeline", "every segment", "coverage across", "sequence of events",
-    "chronolog", "overview of", "synopsis",
-})
-
-
-def _needs_broadcast(missing_desc: str) -> bool:
-    s = (missing_desc or "").lower()
-    return any(kw in s for kw in _BROADCAST_KEYWORDS)
+    return "\n".join(parts), weak_list or None
 
 
 # ── Query similarity safety nets ─────────────────────────────────────────────
@@ -304,7 +231,7 @@ def _jaccard(a: str, b: str) -> float:
     return len(sa & sb) / len(sa | sb)
 
 
-def _too_similar(new_q: str, prev_queries: List[str], threshold: float = 0.5) -> bool:
+def _too_similar(new_q: str, prev_queries: List[str], threshold: float = 0.9) -> bool:
     return any(_jaccard(new_q, pq) >= threshold for pq in prev_queries)
 
 
@@ -326,26 +253,18 @@ class Planner:
         candidates: List[str],
         *,
         force_option: bool = False,
-        decompose: bool = True,
     ) -> dict:
         """Iter-0 plan.
 
-        Three modes (force_option wins over decompose):
-          - force_option=True            -> one option-grounded query per candidate
-          - decompose=True  (default)    -> LLM splits the question into 2-4 atomic sub-queries
-          - decompose=False              -> single query == original question (no decomposition)
+        Two modes:
+          - force_option=True  -> one option-grounded query per candidate
+          - force_option=False -> LLM splits into 2-4 atomic sub-queries
         """
         if force_option:
             return {
                 "strategy":  "targeted",
                 "queries":   _option_grounded_subquestions(question, candidates),
                 "reasoning": "iter0_option_grounded",
-            }
-        if not decompose:
-            return {
-                "strategy":  "targeted",
-                "queries":   [question],
-                "reasoning": "iter0_no_decompose",
             }
         return {
             "strategy":  "targeted",
@@ -357,8 +276,8 @@ class Planner:
         self,
         verdict: dict,
         rubric_judgment: bool,
-    ) -> Tuple[str, Optional[dict]]:
-        """Project a verifier verdict into (missing_description, failed_criteria)."""
+    ) -> Tuple[str, Optional[List[str]]]:
+        """Project a verifier verdict into (missing_description, weak_rubric_criteria)."""
         return _planner_repair_context(verdict, rubric_judgment)
 
     def plan_next(
@@ -367,41 +286,34 @@ class Planner:
         candidates: List[str],
         evidence_texts: List[str],
         verdict: dict,
-        plan_history: List[dict],
+        plan_history: List[List[str]],
         *,
-        keyword_broadcast: bool = True,
         rubric_judgment: bool = True,
         prune_satisfied: bool = False,
-    ) -> Tuple[dict, str, Optional[dict]]:
+    ) -> Tuple[dict, str, Optional[List[str]]]:
         """Pick the next iter plan from the verifier verdict.
 
-        Returns (plan, missing_description, failed_criteria).
-        The latter two are also returned so callers can record them in the trace.
+        Returns (plan, missing_description, weak_rubric_criteria).
         """
-        m_desc, failed = _planner_repair_context(verdict, rubric_judgment)
+        m_desc, weak = _planner_repair_context(verdict, rubric_judgment)
 
-        if keyword_broadcast and _needs_broadcast(m_desc):
-            plan = {"strategy": "broadcast", "queries": [], "reasoning": "keyword_trigger"}
-            return plan, m_desc, failed
-
-        opt_status = verdict.get("option_status") if rubric_judgment else None
+        unk_opts = verdict.get("unknown_options") if rubric_judgment else None
         plan = _plan_next(
             question, candidates, evidence_texts, m_desc, self.llm, plan_history,
-            allow_broadcast=not keyword_broadcast,
-            option_status=opt_status,
-            failed_criteria=failed if rubric_judgment else None,
+            unknown_options=unk_opts,
+            weak_rubric_criteria=weak if rubric_judgment else None,
             prune_satisfied=prune_satisfied,
         )
-        return plan, m_desc, failed
+        return plan, m_desc, weak
 
     def filter_targeted_queries(
         self,
         plan: dict,
-        prev_queries: List[str],
+        plan_history: List[List[str]],
         embedder,
         evidence_vecs: List[List[float]],
         *,
-        dedup_thresh: float = 0.5,
+        dedup_thresh: float = 0.9,
         drift_threshold: Optional[float] = 0.70,
     ) -> dict:
         """Apply Jaccard + BGE-drift safety nets to a targeted plan.
@@ -411,6 +323,7 @@ class Planner:
         if plan["strategy"] != "targeted":
             return plan
 
+        prev_queries = [q for qs in plan_history for q in qs]
         ev_mat = (np.array(evidence_vecs, dtype=np.float32)
                   if drift_threshold is not None and evidence_vecs else None)
         kept: List[str] = []

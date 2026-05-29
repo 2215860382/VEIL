@@ -47,21 +47,29 @@ ALL_PIPELINES = (
     # flat-retrieval reference at matched chunk counts
     "coarse24_27b",
     # ─── main VEIL line ────────────────────────────────────────────────
-    # veil_27b = LLM iter-0 subq decomp + unified planner (keyword broadcast)
+    # veil_27b = LLM iter-0 subq decomp + unified planner (LLM-decided broadcast)
     # + rubric judgment + answer-time rubric rerank. All ablations below
     # toggle exactly ONE switch off this baseline.
     "veil_27b",
     # ─── single-switch ablations relative to veil_27b ───────────────────
-    "veil_27b_option4",            # force_option_subquestions=True
-    "veil_27b_llmbcast",           # keyword_broadcast=False (LLM decides broadcast)
     "veil_27b_no_rubric_judge",    # rubric_judgment=False (holistic verifier; planner gets only missing analysis)
+    "veil_27b_no_rubric_attr",     # rubric_judgment=False + verifier_attr=True (implicit evidence attribution, no opstatus)
+    "veil_27b_no_rubric_attr_opstatus", # rubric_judgment=False + verifier_attr=True + verifier_opstatus=True
     "veil_27b_no_rubric_rerank",   # rubric_rerank=False (no LLM rerank before answerer)
+    "veil_27b_combined",           # best ablations: no_rubric_attr_opstatus + prune_satisfied + no_rerank + prune_distractors
+    "veil_27b_subq_oracle_stable", # oracle with consistent evidence order (no second rerank)
+    # ─── incremental stacking (each adds one method on top of previous best) ──
+    # stack1 = veil_27b_no_rubric_judge (already exists)
+    "veil_27b_nr_ps",              # stack2: no_rubric + prune_satisfied
+    "veil_27b_nr_ps_nrr",         # stack3: stack2 + no_rubric_rerank
+    "veil_27b_nr_ps_nrr_lb",      # stack4: stack3 + no_rerank (lb suffix kept for compat)
     "veil_27b_prune_satisfied",    # prune_satisfied=True (planner skips already-satisfied facts)
     "veil_27b_explicit_attr",      # explicit_attribution=True (verifier prints attribution; no pruning)
     "veil_27b_prune_distractors",  # explicit_attribution=True + prune_distractors=True
+    # ─── no-rubric + no-rerank combined ─────────────────────────────────
+    "veil_27b_nr_nrr",              # rubric_judgment=F + rubric_rerank=F
     # ─── upper bounds ───────────────────────────────────────────────────
     "veil_27b_subq_oracle",        # use_oracle=True (iter-0 subq, perfect option_status, criteria untouched)
-    "veil_27b_singlequery_oracle", # use_oracle=True + iter0_decompose=False (reproduces 0515 single-query oracle)
     # ─── other ablation ────────────────────────────────────────────────
     "llm_rerank8",                 # swap cross-encoder → LLM listwise reranker
 )
@@ -70,26 +78,36 @@ _DYNAMIC_COARSE_27B_RE = re.compile(r"^coarse(\d+)_27b(?:_rubric)?$")
 _VEIL_VL_ANS      = frozenset({"veil_coarse8", "veil_coarse64", "veil_rerank8"})
 _VEIL_27B_ANS     = frozenset({"veil_coarse8_27b", "veil_coarse64_27b", "veil_rerank8_27b",
                                 "veil_27b",
-                                "veil_27b_option4",
-                                "veil_27b_llmbcast",
                                 "veil_27b_no_rubric_judge",
+                                "veil_27b_no_rubric_attr",
+                                "veil_27b_no_rubric_attr_opstatus",
                                 "veil_27b_no_rubric_rerank",
+                                "veil_27b_combined",
+                                "veil_27b_subq_oracle_stable",
+                                "veil_27b_nr_ps",
+                                "veil_27b_nr_ps_nrr",
+                                "veil_27b_nr_ps_nrr_lb",
                                 "veil_27b_prune_satisfied",
                                 "veil_27b_explicit_attr",
                                 "veil_27b_prune_distractors",
-                                "veil_27b_subq_oracle",
-                                "veil_27b_singlequery_oracle"})
+                                "veil_27b_nr_nrr",
+                                "veil_27b_subq_oracle"})
 _VEIL_27B_MAIN_AND_ABLATIONS = frozenset({
     "veil_27b",
-    "veil_27b_option4",
-    "veil_27b_llmbcast",
     "veil_27b_no_rubric_judge",
+    "veil_27b_no_rubric_attr",
+    "veil_27b_no_rubric_attr_opstatus",
     "veil_27b_no_rubric_rerank",
+    "veil_27b_combined",
+    "veil_27b_subq_oracle_stable",
+    "veil_27b_nr_ps",
+    "veil_27b_nr_ps_nrr",
+    "veil_27b_nr_ps_nrr_lb",
     "veil_27b_prune_satisfied",
     "veil_27b_explicit_attr",
     "veil_27b_prune_distractors",
+    "veil_27b_nr_nrr",
     "veil_27b_subq_oracle",
-    "veil_27b_singlequery_oracle",
 })
 _VEIL_PIPES       = _VEIL_VL_ANS | _VEIL_27B_ANS
 # 27B answerer pipelines — use Answerer(vlm) so the 27B VLM sees keyframes too.
@@ -176,6 +194,10 @@ def main():
                     help="Served model id for --llm-api-url (default: Qwen3.5-27B)")
     ap.add_argument("--answer-evidence-k", type=int, default=None,
                     help="Cap evidence blocks passed to the final answerer (e.g. 8 for top-8 plot layer after coarse-64 retrieval)")
+    ap.add_argument("--verifier-evidence-k", type=int, default=None,
+                    help="Cap evidence blocks passed to verifier (ranked by rubric relevance); prevents 400/timeout on long evidence chains")
+    ap.add_argument("--answer-keyframe-k", type=int, default=16,
+                    help="Cap keyframe images passed to the final answerer (default 16); prevents context-length errors on diverse videos")
     ap.add_argument("--max-frames",  type=int, default=None,
                     help="Override frame_sampling.max_frames from config (e.g. 32 or 128)")
     ap.add_argument("--direct-max-new-tokens", type=int, default=None,
@@ -217,7 +239,7 @@ def main():
     veil_dedup = float(_vl.get("dedup_threshold", 0.85))
 
     memory_dir = Path(args.memory_dir) if args.memory_dir else \
-                 out_root / "memory" / f"{bench}_fixed"
+                 out_root / "memory" / f"{bench}_L_27b_27b"
     default_out_dir = Path(cfg.get("eval", {}).get("output_dir") or (out_root / "results" / bench))
     out_path   = Path(args.out) if args.out else \
                  default_out_dir / "experiments_fixed.jsonl"
@@ -427,6 +449,8 @@ def main():
     from src.eval.parse_answer import parse_letter
 
     aek = args.answer_evidence_k
+    vek = args.verifier_evidence_k
+    akk = args.answer_keyframe_k
 
     def run_pipeline(pipeline: str, s):
         if pipeline in ("direct", "direct_27b"):
@@ -530,25 +554,52 @@ def main():
         elif pipeline in _VEIL_27B_MAIN_AND_ABLATIONS:
             # Main VEIL line + single-switch ablations + oracle upper bounds.
             # Baseline (veil_27b):
-            #   force_option_subquestions=False, keyword_broadcast=True,
-            #   rubric_judgment=True, rubric_rerank=True,
-            #   prune_satisfied=False, explicit_attribution=False,
-            #   prune_distractors=False, use_oracle=False, iter0_decompose=True
-            # Each ablation flips exactly ONE switch off this baseline.
+            #   rubric_judgment=True, rubric_rerank=False, prune_satisfied=False,
+            #   explicit_attribution=False, prune_distractors=False, use_oracle=False
             kw: dict = dict(
                 reranker=None, coarse_top_k=8, final_top_k=8,
                 max_iter=veil_max_iter, dedup_thresh=veil_dedup,
                 siglip=siglip, text_alpha=va, keyframe_dir=kf_dir,
                 answer_evidence_cap=aek,
+                answer_keyframe_cap=akk,
+                verifier_evidence_cap=vek,
                 rubric_rerank=True,
             )
-            if pipeline == "veil_27b_option4":
-                kw["force_option_subquestions"] = True
-            elif pipeline == "veil_27b_llmbcast":
-                kw["keyword_broadcast"] = False
-            elif pipeline == "veil_27b_no_rubric_judge":
+            if pipeline == "veil_27b_no_rubric_judge":
                 kw["rubric_judgment"] = False
+            elif pipeline == "veil_27b_no_rubric_attr":
+                kw["rubric_judgment"] = False
+                kw["verifier_attr"] = True
+            elif pipeline == "veil_27b_no_rubric_attr_opstatus":
+                kw["rubric_judgment"] = False
+                kw["verifier_attr"] = True
+                kw["verifier_opstatus"] = True
+            elif pipeline == "veil_27b_combined":
+                kw["rubric_judgment"] = False
+                kw["verifier_attr"] = True
+                kw["verifier_opstatus"] = True
+                kw["prune_satisfied"] = True
+                kw["rubric_rerank"] = False
+                kw["prune_distractors"] = True
+            elif pipeline == "veil_27b_subq_oracle_stable":
+                kw["use_oracle"] = True
+                kw["gold_answer"] = s.answer
+                kw["oracle_no_second_rerank"] = True
+            elif pipeline == "veil_27b_nr_ps":
+                kw["rubric_judgment"] = False
+                kw["prune_satisfied"] = True
+            elif pipeline == "veil_27b_nr_ps_nrr":
+                kw["rubric_judgment"] = False
+                kw["prune_satisfied"] = True
+                kw["rubric_rerank"] = False
+            elif pipeline == "veil_27b_nr_ps_nrr_lb":
+                kw["rubric_judgment"] = False
+                kw["prune_satisfied"] = True
+                kw["rubric_rerank"] = False
             elif pipeline == "veil_27b_no_rubric_rerank":
+                kw["rubric_rerank"] = False
+            elif pipeline == "veil_27b_nr_nrr":
+                kw["rubric_judgment"] = False
                 kw["rubric_rerank"] = False
             elif pipeline == "veil_27b_prune_satisfied":
                 kw["prune_satisfied"] = True
@@ -560,10 +611,6 @@ def main():
             elif pipeline == "veil_27b_subq_oracle":
                 kw["use_oracle"] = True
                 kw["gold_answer"] = s.answer
-            elif pipeline == "veil_27b_singlequery_oracle":
-                kw["use_oracle"] = True
-                kw["gold_answer"] = s.answer
-                kw["iter0_decompose"] = False
             r = run_veil(s.question, s.candidates, bank, embedder, text_answerer_27b, llm,
                          task_type=s.question_type, **kw)
         # ── Ablation: LLM listwise reranker ───────────────────────────────────
@@ -620,7 +667,7 @@ def main():
             "pipeline":         pipeline,
             "question":         s.question,
             "candidates":       s.candidates,
-            "gold":             s.answer,
+            "gold_answer":      s.answer,
             "pred_letter":      pred_letter,
             "pred_text":        pred_text,
             "correct":          correct,

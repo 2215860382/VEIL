@@ -138,6 +138,30 @@ class LLMClient:
             ep = self._api_endpoints[self._api_rr % len(self._api_endpoints)]
             self._api_rr += 1
         resp = self._requests.post(ep, json=payload, timeout=120)
+        if resp.status_code in (400, 500):
+            # Strip image_url items from the last message and retry once.
+            msgs = payload["messages"]
+            has_images = any(
+                isinstance(m.get("content"), list) and
+                any(c.get("type") == "image_url" for c in m["content"])
+                for m in msgs
+            )
+            if has_images:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "LLM API %s error with images — retrying without images", resp.status_code
+                )
+                payload["messages"] = [
+                    {**m, "content": (
+                        [c for c in m["content"] if c.get("type") != "image_url"]
+                        if isinstance(m.get("content"), list) else m["content"]
+                    )}
+                    for m in msgs
+                ]
+                with self._api_lock:
+                    ep = self._api_endpoints[self._api_rr % len(self._api_endpoints)]
+                    self._api_rr += 1
+                resp = self._requests.post(ep, json=payload, timeout=120)
         resp.raise_for_status()
         result = resp.json()["choices"][0]["message"]["content"]
         if "</think>" in result:

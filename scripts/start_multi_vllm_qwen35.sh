@@ -53,8 +53,8 @@ for pair in "${PAIRS[@]}"; do
     --host 0.0.0.0 \
     --port "$port" \
     --dtype bfloat16 \
-    --max-model-len 8192 \
-    --gpu-memory-utilization 0.92 \
+    --max-model-len 16384 \
+    --gpu-memory-utilization 0.85 \
     --max-num-seqs 128 \
     --enable-prefix-caching \
     "${LIMIT_ARGS[@]}" \
