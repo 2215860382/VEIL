@@ -76,106 +76,63 @@ def _extract_narrative_from_event_summary(raw_text: str) -> list:
 
 def _upgrade_chunk(
     chunk,
-    vlm,
     embedder,
-    keyframe_dir: Path,
 ) -> None:
-    """In-place upgrade of a single chunk to two-layer format."""
+    """Phase 1: In-place quick conversion to two-layer format (no VLM calls).
+
+    Narrative layer: extract from existing fields (will be enhanced in Phase 2)
+    Static layer: concatenate from ocr + objects + persons (will be multi-frame in Phase 2)
+    """
     # ─────────────────────────────────────────────────────────────
-    # 1. Narrative Layer: VLM 从 event_summary + memory_text 重新生成
+    # 1. Narrative Layer: 从现有字段快速提取（Phase 2 补充）
     # ─────────────────────────────────────────────────────────────
 
-    # 构造输入：事件摘要 + 现有总结
-    narrative_input = f"Event summary: {chunk.event_summary}\n\nOverall summary: {chunk.memory_text}"
-    if chunk.asr:
-        narrative_input += f"\n\nSpoken text: {chunk.asr}"
-
-    messages = [
-        {"role": "system", "content": DYNAMIC_SYS},
-        {"role": "user", "content": narrative_input},
-    ]
-
-    try:
-        raw = vlm._generate(messages, max_new_tokens=256).strip()
-        narrative = _parse_dynamic_narrative(raw, chunk.memory_text)
-    except Exception as e:
-        log.warning("[%s] narrative generation failed: %s", chunk.video_id, e)
-        # Fallback：从现有字段提取
-        narrative = {
-            "summary": chunk.memory_text,
-            "key_events": _extract_narrative_from_event_summary(chunk.event_summary),
-            "actors": chunk.persons if chunk.persons else [],
-            "actions": chunk.actions if chunk.actions else [],
-            "state_changes": [],  # 原库没有，VLM 生成失败时留空
-            "temporal_relations": [],
-            "causal_clues": [],
-        }
-
-    chunk.key_events = narrative.get("key_events", [])
-    chunk.actors = narrative.get("actors", [])
-    chunk.state_changes = narrative.get("state_changes", [])
-    chunk.temporal_relations = narrative.get("temporal_relations", [])
-    chunk.causal_clues = narrative.get("causal_clues", [])
+    chunk.key_events = _extract_narrative_from_event_summary(chunk.event_summary)
+    chunk.actors = chunk.persons if chunk.persons else []
+    chunk.state_changes = []  # Phase 2 补充
+    chunk.temporal_relations = []  # Phase 2 补充
+    chunk.causal_clues = []  # Phase 2 补充
     # memory_text 保持不变（已有高质量摘要）
 
     # ─────────────────────────────────────────────────────────────
-    # 2. Static Attribute Layer: 从原库字段直接拼接（无需VLM）
+    # 2. Static Attribute Layer: 从原库字段拼接（无VLM，Phase 2 扩展多帧）
     # ─────────────────────────────────────────────────────────────
 
-    if chunk.ocr or chunk.objects or chunk.persons:
-        # 构建静态属性帧
-        static_attrs = {
-            "frame_id": f"{chunk.video_id}_chunk{chunk.chunk_id:03d}",
-            "timestamp": chunk.keyframe_ts,
-            "image_path": chunk.keyframe_path,
-            "ocr_text": chunk.ocr.split() if chunk.ocr else [],
-            "numbers": [s for s in chunk.ocr.split() if s.isdigit()] if chunk.ocr else [],
-            "objects": chunk.objects if chunk.objects else [],
-            "people_appearance": chunk.persons if chunk.persons else [],
-        }
+    # 总是创建 static_frames，即使字段为空（Phase 2 会补充）
+    static_attrs = {
+        "frame_id": f"{chunk.video_id}_chunk{chunk.chunk_id:03d}_f0",
+        "timestamp": chunk.keyframe_ts,
+        "image_path": chunk.keyframe_path,
+        "ocr_text": chunk.ocr.split() if chunk.ocr else [],
+        "numbers": [s for s in chunk.ocr.split() if s.isdigit()] if chunk.ocr else [],
+        "colors": [],  # Phase 2 VLM 补充
+        "objects": chunk.objects if chunk.objects else [],
+        "object_attributes": [],  # Phase 2 补充
+        "people_appearance": chunk.persons if chunk.persons else [],
+        "clothing": [],  # Phase 2 VLM 补充
+        "spatial_layout": [],  # Phase 2 VLM 补充
+        "textures": [],  # Phase 2 VLM 补充
+        "scene_attributes": [],  # Phase 2 VLM 补充
+    }
 
-        # 可选：如果有 keyframe，用 VLM 补充 colors/spatial_layout
-        if chunk.keyframe_path and Path(chunk.keyframe_path).exists():
-            try:
-                static_frame = extract_static_attributes(
-                    chunk.keyframe_path,
-                    frame_id=static_attrs["frame_id"],
-                    timestamp=chunk.keyframe_ts,
-                    vlm=vlm,
-                )
-                if static_frame:
-                    # 合并：VLM 的结果覆盖，保留原库数据作为 fallback
-                    static_attrs.update({
-                        "colors": static_frame.get("colors", []),
-                        "clothing": static_frame.get("clothing", []),
-                        "spatial_layout": static_frame.get("spatial_layout", []),
-                        "scene_attributes": static_frame.get("scene_attributes", []),
-                    })
-            except Exception as e:
-                log.warning("[%s] static attribute extraction failed: %s", chunk.video_id, e)
-                # Fallback：只用原库数据，新字段保留空列表
-                pass
+    chunk.static_frames = [static_attrs]
+    chunk.static_index_text = build_static_index_text(static_attrs)
 
-        chunk.static_frames = [static_attrs]
-        chunk.static_index_text = build_static_index_text(static_attrs)
-
-        # 3. 计算属性层向量
-        text_to_encode = chunk.static_index_text if chunk.static_index_text else " "
-        v_static = embedder.encode([text_to_encode])[0].tolist()
-        chunk.v_static = v_static
+    # 3. 计算属性层向量（即使为空也要创建向量，用于 Phase 2 增强）
+    text_to_encode = chunk.static_index_text if chunk.static_index_text else " "
+    v_static = embedder.encode([text_to_encode])[0].tolist()
+    chunk.v_static = v_static
 
 
 def upgrade_bank_file(
     input_path: Path,
-    vlm,
     embedder,
     output_path: Optional[Path] = None,
 ) -> Path:
-    """Upgrade a single bank file to two-layer format.
+    """Phase 1: Quick conversion to two-layer format (no VLM calls).
 
     Args:
         input_path: Path to legacy bank JSON
-        vlm: VLMClient for narrative and static extraction
         embedder: BGE embedder for v_static vectors
         output_path: Where to save upgraded bank (default: same as input, in-place)
 
@@ -193,13 +150,12 @@ def upgrade_bank_file(
         log.info("Bank already has v_static, skipping")
         return output_path
 
-    log.info("Upgrading %d chunks...", len(bank.chunks))
-    keyframe_dir = input_path.parent / bank.video_id / "keyframes"
+    log.info("Phase 1: Quick converting %d chunks (no VLM)...", len(bank.chunks))
 
     for i, chunk in enumerate(bank.chunks):
-        if i % 10 == 0:
+        if i % 500 == 0:
             log.info("  [%d/%d]", i, len(bank.chunks))
-        _upgrade_chunk(chunk, vlm, embedder, keyframe_dir)
+        _upgrade_chunk(chunk, embedder)
 
     log.info("Saving upgraded bank: %s", output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -209,22 +165,17 @@ def upgrade_bank_file(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Upgrade legacy similarity_group banks to two-layer format"
+        description="Phase 1: Quick conversion of legacy similarity_group banks to two-layer format (no VLM)"
     )
     ap.add_argument(
-        "--input",
+        "--input-dir",
         required=True,
-        help="Path to legacy bank JSON file",
+        help="Directory containing legacy bank JSON files",
     )
     ap.add_argument(
-        "--output",
+        "--output-dir",
         default=None,
-        help="Output path (default: same as input, in-place upgrade)",
-    )
-    ap.add_argument(
-        "--vlm-model",
-        required=True,
-        help="Path to VLM checkpoint for narrative extraction",
+        help="Output directory (default: same as input, in-place upgrade)",
     )
     ap.add_argument(
         "--bge-model",
@@ -233,20 +184,24 @@ def main():
     )
     ap.add_argument(
         "--device",
-        default="cuda:0",
-        help="Device for VLM/BGE (default: cuda:0)",
+        default="cuda:4",
+        help="Device for BGE (default: cuda:4)",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers (default: 1)",
     )
     args = ap.parse_args()
 
-    input_path = Path(args.input)
-    output_path = Path(args.output) if args.output else input_path
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir) if args.output_dir else input_dir
 
-    if not input_path.exists():
-        ap.error(f"Input file not found: {input_path}")
+    if not input_dir.exists():
+        ap.error(f"Input directory not found: {input_dir}")
 
-    log.info("Loading VLM: %s", args.vlm_model)
-    vlm = VLMClient(model_path=args.vlm_model, device=args.device, max_new_tokens=256)
-
+    log.info("Phase 1: Quick conversion (no VLM)")
     log.info("Loading BGE embedder...")
     if args.bge_model:
         embedder = BGEM3Embedder(model_path=args.bge_model, device=args.device)
@@ -258,9 +213,22 @@ def main():
             model_path=cfg["models"]["embedder"]["model_path"],
             device=args.device,
         )
+    log.info("  BGE ready")
 
-    upgrade_bank_file(input_path, vlm, embedder, output_path)
-    log.info("Done!")
+    # 批量升级库文件
+    bank_files = sorted(input_dir.glob("*.json"))
+    log.info("Found %d bank files to convert", len(bank_files))
+
+    for idx, bank_file in enumerate(bank_files):
+        if idx % 50 == 0:
+            log.info("Progress: [%d/%d]", idx, len(bank_files))
+        output_file = output_dir / bank_file.name if output_dir != input_dir else bank_file
+        try:
+            upgrade_bank_file(bank_file, embedder, output_file)
+        except Exception as e:
+            log.error("Failed to upgrade %s: %s", bank_file.name, e)
+
+    log.info("Phase 1 complete! %d banks converted", len(bank_files))
 
 
 if __name__ == "__main__":
