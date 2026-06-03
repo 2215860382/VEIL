@@ -137,7 +137,7 @@ class LLMClient:
         with self._api_lock:
             ep = self._api_endpoints[self._api_rr % len(self._api_endpoints)]
             self._api_rr += 1
-        resp = self._requests.post(ep, json=payload, timeout=120)
+        resp = self._requests.post(ep, json=payload, timeout=600)
         if resp.status_code in (400, 500):
             # Strip image_url items from the last message and retry once.
             msgs = payload["messages"]
@@ -161,7 +161,7 @@ class LLMClient:
                 with self._api_lock:
                     ep = self._api_endpoints[self._api_rr % len(self._api_endpoints)]
                     self._api_rr += 1
-                resp = self._requests.post(ep, json=payload, timeout=120)
+                resp = self._requests.post(ep, json=payload, timeout=600)
         resp.raise_for_status()
         result = resp.json()["choices"][0]["message"]["content"]
         if "</think>" in result:
