@@ -177,6 +177,41 @@ def _dedup_by_similarity(
     return kept_t, kept_i, kept_v
 
 
+# ── Query type classification ──────────────────────────────────────────────
+
+def _classify_query_type(query: str) -> str:
+    """Classify query as 'dynamic' (events/actions), 'static' (attributes), or 'mixed'."""
+    query_lower = query.lower()
+    # Dynamic keywords (prioritize longer, more specific phrases first)
+    dynamic_keywords = [
+        "what happened", "what occur", "when did", "in what order", "what was the sequence",
+        "how did", "process", "step", "play", "score a goal", "scored",
+        "first", "then", "finally", "start", "end", "begin",
+        "movement", "move", "strike", "kick", "throw", "hit", "catch",
+        "action", "event", "change from", "changed to", "goes from",
+    ]
+    # Static keywords (prioritize longer, more specific phrases first)
+    static_keywords = [
+        "what color", "which color", "color of", "what is the color",
+        "how many", "how much", "count", "number of", "how many people",
+        "what text", "written text", "text on", "text displayed",
+        "ocr", "written", "says", "display", "displayed",
+        "appearance", "clothing", "clothes", "wear", "jersey",
+        "shirt", "name on", "look like", "describe the", "object", "objects",
+    ]
+
+    # Count keyword matches (longer keywords take priority)
+    dynamic_count = sum(1 for kw in dynamic_keywords if kw in query_lower)
+    static_count = sum(1 for kw in static_keywords if kw in query_lower)
+
+    if dynamic_count > static_count:
+        return "dynamic"
+    elif static_count > dynamic_count:
+        return "static"
+    else:
+        return "mixed"
+
+
 # ── Query-driven retrieval (per sub-question) ────────────────────────────────
 
 def _query_retrieve(
@@ -191,15 +226,36 @@ def _query_retrieve(
     text_alpha: float = 0.6,
     vis_query: str = "",
 ) -> tuple[List[str], List[int], List[List[float]]]:
-    """Return (evidence_texts, chunk_ids, v_semantic_vecs), skipping already-seen chunks."""
+    """Return (evidence_texts, chunk_ids, v_semantic_vecs), skipping already-seen chunks.
+
+    Uses two-layer retrieval: fuses v_semantic (narrative) and v_static (attributes)
+    with weights based on query type classification. Evidence includes both layers.
+    """
     texts    = bank.memory_texts()
-    texts_ev = bank.memory_texts(with_time=True, with_asr=True)
+    texts_ev = bank.memory_texts(with_time=True, with_asr=True, with_layers=True)
     q_vec  = embedder.encode([query])[0]
+
+    # Fuse v_semantic and v_static based on query type
     if bank.chunks[0].v_semantic:
         doc_vecs = np.array([c.v_semantic for c in bank.chunks], dtype=np.float32)
+        scores = doc_vecs @ q_vec
+
+        # Check if v_static vectors are available (two-layer banks)
+        if bank.chunks[0].v_static:
+            q_type = _classify_query_type(query)
+            weight_map = {
+                "dynamic": (0.8, 0.2),   # 80% narrative, 20% attributes
+                "static": (0.2, 0.8),   # 20% narrative, 80% attributes
+                "mixed": (0.5, 0.5),    # 50/50 split
+            }
+            w_dyn, w_sta = weight_map.get(q_type, (0.5, 0.5))
+
+            stat_vecs = np.array([c.v_static for c in bank.chunks], dtype=np.float32)
+            stat_scores = stat_vecs @ q_vec
+            scores = w_dyn * scores + w_sta * stat_scores
     else:
         doc_vecs = embedder.encode(texts)
-    scores = doc_vecs @ q_vec
+        scores = doc_vecs @ q_vec
 
     if siglip is not None and vis_query and bank.chunks[0].v_visual:
         vq_vec     = siglip.encode_text([vis_query])[0]

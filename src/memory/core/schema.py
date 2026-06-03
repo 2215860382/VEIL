@@ -110,11 +110,28 @@ class MemoryBank(BaseModel):
     def load(cls, path: str | Path) -> "MemoryBank":
         return cls.model_validate_json(Path(path).read_text())
 
-    def memory_texts(self, with_time: bool = False, with_asr: bool = False) -> List[str]:
+    def memory_texts(self, with_time: bool = False, with_asr: bool = False, with_layers: bool = False) -> List[str]:
         results = []
         for c in self.chunks:
-            text = f"[{c.start_time:.0f}s-{c.end_time:.0f}s] {c.memory_text}" if with_time else c.memory_text
-            if with_asr and c.asr.strip():
-                text = f"{text}\nSpeech: {c.asr}"
+            if with_layers:
+                parts = []
+                if with_time:
+                    parts.append(f"[{c.start_time:.0f}s-{c.end_time:.0f}s]")
+                parts.append(c.memory_text)
+                if c.key_events:
+                    parts.append(f"Events: {' | '.join(c.key_events)}")
+                if c.actors:
+                    parts.append(f"Actors: {' | '.join(c.actors)}")
+                if c.state_changes:
+                    parts.append(f"Changes: {' | '.join(c.state_changes)}")
+                if c.static_index_text:
+                    parts.append(f"Visual: {c.static_index_text}")
+                if with_asr and c.asr.strip():
+                    parts.append(f"Speech: {c.asr}")
+                text = "\n".join(parts)
+            else:
+                text = f"[{c.start_time:.0f}s-{c.end_time:.0f}s] {c.memory_text}" if with_time else c.memory_text
+                if with_asr and c.asr.strip():
+                    text = f"{text}\nSpeech: {c.asr}"
             results.append(text)
         return results
