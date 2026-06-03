@@ -681,14 +681,14 @@ def main():
         ap.error("--vlm-model is required for local VLM inference (two-pass, or single-pass without --api-url).")
 
     if args.benchmark is not None:
-        from memory import specs as build_specs
+        from src.memory.core import specs as build_specs
         cfg = build_specs.cfg_for_similarity_build(args.benchmark)
     else:
         cfg = load_config(args.config)
         # Eval YAMLs no longer carry memory.cache_dir; fill default so legacy --config scripts keep working.
         bn = cfg.get("benchmark", {}).get("name")
         if bn in ("mlvu", "videomme") and not (cfg.get("memory") or {}).get("cache_dir"):
-            from memory import specs as build_specs
+            from src.memory.core import specs as build_specs
             cfg.setdefault("memory", {})["cache_dir"] = str(
                 build_specs.similarity_memory_cache_dir(bn)
             )

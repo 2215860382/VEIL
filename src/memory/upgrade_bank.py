@@ -64,6 +64,16 @@ def _parse_dynamic_narrative(raw_text: str, fallback_summary: str = "") -> dict:
     }
 
 
+def _extract_narrative_from_event_summary(raw_text: str) -> list:
+    """Extract list of events from event_summary text (separated by semicolons or newlines)."""
+    if not raw_text:
+        return []
+    # Split by common separators: 。；, or newlines
+    import re
+    events = re.split(r'[。；,\n]+', raw_text.strip())
+    return [e.strip() for e in events if e.strip()]
+
+
 def _upgrade_chunk(
     chunk,
     vlm,
@@ -71,46 +81,88 @@ def _upgrade_chunk(
     keyframe_dir: Path,
 ) -> None:
     """In-place upgrade of a single chunk to two-layer format."""
-    # 1. Re-generate narrative layer from summary + available episodic context
-    # Use chunk.memory_text (existing summary) + any available episodic_descs as context
-    prompt_input = f"Analyze this video segment summary and extract structured narrative:\n{chunk.memory_text}"
+    # ─────────────────────────────────────────────────────────────
+    # 1. Narrative Layer: VLM 从 event_summary + memory_text 重新生成
+    # ─────────────────────────────────────────────────────────────
+
+    # 构造输入：事件摘要 + 现有总结
+    narrative_input = f"Event summary: {chunk.event_summary}\n\nOverall summary: {chunk.memory_text}"
     if chunk.asr:
-        prompt_input += f"\n\nSpoken text: {chunk.asr}"
+        narrative_input += f"\n\nSpoken text: {chunk.asr}"
 
     messages = [
         {"role": "system", "content": DYNAMIC_SYS},
-        {"role": "user", "content": prompt_input},
+        {"role": "user", "content": narrative_input},
     ]
 
     try:
         raw = vlm._generate(messages, max_new_tokens=256).strip()
         narrative = _parse_dynamic_narrative(raw, chunk.memory_text)
     except Exception as e:
-        log.warning("[%s] narrative extraction failed: %s", chunk.video_id, e)
-        narrative = _parse_dynamic_narrative("", chunk.memory_text)
+        log.warning("[%s] narrative generation failed: %s", chunk.video_id, e)
+        # Fallback：从现有字段提取
+        narrative = {
+            "summary": chunk.memory_text,
+            "key_events": _extract_narrative_from_event_summary(chunk.event_summary),
+            "actors": chunk.persons if chunk.persons else [],
+            "actions": chunk.actions if chunk.actions else [],
+            "state_changes": [],  # 原库没有，VLM 生成失败时留空
+            "temporal_relations": [],
+            "causal_clues": [],
+        }
 
     chunk.key_events = narrative.get("key_events", [])
     chunk.actors = narrative.get("actors", [])
     chunk.state_changes = narrative.get("state_changes", [])
     chunk.temporal_relations = narrative.get("temporal_relations", [])
     chunk.causal_clues = narrative.get("causal_clues", [])
+    # memory_text 保持不变（已有高质量摘要）
 
-    # 2. Extract static attributes from keyframe
-    if chunk.keyframe_path and Path(chunk.keyframe_path).exists():
-        static_frame = extract_static_attributes(
-            chunk.keyframe_path,
-            frame_id=f"{chunk.video_id}_chunk{chunk.chunk_id:03d}",
-            timestamp=chunk.keyframe_ts,
-            vlm=vlm,
-        )
-        if static_frame:
-            chunk.static_frames = [static_frame]
-            chunk.static_index_text = build_static_index_text(static_frame)
+    # ─────────────────────────────────────────────────────────────
+    # 2. Static Attribute Layer: 从原库字段直接拼接（无需VLM）
+    # ─────────────────────────────────────────────────────────────
 
-            # 3. Compute v_static vector
-            text_to_encode = chunk.static_index_text if chunk.static_index_text else " "
-            v_static = embedder.encode([text_to_encode])[0].tolist()
-            chunk.v_static = v_static
+    if chunk.ocr or chunk.objects or chunk.persons:
+        # 构建静态属性帧
+        static_attrs = {
+            "frame_id": f"{chunk.video_id}_chunk{chunk.chunk_id:03d}",
+            "timestamp": chunk.keyframe_ts,
+            "image_path": chunk.keyframe_path,
+            "ocr_text": chunk.ocr.split() if chunk.ocr else [],
+            "numbers": [s for s in chunk.ocr.split() if s.isdigit()] if chunk.ocr else [],
+            "objects": chunk.objects if chunk.objects else [],
+            "people_appearance": chunk.persons if chunk.persons else [],
+        }
+
+        # 可选：如果有 keyframe，用 VLM 补充 colors/spatial_layout
+        if chunk.keyframe_path and Path(chunk.keyframe_path).exists():
+            try:
+                static_frame = extract_static_attributes(
+                    chunk.keyframe_path,
+                    frame_id=static_attrs["frame_id"],
+                    timestamp=chunk.keyframe_ts,
+                    vlm=vlm,
+                )
+                if static_frame:
+                    # 合并：VLM 的结果覆盖，保留原库数据作为 fallback
+                    static_attrs.update({
+                        "colors": static_frame.get("colors", []),
+                        "clothing": static_frame.get("clothing", []),
+                        "spatial_layout": static_frame.get("spatial_layout", []),
+                        "scene_attributes": static_frame.get("scene_attributes", []),
+                    })
+            except Exception as e:
+                log.warning("[%s] static attribute extraction failed: %s", chunk.video_id, e)
+                # Fallback：只用原库数据，新字段保留空列表
+                pass
+
+        chunk.static_frames = [static_attrs]
+        chunk.static_index_text = build_static_index_text(static_attrs)
+
+        # 3. 计算属性层向量
+        text_to_encode = chunk.static_index_text if chunk.static_index_text else " "
+        v_static = embedder.encode([text_to_encode])[0].tolist()
+        chunk.v_static = v_static
 
 
 def upgrade_bank_file(
