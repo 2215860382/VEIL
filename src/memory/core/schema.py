@@ -8,6 +8,23 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+class StaticAttributeFrame(BaseModel):
+    """Static visual attributes extracted from a single frame."""
+    frame_id: str
+    timestamp: float
+    image_path: str
+    ocr_text: List[str] = Field(default_factory=list)
+    numbers: List[str] = Field(default_factory=list)
+    colors: List[str] = Field(default_factory=list)
+    objects: List[str] = Field(default_factory=list)
+    object_attributes: List[dict] = Field(default_factory=list)
+    people_appearance: List[str] = Field(default_factory=list)
+    clothing: List[str] = Field(default_factory=list)
+    spatial_layout: List[str] = Field(default_factory=list)
+    textures: List[str] = Field(default_factory=list)
+    scene_attributes: List[str] = Field(default_factory=list)
+
+
 class MemoryChunk(BaseModel):
     video_id: str
     chunk_id: int
@@ -35,6 +52,16 @@ class MemoryChunk(BaseModel):
     v_visual: List[float] = Field(default_factory=list)     # SigLIP keyframe (1024,) L2-normed
     keyframe_path: str = ""
     keyframe_ts: float = 0.0
+
+    # Two-layer memory bank fields (Dynamic Narrative + Static Attribute)
+    key_events: List[str] = Field(default_factory=list)
+    actors: List[str] = Field(default_factory=list)
+    state_changes: List[str] = Field(default_factory=list)
+    temporal_relations: List[str] = Field(default_factory=list)
+    causal_clues: List[str] = Field(default_factory=list)
+    static_frames: List[StaticAttributeFrame] = Field(default_factory=list)
+    static_index_text: str = ""
+    v_static: List[float] = Field(default_factory=list)   # BGE-M3 on static attributes
 
     def label(self) -> str:
         return f"{self.video_id}#chunk{self.chunk_id:03d}@{self.start_time:.0f}-{self.end_time:.0f}s"

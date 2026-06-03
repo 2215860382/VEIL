@@ -70,24 +70,48 @@ FRAME_CAPTION_PROMPT = (
     "scoreboard reads \"HOME 2 – AWAY 1\"; stadium crowd in background.'"
 )
 
-SUMMARY_SYS = (
-    "You are a video analyst. Summarize this video segment in 2-4 sentences "
-    "(use more sentences only when the segment contains multiple distinct events or steps).\n"
+DYNAMIC_SYS = (
+    "You are a video event analyst. Analyze this video segment and return a JSON object.\n"
     "Priority rules:\n"
-    "1. SPEAKER FIRST: if a host, narrator, or named presenter is speaking, make them the subject "
-    "of the sentence (e.g. 'The host explains...', 'Joeri describes...', 'The narrator states...'). "
-    "Avoid 'The video shows...' when a real person is clearly speaking.\n"
-    "2. STATE the main topic, activity, or event so a reader understands the segment's purpose.\n"
-    "3. PRESERVE specifics from the frame descriptions: exact numbers, counts, names, "
-    "scores, and transcribed on-screen text — never replace them with vague terms.\n"
-    "4. SEQUENCE events with temporal markers (first / then / after / finally) "
-    "if the frames show a process or ordered steps.\n"
-    "5. INCLUDE causal or purposive language when evident "
-    "(e.g. 'because', 'in order to', 'which causes', 'as a result') "
-    "to preserve why or how things happen.\n"
+    "1. OPEN WITH NUMBERS/CHANGES: if any numbers, scores, counts, or state changes exist, "
+    "state them first. Use delta notation 'from X to Y' for changes.\n"
+    "2. SPEAKER FIRST: if a host/narrator is speaking, make them the subject.\n"
+    "3. STATE the main topic/activity/event. PRESERVE all specifics: numbers, names, scores, text.\n"
+    "4. SEQUENCE events with temporal markers (first/then/after/finally) if the frames show process/steps.\n"
+    "5. INCLUDE causal language (because, in order to, which causes, as a result).\n"
     "6. INCLUDE key attributes (color, appearance, location) that distinguish subjects.\n"
-    "Be factual. Do not infer anything not stated in the frame descriptions."
+    "Return JSON with these keys:\n"
+    "{\n"
+    '  "summary": "2-4 sentence narrative with numbers/changes in sentence 1",\n'
+    '  "key_events": ["ordered", "list", "of", "key", "events"],\n'
+    '  "actors": ["named persons or consistent descriptors"],\n'
+    '  "state_changes": ["observable changes: \'X changed from A to B\'", "empty list if none"],\n'
+    '  "temporal_relations": ["sequence markers: \'first...\', \'then...\', \'finally...\'"],\n'
+    '  "causal_clues": ["causal statements: \'because X, Y happened\'"]\n'
+    "}\n"
+    "Be factual. Do not infer beyond frame descriptions."
 )
+
+STATIC_ATTR_SYS = (
+    "You are a visual attribute extractor. Analyze this video frame and return a JSON object.\n"
+    "Extract ONLY static visible attributes — do NOT describe actions or events.\n"
+    "Return JSON with these keys:\n"
+    "{\n"
+    '  "ocr_text": ["exact on-screen text/numbers/scores — transcribe verbatim"],\n'
+    '  "numbers": ["every visible number"],\n'
+    '  "colors": ["dominant colors of main objects/persons"],\n'
+    '  "objects": ["specific object names with precise names"],\n'
+    '  "object_attributes": [{"object": "name", "attributes": ["color", "shape", "material", "texture"]}],\n'
+    '  "people_appearance": ["physical description of each person"],\n'
+    '  "clothing": ["clothing items with colors/styles"],\n'
+    '  "spatial_layout": ["relative positions: \'person on left\', \'text in top-right\'"],\n'
+    '  "textures": ["notable textures or materials"],\n'
+    '  "scene_attributes": ["location type, lighting, background details"]\n'
+    "}\n"
+    "If a category has no items, use an empty list."
+)
+
+SUMMARY_SYS = DYNAMIC_SYS  # For backward compatibility
 
 
 # ── SRT parsing & subtitle alignment ──────────────────────────────────────────
@@ -289,11 +313,19 @@ def summarize_group(
     vlm,
     speech_text: str = "",
     max_caps: int = 15,
-) -> str:
-    """Generate 1-2 sentence summary from frame captions; aligned SRT text is always included when non-empty."""
+) -> dict:
+    """Generate structured narrative (summary, key_events, actors, state_changes, etc.) from frame captions.
+    Returns dict with keys: summary, key_events, actors, state_changes, temporal_relations, causal_clues."""
     caps = [c for c in frame_captions if c.strip()]
     if not caps and not speech_text.strip():
-        return ""
+        return {
+            "summary": "",
+            "key_events": [],
+            "actors": [],
+            "state_changes": [],
+            "temporal_relations": [],
+            "causal_clues": [],
+        }
     if len(caps) > max_caps:
         step = len(caps) / max_caps
         caps = [caps[int(i * step)] for i in range(max_caps)]
@@ -302,17 +334,101 @@ def summarize_group(
     user_msg = f"Frame descriptions:\n{desc}\n"
     if speech_text.strip():
         user_msg += f"\nSpoken words:\n{speech_text.strip()}\n"
-    user_msg += "\nWrite a 1-2 sentence summary of this video segment:"
 
     messages = [
-        {"role": "system", "content": SUMMARY_SYS},
+        {"role": "system", "content": DYNAMIC_SYS},
         {"role": "user",   "content": user_msg},
     ]
     try:
-        return vlm._generate(messages, max_new_tokens=128).strip()
+        raw = vlm._generate(messages, max_new_tokens=256).strip()
+        # Extract JSON from response
+        import json as _json
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        if m:
+            d = _json.loads(m.group())
+            return {
+                "summary": str(d.get("summary", "")),
+                "key_events": d.get("key_events", []) if isinstance(d.get("key_events"), list) else [],
+                "actors": d.get("actors", []) if isinstance(d.get("actors"), list) else [],
+                "state_changes": d.get("state_changes", []) if isinstance(d.get("state_changes"), list) else [],
+                "temporal_relations": d.get("temporal_relations", []) if isinstance(d.get("temporal_relations"), list) else [],
+                "causal_clues": d.get("causal_clues", []) if isinstance(d.get("causal_clues"), list) else [],
+            }
     except Exception as e:
         log.warning("  summary error: %s", e)
-        return caps[0] if caps else speech_text[:200]
+
+    # Fallback to simple summary
+    return {
+        "summary": caps[0] if caps else speech_text[:200],
+        "key_events": [],
+        "actors": [],
+        "state_changes": [],
+        "temporal_relations": [],
+        "causal_clues": [],
+    }
+
+
+# ── Static Attribute Extraction (local VLM) ───────────────────────────────────
+
+def extract_static_attributes(
+    frame_path: str,
+    frame_id: str,
+    timestamp: float,
+    vlm,
+) -> Optional[dict]:
+    """Extract static visual attributes from a single frame. Returns dict for StaticAttributeFrame."""
+    try:
+        from PIL import Image
+        img = Image.open(frame_path).convert("RGB")
+
+        raw = vlm.chat_with_frames([img], STATIC_ATTR_SYS, max_new_tokens=512).strip()
+
+        import json as _json
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        if m:
+            d = _json.loads(m.group())
+            return {
+                "frame_id": frame_id,
+                "timestamp": timestamp,
+                "image_path": frame_path,
+                "ocr_text": d.get("ocr_text", []) if isinstance(d.get("ocr_text"), list) else [],
+                "numbers": d.get("numbers", []) if isinstance(d.get("numbers"), list) else [],
+                "colors": d.get("colors", []) if isinstance(d.get("colors"), list) else [],
+                "objects": d.get("objects", []) if isinstance(d.get("objects"), list) else [],
+                "object_attributes": d.get("object_attributes", []) if isinstance(d.get("object_attributes"), list) else [],
+                "people_appearance": d.get("people_appearance", []) if isinstance(d.get("people_appearance"), list) else [],
+                "clothing": d.get("clothing", []) if isinstance(d.get("clothing"), list) else [],
+                "spatial_layout": d.get("spatial_layout", []) if isinstance(d.get("spatial_layout"), list) else [],
+                "textures": d.get("textures", []) if isinstance(d.get("textures"), list) else [],
+                "scene_attributes": d.get("scene_attributes", []) if isinstance(d.get("scene_attributes"), list) else [],
+            }
+    except Exception as e:
+        log.warning("  static attr error: %s", e)
+        return None
+
+
+def build_static_index_text(static_frame: dict) -> str:
+    """Build searchable text from static attributes for BGE encoding."""
+    parts = []
+    if static_frame.get("ocr_text"):
+        parts.append(f"OCR: {' '.join(static_frame['ocr_text'])}")
+    if static_frame.get("numbers"):
+        parts.append(f"Numbers: {' '.join(static_frame['numbers'])}")
+    if static_frame.get("colors"):
+        parts.append(f"Colors: {' '.join(static_frame['colors'])}")
+    if static_frame.get("objects"):
+        parts.append(f"Objects: {' '.join(static_frame['objects'])}")
+    if static_frame.get("people_appearance"):
+        parts.append(f"People: {' '.join(static_frame['people_appearance'])}")
+    if static_frame.get("clothing"):
+        parts.append(f"Clothing: {' '.join(static_frame['clothing'])}")
+    if static_frame.get("spatial_layout"):
+        parts.append(f"Layout: {' '.join(static_frame['spatial_layout'])}")
+    if static_frame.get("textures"):
+        parts.append(f"Textures: {' '.join(static_frame['textures'])}")
+    if static_frame.get("scene_attributes"):
+        parts.append(f"Scene: {' '.join(static_frame['scene_attributes'])}")
+    return " | ".join(parts) if parts else ""
 
 
 # ── Group summary (vLLM API) ───────────────────────────────────────────────────
@@ -331,14 +447,13 @@ def _build_summary_payload(
     user_msg = f"Frame descriptions:\n{desc}\n"
     if speech_text.strip():
         user_msg += f"\nSpoken words:\n{speech_text.strip()}\n"
-    user_msg += "\nWrite a 1-2 sentence summary of this video segment:"
     return {
         "model": api_model,
         "messages": [
-            {"role": "system", "content": SUMMARY_SYS},
+            {"role": "system", "content": DYNAMIC_SYS},
             {"role": "user",   "content": user_msg},
         ],
-        "max_tokens": 128,
+        "max_tokens": 256,
         "temperature": 0,
         "repetition_penalty": 1.3,
         "chat_template_kwargs": {"enable_thinking": False},
@@ -351,8 +466,8 @@ def summarize_groups_api(
     api_url: str,
     api_model: str,
     concurrency: int = 16,
-) -> List[str]:
-    """Async-batch summarize all groups for one video."""
+) -> List[dict]:
+    """Async-batch summarize all groups for one video. Returns list of dicts with 'summary' key."""
     import asyncio
     import aiohttp
 
@@ -366,11 +481,26 @@ def summarize_groups_api(
                     timeout=aiohttp.ClientTimeout(total=90),
                 ) as r:
                     data = await r.json()
-                    return idx, data["choices"][0]["message"]["content"].strip()
+                    summary_text = data["choices"][0]["message"]["content"].strip()
+                    return idx, {
+                        "summary": summary_text,
+                        "key_events": [],
+                        "actors": [],
+                        "state_changes": [],
+                        "temporal_relations": [],
+                        "causal_clues": [],
+                    }
             except Exception as e:
                 log.warning("  API summary group %d: %s", idx, e)
-                fallback = " ".join(c for c in caps if c)[:200]
-                return idx, fallback or speech[:200]
+                fallback = " ".join(c for c in caps if c)[:200] or speech[:200]
+                return idx, {
+                    "summary": fallback,
+                    "key_events": [],
+                    "actors": [],
+                    "state_changes": [],
+                    "temporal_relations": [],
+                    "causal_clues": [],
+                }
 
     async def _run():
         sem = asyncio.Semaphore(concurrency)
@@ -379,9 +509,9 @@ def summarize_groups_api(
             tasks = [_one(session, sem, i, caps, sp)
                      for i, (caps, sp) in enumerate(zip(groups_captions, groups_speech))]
             results = await asyncio.gather(*tasks)
-        out = [""] * len(groups_captions)
-        for idx, text in results:
-            out[idx] = text
+        out = [{}] * len(groups_captions)
+        for idx, summary_dict in results:
+            out[idx] = summary_dict
         return out
 
     return asyncio.run(_run())
@@ -759,17 +889,11 @@ def main():
                         groups_caps, speech_texts,
                         args.api_url, args.api_model,
                         concurrency=args.api_concurrency)
-                    summaries = [
-                        s if s else ". ".join(c for c in gc if c)[:300]
-                        for s, gc in zip(summaries, groups_caps)
-                    ]
                 else:
                     summaries = []
                     for gd, speech in zip(groups_data, speech_texts):
                         caps = [all_captions[fi] for fi in gd["frame_indices"]]
                         summary = summarize_group(caps, vlm, speech_text=speech)
-                        if not summary:
-                            summary = ". ".join(c for c in caps if c)[:300]
                         summaries.append(summary)
 
                 embed_texts = [
@@ -782,8 +906,9 @@ def main():
                 video_ep_dir.mkdir(parents=True, exist_ok=True)
 
                 chunks = []
-                for chunk_id, (gd, summary, speech) in enumerate(
+                for chunk_id, (gd, summary_dict, speech) in enumerate(
                         zip(groups_data, summaries, speech_texts)):
+                    summary_text = summary_dict.get("summary", "") if isinstance(summary_dict, dict) else summary_dict
                     ep_data = {
                         "unit_id": f"{video_id}_unit_{chunk_id:04d}",
                         "episodic_descs": [all_captions[fi] for fi in gd["frame_indices"]
@@ -794,19 +919,47 @@ def main():
                     (video_ep_dir / f"{chunk_id:04d}.json").write_text(
                         json.dumps(ep_data, ensure_ascii=False))
 
-                    chunks.append(MemoryChunk(
-                        video_id=video_id,
-                        chunk_id=chunk_id,
-                        start_time=gd["t_start"],
-                        end_time=gd["t_end"],
-                        memory_text=summary,
-                        asr=speech,
-                        sampled_frames=[timestamps[fi] for fi in gd["frame_indices"]],
-                        keyframe_path=gd["keyframe_path"],
-                        keyframe_ts=gd["keyframe_ts"],
-                        v_semantic=sem_vecs[chunk_id].tolist(),
-                        v_visual=gd["v_visual"],
-                    ))
+                    # Extract static attributes from keyframe
+                    static_frame = extract_static_attributes(
+                        gd["keyframe_path"],
+                        frame_id=f"{video_id}_chunk{chunk_id:03d}",
+                        timestamp=gd["keyframe_ts"],
+                        vlm=vlm,
+                    ) if Path(gd["keyframe_path"]).exists() else None
+
+                    static_index_text = build_static_index_text(static_frame) if static_frame else ""
+                    text_to_encode = static_index_text if static_index_text else " "
+                    static_vecs = embedder.encode([text_to_encode])
+
+                    chunk_kwargs = {
+                        "video_id": video_id,
+                        "chunk_id": chunk_id,
+                        "start_time": gd["t_start"],
+                        "end_time": gd["t_end"],
+                        "memory_text": summary_text,
+                        "asr": speech,
+                        "sampled_frames": [timestamps[fi] for fi in gd["frame_indices"]],
+                        "keyframe_path": gd["keyframe_path"],
+                        "keyframe_ts": gd["keyframe_ts"],
+                        "v_semantic": sem_vecs[chunk_id].tolist(),
+                        "v_visual": gd["v_visual"],
+                    }
+                    if isinstance(summary_dict, dict):
+                        chunk_kwargs.update({
+                            "key_events": summary_dict.get("key_events", []),
+                            "actors": summary_dict.get("actors", []),
+                            "state_changes": summary_dict.get("state_changes", []),
+                            "temporal_relations": summary_dict.get("temporal_relations", []),
+                            "causal_clues": summary_dict.get("causal_clues", []),
+                        })
+                    if static_frame:
+                        chunk_kwargs.update({
+                            "static_frames": [static_frame],
+                            "static_index_text": static_index_text,
+                            "v_static": static_vecs[0].tolist(),
+                        })
+
+                    chunks.append(MemoryChunk(**chunk_kwargs))
 
                 bank = MemoryBank(
                     video_id=video_id,
@@ -911,17 +1064,11 @@ def main():
                     groups_caps, speech_texts,
                     args.api_url, args.api_model,
                     concurrency=args.api_concurrency)
-                summaries = [
-                    s if s else ". ".join(c for c in gc if c)[:300]
-                    for s, gc in zip(summaries, groups_caps)
-                ]
             else:
                 summaries = []
                 for g, speech in zip(groups, speech_texts):
                     caps = [all_captions[fi] for fi in g.frame_indices]
                     summary = summarize_group(caps, vlm, speech_text=speech)
-                    if not summary:
-                        summary = ". ".join(c for c in caps if c)[:300]
                     summaries.append(summary)
             log.info("  summaries done (%.1fs)", time.time() - t0)
 
@@ -937,11 +1084,12 @@ def main():
             video_ep_dir.mkdir(parents=True, exist_ok=True)
 
             chunks = []
-            for chunk_id, (g, summary, speech) in enumerate(
+            for chunk_id, (g, summary_dict, speech) in enumerate(
                     zip(groups, summaries, speech_texts)):
                 center = _select_center(frame_paths, g)
                 kf_path = _save_keyframe(frame_paths, center,
                                          video_kf_dir / f"{chunk_id:04d}.jpg")
+                summary_text = summary_dict.get("summary", "") if isinstance(summary_dict, dict) else summary_dict
                 ep_data = {
                     "unit_id": f"{video_id}_unit_{chunk_id:04d}",
                     "episodic_descs": [all_captions[fi] for fi in g.frame_indices
@@ -952,19 +1100,47 @@ def main():
                 (video_ep_dir / f"{chunk_id:04d}.json").write_text(
                     json.dumps(ep_data, ensure_ascii=False))
 
-                chunks.append(MemoryChunk(
-                    video_id=video_id,
-                    chunk_id=chunk_id,
-                    start_time=g.t_start,
-                    end_time=g.t_end,
-                    memory_text=summary,
-                    asr=speech,
-                    sampled_frames=[timestamps[fi] for fi in g.frame_indices],
-                    keyframe_path=kf_path,
-                    keyframe_ts=timestamps[center],
-                    v_semantic=sem_vecs[chunk_id].tolist(),
-                    v_visual=v_frames[center].tolist(),
-                ))
+                # Extract static attributes from keyframe
+                static_frame = extract_static_attributes(
+                    kf_path,
+                    frame_id=f"{video_id}_chunk{chunk_id:03d}",
+                    timestamp=timestamps[center],
+                    vlm=vlm,
+                ) if not args.api_url and vlm and Path(kf_path).exists() else None
+
+                static_index_text = build_static_index_text(static_frame) if static_frame else ""
+                text_to_encode = static_index_text if static_index_text else " "
+                static_vecs = embedder.encode([text_to_encode])
+
+                chunk_kwargs = {
+                    "video_id": video_id,
+                    "chunk_id": chunk_id,
+                    "start_time": g.t_start,
+                    "end_time": g.t_end,
+                    "memory_text": summary_text,
+                    "asr": speech,
+                    "sampled_frames": [timestamps[fi] for fi in g.frame_indices],
+                    "keyframe_path": kf_path,
+                    "keyframe_ts": timestamps[center],
+                    "v_semantic": sem_vecs[chunk_id].tolist(),
+                    "v_visual": v_frames[center].tolist(),
+                }
+                if isinstance(summary_dict, dict):
+                    chunk_kwargs.update({
+                        "key_events": summary_dict.get("key_events", []),
+                        "actors": summary_dict.get("actors", []),
+                        "state_changes": summary_dict.get("state_changes", []),
+                        "temporal_relations": summary_dict.get("temporal_relations", []),
+                        "causal_clues": summary_dict.get("causal_clues", []),
+                    })
+                if static_frame:
+                    chunk_kwargs.update({
+                        "static_frames": [static_frame],
+                        "static_index_text": static_index_text,
+                        "v_static": static_vecs[0].tolist(),
+                    })
+
+                chunks.append(MemoryChunk(**chunk_kwargs))
 
             bank = MemoryBank(
                 video_id=video_id,
