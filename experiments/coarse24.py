@@ -1,213 +1,319 @@
-#!/usr/bin/env python
-"""Coarse24 — 极简基线：单query → BGE top-24 → LLM判断
+"""Coarse-24 Baseline — Direct retrieval of 24 evidence chunks.
+
+Single-stage: BGE top-24 → Answerer (no iteration, no judgment).
+
+Usage:
+    cd /home2/ycj/Project/VEIL
+    PYTHONPATH=. python experiments/coarse24.py \
+        --config configs/videomme_memory_bank.yaml \
+        --vlm-api-url http://localhost:8002 \
+        --bge-gpu cuda:3
 """
+from __future__ import annotations
+
 import argparse
 import json
 import sys
+import threading
 import time
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import load_config
-from src.dataloader.videomme import load_videomme
-from src.models.embedder import BGEM3Embedder
-from src.models.llm_client import LLMClient
 from src.utils.logging import get_logger
+from src.clients.vlm_client import VLMClient
+from src.clients.embedder import BGEM3Embedder
+from src.clients.siglip_embedder import SigLIPEmbedder
+from src.agents.answerer import Answerer
+from src.build_memory.core.schema import MemoryBank
+from src.eval.parse_answer import parse_letter
 
 PIPELINE_NAME = "coarse24"
+
 log = get_logger(PIPELINE_NAME)
+
+
+def load_samples(cfg: dict, filter_video_ids: set | None = None):
+    bench = cfg["benchmark"]["name"]
+    if bench == "mlvu":
+        from src.dataloader.mlvu import load_mlvu
+        b = cfg["benchmark"]
+        samples = load_mlvu(
+            json_dir=b["json_dir"],
+            video_dir=b["video_dir"],
+            json_files=b["json_files"],
+        )
+    elif bench == "videomme":
+        from src.dataloader.videomme import load_videomme
+        b = cfg["benchmark"]
+        samples = load_videomme(
+            parquet_path=b["parquet_path"],
+            video_dir=b["video_dir"],
+            duration_groups=b.get("duration_groups"),
+        )
+    else:
+        raise ValueError(f"Unknown benchmark: {bench}")
+    if filter_video_ids is not None:
+        samples = [s for s in samples if s.video_id in filter_video_ids]
+    return samples
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--memory-dir", default=None)
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--bge-gpu", default="cuda:3")
-    ap.add_argument("--llm-api-url", default=None)
-    ap.add_argument("--llm-api-model", default="Qwen3.5-27B")
-    ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--config",      required=True)
+    ap.add_argument("--memory-dir",  default=None)
+    ap.add_argument("--out",         default=None)
+    ap.add_argument("--filter-from", default=None,
+                    help="JSONL with video_id keys; only run those videos")
+    ap.add_argument("--sample-start", type=int, default=None,
+                    help="Inclusive lower bound on sample_idx")
+    ap.add_argument("--sample-end",   type=int, default=None,
+                    help="Exclusive upper bound on sample_idx")
+    ap.add_argument("--vlm-gpu",        default="cuda:0")
+    ap.add_argument("--bge-gpu",        default="cuda:3")
+    ap.add_argument("--siglip-gpu",     default=None,
+                    help="GPU for SigLIP visual scoring; defaults to --bge-gpu")
+    ap.add_argument("--no-siglip",      action="store_true",
+                    help="Disable SigLIP dual-path fusion")
+    ap.add_argument("--no-keyframes",   action="store_true",
+                    help="Do not load keyframe images for the answerer")
+    ap.add_argument("--text-alpha",     type=float, default=0.6,
+                    help="Weight of semantic (BGE) path in dual-path fusion")
+    ap.add_argument("--vlm-model",      default=None)
+    ap.add_argument("--vlm-api-url",    default=None,
+                    help="vLLM API base URL")
+    ap.add_argument("--vlm-api-model",  default=None)
+    ap.add_argument("--answer-keyframe-k",   type=int, default=16,
+                    help="Cap keyframe images passed to the final answerer")
+    ap.add_argument("--max-frames",          type=int, default=None,
+                    help="Override frame_sampling.max_frames from config")
+    ap.add_argument("--workers",             type=int, default=1,
+                    help="Parallel workers (safe with API-mode VLM)")
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
-    bench = cfg["benchmark"]["name"]
+    cfg      = load_config(args.config)
+    bench    = cfg["benchmark"]["name"]
     out_root = Path(cfg.get("paths", {}).get("outputs_root", "outputs"))
 
-    # 加载样本
-    b = cfg["benchmark"]
-    samples = load_videomme(
-        parquet_path=b["parquet_path"],
-        video_dir=b["video_dir"],
-        duration_groups=b.get("duration_groups"),
-    )
-    log.info("loaded %d samples", len(samples))
-
-    # 输出路径
-    out_path = Path(args.out) if args.out else (out_root / "results" / "videommeL" / "coarse24.jsonl")
+    memory_dir = Path(args.memory_dir) if args.memory_dir else \
+                 out_root / "memory" / f"{bench}_L_27b_27b"
+    default_out_dir = Path(cfg.get("eval", {}).get("output_dir") or (out_root / "results" / bench))
+    out_path = Path(args.out) if args.out else \
+               default_out_dir / "coarse24.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    done_keys = set()
+    filter_vids: set | None = None
+    if args.filter_from:
+        filter_vids = set()
+        for line in Path(args.filter_from).open():
+            try: filter_vids.add(json.loads(line)["video_id"])
+            except: pass
+        log.info("filter: %d video_ids from %s", len(filter_vids), args.filter_from)
+
+    samples = load_samples(cfg, filter_vids)
+    if args.sample_start is not None:
+        samples = [s for s in samples if int(s.sample_idx) >= args.sample_start]
+    if args.sample_end is not None:
+        samples = [s for s in samples if int(s.sample_idx) < args.sample_end]
+    log.info("loaded %d samples (%d videos)", len(samples),
+             len({s.video_id for s in samples}))
+
+    done_keys: set[str] = set()
     if out_path.exists():
         for line in out_path.open():
-            try:
-                done_keys.add(json.loads(line)["key"])
-            except:
-                pass
-    log.info("already done: %d", len(done_keys))
+            try: done_keys.add(json.loads(line)["key"])
+            except: pass
+    log.info("already done: %d records", len(done_keys))
 
-    # 记忆库
-    memory_dir = Path(args.memory_dir) if args.memory_dir else (out_root / "memory" / "videomme_L_27b_27b")
+    needs_siglip  = not args.no_siglip
+    siglip_device = (args.siglip_gpu if args.siglip_gpu is not None else args.bge_gpu) if needs_siglip else None
 
-    def load_bank(vid):
-        bp = memory_dir / f"{vid}.json"
-        return json.load(open(bp)) if bp.exists() else None
+    vlm = embedder = answerer = siglip = None
 
-    # 模型
-    log.info("loading BGE on %s", args.bge_gpu)
+    vlm_model = args.vlm_model or cfg["models"]["vlm"]["model_path"]
+    if args.vlm_api_url:
+        log.info("loading VLM via API %s ...", args.vlm_api_url)
+        vlm = VLMClient(model_path=vlm_model, api_url=args.vlm_api_url,
+                        api_model=args.vlm_api_model)
+    else:
+        log.info("loading VLM %s on %s ...", vlm_model, args.vlm_gpu)
+        vlm = VLMClient(model_path=vlm_model, device=args.vlm_gpu)
+    answerer = Answerer(vlm)
+    log.info("  VLM ready")
+
+    log.info("loading BGE-M3 on %s ...", args.bge_gpu)
+    t0 = time.time()
     embedder = BGEM3Embedder(
         model_path=cfg["models"]["embedder"]["model_path"],
         use_fp16=cfg["models"]["embedder"].get("use_fp16", True),
         device=args.bge_gpu,
     )
+    log.info("  BGE-M3 ready (%.1fs)", time.time() - t0)
 
-    log.info("loading LLM API %s", args.llm_api_url)
-    llm = LLMClient(
-        model_path=args.llm_api_model,
-        api_url=args.llm_api_url,
-        api_model=args.llm_api_model,
-    )
+    if needs_siglip and siglip_device:
+        from src.clients.siglip_embedder import SigLIPEmbedder
+        siglip_model = "/home2/ycj/Models/google/siglip-large-patch16-384"
+        log.info("loading SigLIP on %s ...", siglip_device)
+        t0 = time.time()
+        siglip = SigLIPEmbedder(model_path=siglip_model, device=siglip_device)
+        log.info("  SigLIP ready (%.1fs)", time.time() - t0)
 
-    out_fh = out_path.open("a")
+    _gpu_lock = threading.Lock()
+
+    class _LockedModel:
+        def __init__(self, model):
+            self._m = model
+        def __getattr__(self, name):
+            attr = getattr(self._m, name)
+            if callable(attr):
+                def _locked(*a, **kw):
+                    with _gpu_lock:
+                        return attr(*a, **kw)
+                return _locked
+            return attr
+
+    if embedder: embedder = _LockedModel(embedder)
+    if siglip:   siglip   = _LockedModel(siglip)
+
+    _bank_cache:  dict = {}
+    _cache_lock = threading.Lock()
+
+    def get_bank(video_id: str):
+        with _cache_lock:
+            if video_id in _bank_cache:
+                return _bank_cache[video_id]
+        vd = memory_dir / video_id
+        if not (vd / "narrative.json").exists():
+            return None
+        from src.build_memory.core.bank_loader import load_bank
+        bank = load_bank(vd)
+        with _cache_lock:
+            _bank_cache[video_id] = bank
+        return bank
+
+    akk = args.answer_keyframe_k
+    kf_dir = None if args.no_keyframes else memory_dir
 
     def run_sample(s):
-        bank = load_bank(s.video_id)
-        if not bank:
+        import numpy as np
+        bank = get_bank(s.video_id)
+        if bank is None:
             return None, "bank_missing"
 
-        # 单 query + top-24
-        chunks = bank.get("chunks", [])
-        if not chunks:
-            return None, "no_chunks"
+        # Single-stage: BGE top-24 → Answerer
+        query_emb = embedder.encode([s.question])[0]
+        doc_vecs = np.array([c.v_dynamic for c in bank.chunks], dtype=np.float32)
+        scores = doc_vecs @ query_emb
+        top_indices = scores.argsort()[-24:][::-1]
+        evidence_ids = [bank.chunks[i].chunk_id for i in top_indices]
 
-        texts = [c.get("memory_text", "") if isinstance(c, dict) else str(c) for c in chunks]
-
-        # BGE 检索 top-24
-        try:
-            import numpy as np
-            from sklearn.metrics.pairwise import cosine_similarity
-
-            query_emb = embedder.encode([s.question])[0:1]
-            texts_embs = embedder.encode(texts)
-
-            # Check for NaN values
-            if np.isnan(query_emb).any() or np.isnan(texts_embs).any():
-                log.warning("NaN detected in embeddings, using fallback ranking")
-                top_indices = list(range(min(24, len(texts))))
-            else:
-                similarities = cosine_similarity(query_emb, texts_embs)[0]
-                top_indices = np.argsort(similarities)[::-1][:24].tolist()
-        except Exception as e:
-            log.error("search error: %s", e)
-            top_indices = list(range(min(24, len(texts))))
-
-        evidence_text = "\n".join([
-            f"{j+1}. {texts[i][:100]}"
-            for j, i in enumerate(top_indices)
-        ])
-
-        # LLM 判断
-        prompt = f"""Question: {s.question}
-
-Options:
-{chr(10).join([f"{chr(65+i)}. {c}" for i, c in enumerate(s.candidates)])}
-
-Evidence (top-24 relevant chunks):
-{evidence_text}
-
-Based on the evidence above, which option is correct? Answer with just the letter (A/B/C/D)."""
-
-        try:
-            messages = [{"role": "user", "content": prompt}]
-            response = llm.chat(messages, max_new_tokens=10, enable_thinking=False)
-            pred = response.strip()[:1].upper() if response else ""
-        except Exception as e:
-            log.error("LLM error: %s", e)
-            pred = ""
+        # Answer - use memory_texts with time and ASR (same as VEIL main)
+        texts_ev = bank.memory_texts(with_time=True, with_asr=True)
+        idx_map = {c.chunk_id: i for i, c in enumerate(bank.chunks)}
+        final_texts = [texts_ev[idx_map[cid]] for cid in evidence_ids]
+        answer_result = answerer.answer(
+            question=s.question,
+            candidates=s.candidates,
+            evidence_texts=final_texts,
+        )
 
         return {
-            "pred": pred,
-            "chunk_ids": top_indices,
+            "answer": answer_result.get("answer", ""),
+            "raw": answer_result.get("raw", ""),
+            "evidence_chunk_ids": evidence_ids,
         }, None
 
-    total = len(samples)
+    out_fh      = out_path.open("a")
+    _write_lock = threading.Lock()
+    _stats_lock = threading.Lock()
+
+    def append_record(rec: dict):
+        with _write_lock:
+            out_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            out_fh.flush()
+
+    total      = len(samples)
     done_count = [len(done_keys)]
-    results = {}
+    correct_by: dict = {}
 
-    def process_item(s):
+    def process_item(s) -> None:
         key = f"{bench}|{s.video_id}|{s.sample_idx}|{PIPELINE_NAME}"
-
-        if key in done_keys:
-            return
 
         t0 = time.time()
         try:
             result, err = run_sample(s)
         except Exception as e:
-            log.error("[%s] %s", s.video_id, e)
+            log.error("[%s/%s] ERROR: %s", s.video_id, s.question_type, e, exc_info=True)
             result, err = None, str(e)
         elapsed = time.time() - t0
 
         if result is None:
-            pred, pred_text, correct = "", "", False
+            pred_letter, pred_text, correct = "", "", False
         else:
-            pred = result["pred"]
-            idx = ord(pred) - ord("A") if pred else -1
+            raw_ans = result.get("answer", "")
+            pred_letter = raw_ans[:1].upper() if raw_ans else \
+                          (parse_letter(result.get("raw", ""), len(s.candidates)) or "")
+            idx = ord(pred_letter) - ord("A") if pred_letter else -1
             pred_text = s.candidates[idx] if 0 <= idx < len(s.candidates) else ""
             correct = (pred_text == s.answer)
 
         rec = {
-            "key": key,
-            "benchmark": bench,
-            "question_type": s.question_type,
-            "video_id": s.video_id,
-            "sample_idx": s.sample_idx,
-            "pipeline": PIPELINE_NAME,
-            "question": s.question,
-            "candidates": s.candidates,
-            "gold_answer": s.answer,
-            "pred_letter": pred,
-            "pred_text": pred_text,
-            "correct": correct,
-            "evidence_chunk_ids": result.get("chunk_ids", []) if result else [],
-            "elapsed": round(elapsed, 2),
-            "error": err,
+            "key":              key,
+            "benchmark":        bench,
+            "question_type":    s.question_type,
+            "video_id":         s.video_id,
+            "sample_idx":       s.sample_idx,
+            "pipeline":         PIPELINE_NAME,
+            "question":         s.question,
+            "candidates":       s.candidates,
+            "gold_answer":      s.answer,
+            "pred_letter":      pred_letter,
+            "pred_text":        pred_text,
+            "correct":          correct,
+            "evidence_chunk_ids": (result or {}).get("evidence_chunk_ids", []),
+            "elapsed":          round(elapsed, 2),
+            "error":            err,
         }
+        append_record(rec)
 
-        out_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        out_fh.flush()
+        with _stats_lock:
+            done_count[0] += 1
+            correct_by.setdefault(s.question_type, []).append(int(correct))
+            n_done = done_count[0]
 
-        done_count[0] += 1
-        results.setdefault(s.question_type, []).append(int(correct))
+        log.info("[%d/%d] %-12s | %-16s | %s %s %.1fs",
+                 n_done, total, s.question_type, s.video_id,
+                 pred_letter, "✓" if correct else "✗", elapsed)
 
-        if done_count[0] % 10 == 0:
-            log.info("[%d/%d] %s %s %.1fs", done_count[0], total, pred, "✓" if correct else "✗", elapsed)
+    tasks = [s for s in samples
+             if f"{bench}|{s.video_id}|{s.sample_idx}|{PIPELINE_NAME}" not in done_keys]
+    log.info("tasks to run: %d  (workers=%d)", len(tasks), args.workers)
 
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        list(as_completed([ex.submit(process_item, s) for s in samples]))
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = [executor.submit(process_item, s) for s in tasks]
+        for fut in as_completed(futures):
+            exc = fut.exception()
+            if exc:
+                log.error("worker exception: %s", exc)
 
     out_fh.close()
 
-    # 准确率
-    print(f"\n=== {PIPELINE_NAME} ===")
-    for qt in sorted(results):
-        c = results[qt]
-        acc = sum(c) / len(c) * 100 if c else 0
-        print(f"{qt:20} {acc:6.1f}%")
-    all_c = sum(sum(v) for v in results.values())
-    all_n = sum(sum(1 for _ in v) for v in results.values())
-    print(f"{'Overall':20} {all_c/all_n*100:6.1f}%")
+    print("\n=== Accuracy ===")
+    qtypes = sorted(correct_by)
+    print(f"{'Pipeline':<20}" + "".join(f"{qt[:8]:>10}" for qt in qtypes) + f"{'Overall':>10}")
+    row = f"{PIPELINE_NAME:<20}"
+    all_c = []
+    for qt in qtypes:
+        c = correct_by.get(qt, [])
+        acc = sum(c) / len(c) if c else float("nan")
+        row += f"{acc*100:>9.1f}%"
+        all_c.extend(c)
+    ov = sum(all_c) / len(all_c) if all_c else float("nan")
+    row += f"{ov*100:>9.1f}%"
+    print(row)
+    log.info("done — results in %s", out_path)
 
 
 if __name__ == "__main__":

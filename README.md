@@ -82,7 +82,7 @@ src/
       sample_frames.py
       dynamic_grouper.py
       consolidate.py
-  models/
+  clients/
     llm_client.py
     vlm_client.py
     embedder.py                      # BGE-M3
@@ -94,7 +94,7 @@ src/
     rerank_rag.py                    # BGE pool + rerank top-k → answerer (rerank_rag8, llm_rerank8)
     veil.py                          # iterative retrieval loop (veil_*)
     _keyframes.py
-  reasoning/
+  agents/
     planner.py                       # iter-0 decomposition + iter≥1 unified planner
     verifier.py
     answerer.py

@@ -1,7 +1,7 @@
 """VEIL — iterative evidence retrieval main loop.
 
 Planner (iter-0 decomposition + iter≥1 unified planner + query safety nets) lives in
-``reasoning/planner.py``. Verifier lives in ``reasoning/verifier.py``. This file owns
+``agents/planner.py``. Verifier lives in ``agents/verifier.py``. This file owns
 only the main loop, retrieval primitives, evidence dedup, oracle override, and the
 rubric-based final evidence rerank.
 
@@ -21,10 +21,10 @@ from typing import List, Optional, Set
 
 import numpy as np
 
-from ._keyframes import keyframe_path, load_keyframe_pil
-from src.memory.core.schema import MemoryBank
-from src.reasoning.planner import Planner
-from src.reasoning.verifier import Verifier, get_rubric_dict
+from ._keyframes import keyframe_path, keyframe_paths, load_keyframe_pil
+from src.build_memory.core.schema import MemoryBank
+from src.agents.planner import Planner
+from src.agents.verifier import Verifier, get_rubric_dict
 
 
 # ── Broadcast (uniform timeline sampling) ────────────────────────────────────
@@ -33,9 +33,13 @@ def _broadcast_retrieve(
     bank: MemoryBank,
     seen_ids: Set[int],
     n: int = 8,
+    evidence_with_attr: bool = False,
+    dialogue_first: bool = False,
 ) -> tuple[list, list, list]:
     """Uniformly sample n unseen chunks across the video timeline."""
-    texts_ev  = bank.memory_texts(with_time=True, with_asr=True)
+    texts_ev  = bank.memory_texts(with_time=True, with_asr=True,
+                                  with_layers=evidence_with_attr,
+                                  dialogue_first=dialogue_first)
     idx_map   = {c.chunk_id: i for i, c in enumerate(bank.chunks)}
     unseen    = [c for c in bank.chunks if c.chunk_id not in seen_ids]
     if not unseen:
@@ -49,7 +53,7 @@ def _broadcast_retrieve(
         if i is not None:
             texts.append(texts_ev[i])
             ids.append(c.chunk_id)
-            vecs.append(c.v_semantic or [])
+            vecs.append(c.v_dynamic or [])
     return texts, ids, vecs
 
 
@@ -117,7 +121,7 @@ def _rerank_by_rubric(
     if len(evidence_texts) <= 1:
         return list(range(len(evidence_texts)))
 
-    from src.reasoning.verifier import _format_rubric_as_text
+    from src.agents.verifier import _format_rubric_as_text
     opts    = "\n".join(f"({chr(65+i)}) {c}" for i, c in enumerate(candidates))
     ev_fmt  = "\n".join(f"[E{i+1}] {t[:300]}" for i, t in enumerate(evidence_texts))
     rubric_text = _format_rubric_as_text(rubric)
@@ -158,7 +162,7 @@ def _dedup_by_similarity(
     existing_vecs: List[List[float]],
     threshold: float = 0.85,
 ) -> tuple[List[str], List[int], List[List[float]]]:
-    """Drop new chunks whose v_semantic cosine sim ≥ threshold against any already-accumulated chunk."""
+    """Drop new chunks whose v_dynamic cosine sim ≥ threshold against any already-accumulated chunk."""
     if not new_vecs or all(not v for v in new_vecs):
         return new_texts, new_ids, new_vecs
     kept_t, kept_i, kept_v = [], [], []
@@ -177,41 +181,6 @@ def _dedup_by_similarity(
     return kept_t, kept_i, kept_v
 
 
-# ── Query type classification ──────────────────────────────────────────────
-
-def _classify_query_type(query: str) -> str:
-    """Classify query as 'dynamic' (events/actions), 'static' (attributes), or 'mixed'."""
-    query_lower = query.lower()
-    # Dynamic keywords (prioritize longer, more specific phrases first)
-    dynamic_keywords = [
-        "what happened", "what occur", "when did", "in what order", "what was the sequence",
-        "how did", "process", "step", "play", "score a goal", "scored",
-        "first", "then", "finally", "start", "end", "begin",
-        "movement", "move", "strike", "kick", "throw", "hit", "catch",
-        "action", "event", "change from", "changed to", "goes from",
-    ]
-    # Static keywords (prioritize longer, more specific phrases first)
-    static_keywords = [
-        "what color", "which color", "color of", "what is the color",
-        "how many", "how much", "count", "number of", "how many people",
-        "what text", "written text", "text on", "text displayed",
-        "ocr", "written", "says", "display", "displayed",
-        "appearance", "clothing", "clothes", "wear", "jersey",
-        "shirt", "name on", "look like", "describe the", "object", "objects",
-    ]
-
-    # Count keyword matches (longer keywords take priority)
-    dynamic_count = sum(1 for kw in dynamic_keywords if kw in query_lower)
-    static_count = sum(1 for kw in static_keywords if kw in query_lower)
-
-    if dynamic_count > static_count:
-        return "dynamic"
-    elif static_count > dynamic_count:
-        return "static"
-    else:
-        return "mixed"
-
-
 # ── Query-driven retrieval (per sub-question) ────────────────────────────────
 
 def _query_retrieve(
@@ -225,37 +194,45 @@ def _query_retrieve(
     siglip=None,
     text_alpha: float = 0.6,
     vis_query: str = "",
+    evidence_with_attr: bool = False,
+    retrieval_static_alpha: float = 1.0,
+    dialogue_first: bool = False,
+    asr_alpha: float = 0.0,
 ) -> tuple[List[str], List[int], List[List[float]]]:
-    """Return (evidence_texts, chunk_ids, v_semantic_vecs), skipping already-seen chunks.
+    """Return (evidence_texts, chunk_ids, v_dynamic_vecs), skipping already-seen chunks.
 
-    Uses two-layer retrieval: fuses v_semantic (narrative) and v_static (attributes)
-    with weights based on query type classification. Evidence includes both layers.
+    evidence_with_attr=True  → append static_index_text to each chunk's evidence string
+    retrieval_static_alpha<1 → blend v_static into the BGE scoring channel
+                               final_bge = α·(q·v_dynamic) + (1-α)·(q·v_static)
+    dialogue_first=True      → put ASR up front with [DIALOGUE] tag in evidence text
+    asr_alpha>0              → blend an ASR-only BGE channel into scoring
+                               final = (1-asr_alpha)·q·v_dynamic + asr_alpha·q·v_asr
+                               (v_asr is computed once per bank and cached)
     """
     texts    = bank.memory_texts()
-    texts_ev = bank.memory_texts(with_time=True, with_asr=True, with_layers=True)
+    texts_ev = bank.memory_texts(with_time=True, with_asr=True,
+                                 with_layers=evidence_with_attr,
+                                 dialogue_first=dialogue_first)
     q_vec  = embedder.encode([query])[0]
-
-    # Fuse v_semantic and v_static based on query type
-    if bank.chunks[0].v_semantic:
-        doc_vecs = np.array([c.v_semantic for c in bank.chunks], dtype=np.float32)
-        scores = doc_vecs @ q_vec
-
-        # Check if v_static vectors are available (two-layer banks)
-        if bank.chunks[0].v_static:
-            q_type = _classify_query_type(query)
-            weight_map = {
-                "dynamic": (0.8, 0.2),   # 80% narrative, 20% attributes
-                "static": (0.2, 0.8),   # 20% narrative, 80% attributes
-                "mixed": (0.5, 0.5),    # 50/50 split
-            }
-            w_dyn, w_sta = weight_map.get(q_type, (0.5, 0.5))
-
-            stat_vecs = np.array([c.v_static for c in bank.chunks], dtype=np.float32)
-            stat_scores = stat_vecs @ q_vec
-            scores = w_dyn * scores + w_sta * stat_scores
+    if bank.chunks[0].v_dynamic:
+        doc_vecs = np.array([c.v_dynamic for c in bank.chunks], dtype=np.float32)
     else:
         doc_vecs = embedder.encode(texts)
-        scores = doc_vecs @ q_vec
+    scores = doc_vecs @ q_vec
+
+    if retrieval_static_alpha < 1.0 and bank.chunks[0].v_static:
+        static_vecs   = np.array([c.v_static for c in bank.chunks], dtype=np.float32)
+        static_scores = static_vecs @ q_vec
+        scores = retrieval_static_alpha * scores + (1 - retrieval_static_alpha) * static_scores
+
+    if asr_alpha > 0.0:
+        asr_vecs = getattr(bank, "_asr_vecs_cache", None)
+        if asr_vecs is None:
+            asr_texts = [(c.asr or "").strip() or "(no speech)" for c in bank.chunks]
+            asr_vecs  = embedder.encode(asr_texts).astype(np.float32, copy=False)
+            bank._asr_vecs_cache = asr_vecs
+        asr_scores = asr_vecs @ q_vec
+        scores = (1 - asr_alpha) * scores + asr_alpha * asr_scores
 
     if siglip is not None and vis_query and bank.chunks[0].v_visual:
         vq_vec     = siglip.encode_text([vis_query])[0]
@@ -277,7 +254,7 @@ def _query_retrieve(
     return (
         [texts_ev[i] for i in new_idx],
         [bank.chunks[i].chunk_id for i in new_idx],
-        [bank.chunks[i].v_semantic for i in new_idx],
+        [bank.chunks[i].v_dynamic for i in new_idx],
     )
 
 
@@ -299,9 +276,9 @@ def run_veil(
     siglip                       = None,
     text_alpha:    float         = 0.6,
     keyframe_dir                 = None,
-    kf_dedup_threshold:    float = 0.92,
-    evidence_dedup_threshold:    float = 0.85,
-    query_evidence_dedup_threshold: float | None = 0.70,
+    kf_dedup_threshold:    float = 0.9,
+    evidence_dedup_threshold:    float = 0.9,
+    query_evidence_dedup_threshold: float | None = 0.9,
     answer_evidence_cap:   int | None   = None,
     answer_keyframe_cap:   int | None   = 16,
     verifier_evidence_cap: int | None   = None,
@@ -318,6 +295,13 @@ def run_veil(
     use_oracle:            bool         = False,
     gold_answer:           str          = "",
     oracle_no_second_rerank: bool       = False,
+    evidence_with_attr:    bool         = False,
+    retrieval_static_alpha: float       = 1.0,
+    per_chunk_keyframe_cap: int         = 1,
+    pass_verifier_judgment_to_answerer: bool = False,
+    loose_verifier:        bool         = False,
+    dialogue_first:        bool         = False,
+    asr_alpha:             float        = 0.0,
 ) -> dict:
     """Iter-0 sub-question decomposition + iter ≥1 unified-planner repair.
 
@@ -392,7 +376,11 @@ def run_veil(
         new_texts, new_ids, new_vecs = [], [], []
 
         if do_broadcast:
-            new_texts, new_ids, new_vecs = _broadcast_retrieve(bank, seen_ids, n=final_top_k)
+            new_texts, new_ids, new_vecs = _broadcast_retrieve(
+                bank, seen_ids, n=final_top_k,
+                evidence_with_attr=evidence_with_attr,
+                dialogue_first=dialogue_first,
+            )
             iter_query = "[broadcast]"
         else:
             for q in queries_this_iter:
@@ -401,6 +389,10 @@ def run_veil(
                     q, bank, embedder, reranker,
                     coarse_top_k, final_top_k, seen_ids,
                     siglip=siglip, text_alpha=text_alpha, vis_query=vq,
+                    evidence_with_attr=evidence_with_attr,
+                    retrieval_static_alpha=retrieval_static_alpha,
+                    dialogue_first=dialogue_first,
+                    asr_alpha=asr_alpha,
                 )
                 new_texts.extend(t); new_ids.extend(i); new_vecs.extend(v)
                 seen_ids.update(i)
@@ -415,21 +407,30 @@ def run_veil(
         all_ev_vecs.extend(new_vecs)
 
         # ── Keyframes (visual de-dup against all accumulated) ────────────────
+        # Cross-chunk dedup decision based on chunk-level v_visual (one vector
+        # per chunk). If chunk is accepted, append up to per_chunk_keyframe_cap
+        # frames from its already-deduped within-chunk frame set.
         if keyframe_dir is not None:
             for cid in new_ids:
                 c = chunk_by_id.get(cid)
                 if c is None:
                     continue
-                img = load_keyframe_pil(keyframe_path(keyframe_dir, bank.video_id, c.chunk_id))
-                if img is None:
-                    continue
                 if c.v_visual and all_kf_vecs:
                     v = np.array(c.v_visual, dtype=np.float32)
                     if float(np.max(np.array(all_kf_vecs, dtype=np.float32) @ v)) >= kf_dedup_threshold:
                         continue
-                all_keyframes.append(img)
-                all_kf_vecs.append(c.v_visual if c.v_visual else [])
-                all_kf_chunk_ids.append(cid)
+                paths = keyframe_paths(keyframe_dir, bank.video_id, c.chunk_id,
+                                       cap=per_chunk_keyframe_cap)
+                added = False
+                for p in paths:
+                    img = load_keyframe_pil(p)
+                    if img is None:
+                        continue
+                    all_keyframes.append(img)
+                    all_kf_chunk_ids.append(cid)
+                    added = True
+                if added:
+                    all_kf_vecs.append(c.v_visual if c.v_visual else [])
 
         # ── Verifier ──────────────────────────────────────────────────────────
         if verifier_evidence_cap is not None and len(all_evidence_texts) > verifier_evidence_cap:
@@ -448,7 +449,8 @@ def run_veil(
                                   rubric_judgment=rubric_judgment,
                                   explicit_attribution=explicit_attribution,
                                   verifier_attr=verifier_attr,
-                                  verifier_opstatus=verifier_opstatus)
+                                  verifier_opstatus=verifier_opstatus,
+                                  loose=loose_verifier)
 
         # ── Oracle check (post-verifier) ──────────────────────────────────────
         # Oracle uses the same evidence/keyframe caps as the final answerer.
@@ -528,6 +530,9 @@ def run_veil(
             "oracle_pred":               oracle_pred or None,
             "plan_strategy":             current_plan.get("strategy"),
             "plan_reasoning":            current_plan.get("reasoning"),
+            "n_keyframes_accumulated":   len(all_keyframes),
+            "n_keyframes_to_verifier":   len(kf_for_verifier),
+            "n_evidence_to_verifier":    len(ev_for_verifier),
         })
 
         if last_verdict["label"] in ("sufficient", "FULLY_SUFFICIENT", "ANSWER_SUFFICIENT"):
@@ -555,8 +560,18 @@ def run_veil(
         if answer_keyframe_cap is not None and len(kf_for_answer) > answer_keyframe_cap:
             kf_for_answer = kf_for_answer[:answer_keyframe_cap]
 
+        verifier_hint_oj = None
+        verifier_hint_scores = None
+        if pass_verifier_judgment_to_answerer and last_verdict:
+            verifier_hint_oj = last_verdict.get("option_judgment")
+            verifier_hint_scores = last_verdict.get("option_rubric_scores")
+
         result = answerer.answer(question, candidates, ev_texts,
-                                 keyframe_images=kf_for_answer)
+                                 keyframe_images=kf_for_answer,
+                                 verifier_option_judgment=verifier_hint_oj,
+                                 verifier_option_scores=verifier_hint_scores)
+        result["n_keyframes_to_answer"] = len(kf_for_answer)
+        result["n_evidence_to_answer"]  = len(ev_texts)
     result["evidence_chunk_ids"] = ev_ids
     result["evidence_texts"]     = ev_texts
     result["trace_iters"]        = iterations

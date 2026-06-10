@@ -1,14 +1,16 @@
-"""VEIL-27B Oracle — upper bound: gold answer provided to planner at each iteration.
+"""LLM-Iter — 3-round iterative retrieval with LLM self-reasoning for sufficiency judgment.
 
-Answerer / Planner / Verifier all use Qwen3.5-27B via --vlm-api-url / --llm-api-url.
+Each round: single query → BGE top-8 → LLM reasons & judges sufficiency → accumulate evidence.
+No sub-query decomposition, no rubric, pure LLM reasoning ability.
 
 Usage:
     cd /home2/ycj/Project/VEIL
-    PYTHONPATH=. python experiments/veil_27b_oracle.py \\
-        --config configs/mlvu_memory_bank.yaml \\
-        --vlm-api-url http://localhost:8000 \\
-        --llm-api-url http://localhost:8001 \\
-        --bge-gpu cuda:3
+    PYTHONPATH=. python experiments/llm_iter.py \
+        --config configs/videomme_memory_bank.yaml \
+        --llm-api-url http://localhost:8002 \
+        --vlm-api-url http://localhost:8002 \
+        --bge-gpu cuda:3 \
+        --workers 2
 """
 from __future__ import annotations
 
@@ -24,9 +26,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import load_config
 from src.utils.logging import get_logger
-from experiments.core.veil import run_veil
+from src.clients.vlm_client import VLMClient
+from src.clients.embedder import BGEM3Embedder
+from src.clients.llm_client import LLMClient
+from src.clients.siglip_embedder import SigLIPEmbedder
+from src.agents.answerer import Answerer
+from src.build_memory.core.schema import MemoryBank
+from src.eval.parse_answer import parse_letter
 
-PIPELINE_NAME = "veil_27b_oracle"
+PIPELINE_NAME = "llm_iter"
 
 log = get_logger(PIPELINE_NAME)
 
@@ -72,8 +80,6 @@ def main():
     ap.add_argument("--llm-gpu",        default="cuda:1")
     ap.add_argument("--siglip-gpu",     default=None,
                     help="GPU for SigLIP visual scoring; defaults to --bge-gpu")
-    ap.add_argument("--embed-api-url",  default=None,
-                    help="Embedding service URL (BGE+SigLIP); skips loading locally")
     ap.add_argument("--no-siglip",      action="store_true",
                     help="Disable SigLIP dual-path fusion")
     ap.add_argument("--no-keyframes",   action="store_true",
@@ -82,51 +88,34 @@ def main():
                     help="Weight of semantic (BGE) path in dual-path fusion")
     ap.add_argument("--vlm-model",      default=None)
     ap.add_argument("--vlm-api-url",    default=None,
-                    help="vLLM API base URL(s); comma-separated = round-robin")
+                    help="vLLM API base URL")
     ap.add_argument("--vlm-api-model",  default=None)
     ap.add_argument("--llm-model",      default=None)
     ap.add_argument("--use-vllm",       action="store_true",
                     help="Use vLLM backend for local LLM")
     ap.add_argument("--llm-api-url",    default=None,
-                    help="OpenAI-compatible API base URL(s); comma-separated = round-robin")
+                    help="OpenAI-compatible API base URL")
     ap.add_argument("--llm-api-model",  default=None,
                     help="Served model id for --llm-api-url (default: Qwen3.5-27B)")
-    ap.add_argument("--answer-evidence-k",   type=int, default=None,
-                    help="Cap evidence blocks passed to the final answerer")
-    ap.add_argument("--verifier-evidence-k", type=int, default=None,
-                    help="Cap evidence blocks passed to verifier")
     ap.add_argument("--answer-keyframe-k",   type=int, default=16,
                     help="Cap keyframe images passed to the final answerer")
     ap.add_argument("--max-frames",          type=int, default=None,
                     help="Override frame_sampling.max_frames from config")
     ap.add_argument("--workers",             type=int, default=1,
                     help="Parallel workers (safe with API-mode LLM)")
-    ap.add_argument("--pipeline-name",       default=None,
-                    help="Override PIPELINE_NAME (= output jsonl filename stem)")
-    ap.add_argument("--use-attr-evidence",   action="store_true",
-                    help="Append static_index_text to each chunk's evidence string")
-    ap.add_argument("--per-chunk-keyframe-cap", type=int, default=1,
-                    help="Max keyframes per chunk fed to VLM (1=baseline)")
     args = ap.parse_args()
-    global PIPELINE_NAME
-    if args.pipeline_name:
-        PIPELINE_NAME = args.pipeline_name
 
     cfg      = load_config(args.config)
     bench    = cfg["benchmark"]["name"]
     out_root = Path(cfg.get("paths", {}).get("outputs_root", "outputs"))
 
-    _vl = cfg.get("veil_loop", {})
-    veil_max_iter = int(_vl.get("max_iter", 3))
-
     memory_dir = Path(args.memory_dir) if args.memory_dir else \
-                 out_root / "memory" / f"{bench}_L_27B"
+                 out_root / "memory" / f"{bench}_L_27b_27b"
     default_out_dir = Path(cfg.get("eval", {}).get("output_dir") or (out_root / "results" / bench))
     out_path = Path(args.out) if args.out else \
-               default_out_dir / "veil_27b_oracle.jsonl"
+               default_out_dir / "llm_iter.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Filter video ids
     filter_vids: set | None = None
     if args.filter_from:
         filter_vids = set()
@@ -143,7 +132,6 @@ def main():
     log.info("loaded %d samples (%d videos)", len(samples),
              len({s.video_id for s in samples}))
 
-    # Resume
     done_keys: set[str] = set()
     if out_path.exists():
         for line in out_path.open():
@@ -151,14 +139,10 @@ def main():
             except: pass
     log.info("already done: %d records", len(done_keys))
 
-    # ── Model loading ──────────────────────────────────────────────────────────
     needs_siglip  = not args.no_siglip
     siglip_device = (args.siglip_gpu if args.siglip_gpu is not None else args.bge_gpu) if needs_siglip else None
 
     vlm = embedder = llm = answerer = siglip = None
-
-    from src.clients.vlm_client import VLMClient
-    from src.agents.answerer import Answerer
 
     vlm_model = args.vlm_model or cfg["models"]["vlm"]["model_path"]
     if args.vlm_api_url:
@@ -171,21 +155,15 @@ def main():
     answerer = Answerer(vlm)
     log.info("  VLM ready")
 
-    from src.clients.embedder import BGEM3Embedder
-    if args.embed_api_url:
-        log.info("loading BGE-M3 via API %s ...", args.embed_api_url)
-        embedder = BGEM3Embedder(api_url=args.embed_api_url)
-    else:
-        log.info("loading BGE-M3 on %s ...", args.bge_gpu)
-        t0 = time.time()
-        embedder = BGEM3Embedder(
-            model_path=cfg["models"]["embedder"]["model_path"],
-            use_fp16=cfg["models"]["embedder"].get("use_fp16", True),
-            device=args.bge_gpu,
-        )
-        log.info("  BGE-M3 ready (%.1fs)", time.time() - t0)
+    log.info("loading BGE-M3 on %s ...", args.bge_gpu)
+    t0 = time.time()
+    embedder = BGEM3Embedder(
+        model_path=cfg["models"]["embedder"]["model_path"],
+        use_fp16=cfg["models"]["embedder"].get("use_fp16", True),
+        device=args.bge_gpu,
+    )
+    log.info("  BGE-M3 ready (%.1fs)", time.time() - t0)
 
-    from src.clients.llm_client import LLMClient
     if args.llm_api_url:
         api_model = args.llm_api_model or "Qwen3.5-27B"
         log.info("loading LLM via API %s ...", args.llm_api_url)
@@ -205,19 +183,14 @@ def main():
         )
         log.info("  LLM ready (%.1fs)", time.time() - t0)
 
-    if needs_siglip:
+    if needs_siglip and siglip_device:
         from src.clients.siglip_embedder import SigLIPEmbedder
-        if args.embed_api_url:
-            log.info("loading SigLIP via API %s ...", args.embed_api_url)
-            siglip = SigLIPEmbedder(api_url=args.embed_api_url)
-        elif siglip_device:
-            siglip_model = "/home2/ycj/Models/google/siglip-large-patch16-384"
-            log.info("loading SigLIP on %s ...", siglip_device)
-            t0 = time.time()
-            siglip = SigLIPEmbedder(model_path=siglip_model, device=siglip_device)
-            log.info("  SigLIP ready (%.1fs)", time.time() - t0)
+        siglip_model = "/home2/ycj/Models/google/siglip-large-patch16-384"
+        log.info("loading SigLIP on %s ...", siglip_device)
+        t0 = time.time()
+        siglip = SigLIPEmbedder(model_path=siglip_model, device=siglip_device)
+        log.info("  SigLIP ready (%.1fs)", time.time() - t0)
 
-    # ── Thread safety (GPU models are not thread-safe) ────────────────────────
     _gpu_lock = threading.Lock()
 
     class _LockedModel:
@@ -235,7 +208,6 @@ def main():
     if embedder: embedder = _LockedModel(embedder)
     if siglip:   siglip   = _LockedModel(siglip)
 
-    # ── Bank cache ────────────────────────────────────────────────────────────
     _bank_cache:  dict = {}
     _cache_lock = threading.Lock()
 
@@ -252,37 +224,63 @@ def main():
             _bank_cache[video_id] = bank
         return bank
 
-    from src.eval.parse_answer import parse_letter
-
-    aek    = args.answer_evidence_k
-    vek    = args.verifier_evidence_k
-    akk    = None if args.answer_keyframe_k is not None and args.answer_keyframe_k < 0 else args.answer_keyframe_k
+    akk = args.answer_keyframe_k
     kf_dir = None if args.no_keyframes else memory_dir
 
     def run_sample(s):
+        import numpy as np
         bank = get_bank(s.video_id)
         if bank is None:
             return None, "bank_missing"
-        kw = dict(
-            reranker=None, coarse_top_k=8, final_top_k=8,
-            max_iter=veil_max_iter,
-            query_history_dedup_threshold=0.9,
-            evidence_dedup_threshold=0.90,
-            query_evidence_dedup_threshold=0.70,
-            siglip=siglip, text_alpha=args.text_alpha, keyframe_dir=kf_dir,
-            answer_evidence_cap=aek,
-            answer_keyframe_cap=akk,
-            verifier_evidence_cap=vek,
-            rubric_rerank=True,
-            use_oracle=True,
-            gold_answer=s.answer,
-            evidence_with_attr=args.use_attr_evidence,
-            per_chunk_keyframe_cap=args.per_chunk_keyframe_cap,
-        )
-        return run_veil(s.question, s.candidates, bank, embedder, answerer, llm,
-                        task_type=s.question_type, **kw), None
 
-    # ── Run loop ──────────────────────────────────────────────────────────────
+        all_evidence_ids = set()
+
+        for round_idx in range(3):
+            query = s.question
+
+            query_emb = embedder.encode([query])[0]
+            doc_vecs = np.array([c.v_dynamic for c in bank.chunks], dtype=np.float32)
+            scores = doc_vecs @ query_emb
+            top_indices = scores.argsort()[-8:][::-1]
+            retrieved_ids = [bank.chunks[i].chunk_id for i in top_indices]
+            all_evidence_ids.update(retrieved_ids)
+
+            # Use with_time and with_asr like main VEIL
+            texts_ev = bank.memory_texts(with_time=True, with_asr=True)
+            idx_map = {c.chunk_id: i for i, c in enumerate(bank.chunks)}
+            evidence_texts = [texts_ev[idx_map[cid]] for cid in retrieved_ids]
+            evidence_text = "\n".join(evidence_texts)
+
+            sufficiency_prompt = f"""You are assessing whether the given evidence is sufficient to answer the question.
+
+Question: {s.question}
+
+Evidence:
+{evidence_text}
+
+Is the evidence sufficient to answer this question? Answer with YES or NO only."""
+
+            response = llm.chat([{"role": "user", "content": sufficiency_prompt}], max_new_tokens=10)
+            is_sufficient = "YES" in response.upper()
+
+            if is_sufficient:
+                break
+
+        texts_ev = bank.memory_texts(with_time=True, with_asr=True)
+        idx_map = {c.chunk_id: i for i, c in enumerate(bank.chunks)}
+        final_texts = [texts_ev[idx_map[cid]] for cid in sorted(all_evidence_ids)]
+        answer_result = answerer.answer(
+            question=s.question,
+            candidates=s.candidates,
+            evidence_texts=final_texts,
+        )
+
+        return {
+            "answer": answer_result.get("answer", ""),
+            "raw": answer_result.get("raw", ""),
+            "evidence_chunk_ids": sorted(list(all_evidence_ids)),
+        }, None
+
     out_fh      = out_path.open("a")
     _write_lock = threading.Lock()
     _stats_lock = threading.Lock()
@@ -317,7 +315,6 @@ def main():
             pred_text = s.candidates[idx] if 0 <= idx < len(s.candidates) else ""
             correct = (pred_text == s.answer)
 
-        trace = result.get("trace_iters") if result else None
         rec = {
             "key":              key,
             "benchmark":        bench,
@@ -332,7 +329,6 @@ def main():
             "pred_text":        pred_text,
             "correct":          correct,
             "evidence_chunk_ids": (result or {}).get("evidence_chunk_ids", []),
-            "trace_iters":      trace,
             "elapsed":          round(elapsed, 2),
             "error":            err,
         }
@@ -343,10 +339,9 @@ def main():
             correct_by.setdefault(s.question_type, []).append(int(correct))
             n_done = done_count[0]
 
-        n_iter = len(trace) if trace else 0
-        log.info("[%d/%d] %-12s | %-16s | %s %s (iter=%d) %.1fs",
+        log.info("[%d/%d] %-12s | %-16s | %s %s %.1fs",
                  n_done, total, s.question_type, s.video_id,
-                 pred_letter, "✓" if correct else "✗", n_iter, elapsed)
+                 pred_letter, "✓" if correct else "✗", elapsed)
 
     tasks = [s for s in samples
              if f"{bench}|{s.video_id}|{s.sample_idx}|{PIPELINE_NAME}" not in done_keys]
@@ -361,7 +356,6 @@ def main():
 
     out_fh.close()
 
-    # ── Report ────────────────────────────────────────────────────────────────
     print("\n=== Accuracy ===")
     qtypes = sorted(correct_by)
     print(f"{'Pipeline':<20}" + "".join(f"{qt[:8]:>10}" for qt in qtypes) + f"{'Overall':>10}")

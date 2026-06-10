@@ -19,7 +19,17 @@ def load_keyframe_pil(path: str):
 
 
 def keyframe_path(keyframe_dir, video_id: str, chunk_id: int) -> str:
-    return str(Path(keyframe_dir) / video_id / "keyframes" / f"{chunk_id:04d}.jpg")
+    """Pick the lowest-index surviving frame for a chunk (post-dedup _0 may be gone)."""
+    frames_dir = Path(keyframe_dir) / video_id / "frames"
+    matches = sorted(frames_dir.glob(f"{chunk_id:04d}_*.jpg"))
+    return str(matches[0]) if matches else ""
+
+
+def keyframe_paths(keyframe_dir, video_id: str, chunk_id: int, cap: int = 3) -> List[str]:
+    """All surviving frames for a chunk, sorted by index, capped to ``cap``."""
+    frames_dir = Path(keyframe_dir) / video_id / "frames"
+    matches = sorted(frames_dir.glob(f"{chunk_id:04d}_*.jpg"))
+    return [str(p) for p in matches[:cap]]
 
 
 def visual_dedup(chunks_with_imgs: List[Tuple], threshold: float = 0.92) -> List:

@@ -112,7 +112,6 @@ def main():
 
     _vl = cfg.get("veil_loop", {})
     veil_max_iter = int(_vl.get("max_iter", 3))
-    veil_dedup    = float(_vl.get("dedup_threshold", 0.85))
 
     memory_dir = Path(args.memory_dir) if args.memory_dir else \
                  out_root / "memory" / f"{bench}_L_27b_27b"
@@ -149,8 +148,8 @@ def main():
 
     vlm = embedder = llm = answerer = siglip = None
 
-    from src.models.vlm_client import VLMClient
-    from src.reasoning.answerer import Answerer
+    from src.clients.vlm_client import VLMClient
+    from src.agents.answerer import Answerer
 
     vlm_model = args.vlm_model or cfg["models"]["vlm"]["model_path"]
     if args.vlm_api_url:
@@ -163,7 +162,7 @@ def main():
     answerer = Answerer(vlm)
     log.info("  VLM ready")
 
-    from src.models.embedder import BGEM3Embedder
+    from src.clients.embedder import BGEM3Embedder
     log.info("loading BGE-M3 on %s ...", args.bge_gpu)
     t0 = time.time()
     embedder = BGEM3Embedder(
@@ -173,7 +172,7 @@ def main():
     )
     log.info("  BGE-M3 ready (%.1fs)", time.time() - t0)
 
-    from src.models.llm_client import LLMClient
+    from src.clients.llm_client import LLMClient
     if args.llm_api_url:
         api_model = args.llm_api_model or "Qwen3.5-27B"
         log.info("loading LLM via API %s ...", args.llm_api_url)
@@ -194,7 +193,7 @@ def main():
         log.info("  LLM ready (%.1fs)", time.time() - t0)
 
     if needs_siglip and siglip_device:
-        from src.models.siglip_embedder import SigLIPEmbedder
+        from src.clients.siglip_embedder import SigLIPEmbedder
         siglip_model = "/home2/ycj/Models/google/siglip-large-patch16-384"
         log.info("loading SigLIP on %s ...", siglip_device)
         t0 = time.time()
@@ -225,11 +224,11 @@ def main():
         with _cache_lock:
             if video_id in _bank_cache:
                 return _bank_cache[video_id]
-        bp = memory_dir / f"{video_id}.json"
-        if not bp.exists():
+        vd = memory_dir / video_id
+        if not (vd / "narrative.json").exists():
             return None
-        from src.memory.core.schema import MemoryBank
-        bank = MemoryBank.load(bp)
+        from src.build_memory.core.bank_loader import load_bank
+        bank = load_bank(vd)
         with _cache_lock:
             _bank_cache[video_id] = bank
         return bank
@@ -249,7 +248,7 @@ def main():
             reranker=None, coarse_top_k=8, final_top_k=8,
             max_iter=veil_max_iter,
             query_history_dedup_threshold=0.9,      # default
-            evidence_dedup_threshold=0.85,           # default
+            evidence_dedup_threshold=0.90,           # default
             query_evidence_dedup_threshold=0.70,    # default
             siglip=siglip, text_alpha=args.text_alpha, keyframe_dir=kf_dir,
             answer_evidence_cap=aek,

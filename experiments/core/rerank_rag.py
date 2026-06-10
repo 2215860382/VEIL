@@ -6,7 +6,7 @@ from typing import List
 import numpy as np
 
 from ._keyframes import load_keyframes
-from src.memory.core.schema import MemoryBank
+from src.build_memory.core.schema import MemoryBank
 
 
 def run_rerank_rag(
@@ -35,8 +35,8 @@ def run_rerank_rag(
     opts = "\n".join(f"({chr(ord('A')+i)}) {c}" for i, c in enumerate(candidates))
     query = f"{question}\nChoices:\n{opts}"
     q_vec = embedder.encode([query])[0]
-    if bank.chunks[0].v_semantic:
-        doc_vecs = np.array([c.v_semantic for c in bank.chunks], dtype=np.float32)
+    if bank.chunks[0].v_dynamic:
+        doc_vecs = np.array([c.v_dynamic for c in bank.chunks], dtype=np.float32)
     else:
         doc_vecs = embedder.encode(texts)
     scores = doc_vecs @ q_vec
