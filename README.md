@@ -54,12 +54,11 @@ configs/
   videomme_direct_fullvideo.yaml
 
 experiments/
-  run_experiments.py                 # benchmark × pipelines → JSONL (CLI entry)
-  analyze_rubric_failures.py
-  eval_classmate_chunks.py
-  eval_classmate_chunks_vlm.py
-  summarize_jsonl.py
-  test_thinking.py
+  veil_27b.py                        # main veil pipeline runner
+  veil_27b_*.py                      # ablations (singlequery, no_rubric_judge, oracle, ignore_verifier)
+  coarse24.py
+  llm_iter.py
+  core/                              # importable pipeline libs (veil.py, coarse_rag.py, rerank_rag.py, _keyframes.py, summarize_jsonl.py)
 
 scripts/
   *.sh                               # vLLM launchers, ablation sweeps
