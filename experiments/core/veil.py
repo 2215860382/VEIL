@@ -503,8 +503,6 @@ def run_veil(
     single_query_iter0:    bool         = False,
     ignore_verifier_signal:    bool     = False,
     force_option_subquestions: bool     = False,
-    verifier_attr:         bool         = False,
-    verifier_opstatus:     bool         = False,
     rubric_rerank:         bool         = False,
     explicit_attribution:  bool         = False,
     prune_distractors:     bool         = False,
@@ -548,9 +546,8 @@ def run_veil(
     if multi_layer_mode == "multi_pool":
         chunk_by_id.update({c.chunk_id: c for c in bank.l2_chunks})
 
-    # Pruning distractors requires distractor_ids from the verifier.
-    # verifier_opstatus already outputs distractor_ids; only fall back to explicit_attribution otherwise.
-    if prune_distractors and not explicit_attribution and not verifier_opstatus:
+    # Pruning distractors requires distractor_ids; use explicit_attribution path.
+    if prune_distractors and not explicit_attribution:
         explicit_attribution = True
 
     # ── Iter-0 plan: sub-question decomposition ──────────────────────────────
@@ -683,8 +680,6 @@ def run_veil(
                                   keyframe_images=kf_for_verifier,
                                   rubric_judgment=rubric_judgment,
                                   explicit_attribution=explicit_attribution,
-                                  verifier_attr=verifier_attr,
-                                  verifier_opstatus=verifier_opstatus,
                                   loose=loose_verifier)
 
         # ── Oracle check (post-verifier) ──────────────────────────────────────

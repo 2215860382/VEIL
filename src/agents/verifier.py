@@ -133,42 +133,70 @@ VERIFIER_SYS = """\
 You evaluate whether retrieved video evidence is sufficient to judge each answer option.
 Output ONE strict JSON object — no prose, no markdown fences.
 
-## Step 1 — Per-Option Evidence Sufficiency Scoring
-For each answer option, convert it into a proposition and score each rubric criterion:
-  1.0 = evidence fully sufficient to judge this option on this criterion
-        (clearly confirms OR clearly rules it out — both count as sufficient)
-  0.5 = evidence partially sufficient — some relevant information present but incomplete
-  0.0 = evidence insufficient to judge this option on this criterion
+## CORE PRINCIPLE — read carefully (this overrides common-sense scoring)
+You are NOT asked "does the evidence support option X?"
+You are asked "does the evidence ALLOW A JUDGMENT on option X?"
 
-Score whether the evidence ALLOWS JUDGMENT of this option, not whether it supports it.
-Evidence that clearly rules out an option scores as high as evidence that clearly confirms it.
+Evidence that CLEARLY RULES OUT an option scores AS HIGH as evidence that CLEARLY CONFIRMS it.
+Both confirm and refute count as "sufficient to judge". Only return low scores when the
+evidence is genuinely silent or ambiguous about that criterion.
+
+Examples:
+- Q: "What color is the car?" Option: "Red car". Evidence: "The car is blue."
+  → evidence_coverage = 1.0 (we CAN judge: option is FALSE)
+- Q: "How many cats?" Option: "Three cats". Evidence: "Two cats sit on the sofa."
+  → evidence_coverage = 1.0 (we CAN judge: option is FALSE — two, not three)
+- Q: "What is the brand?" Option: "Sony". Evidence: "A modern TV is shown."
+  → evidence_coverage = 0.0 (evidence silent on brand; cannot judge)
+
+## Step 1 — Per-Option Evidence Sufficiency Scoring
+For each option × each rubric criterion (use the EXACT criterion names from the Rubric below):
+  1.0 = evidence allows a clear judgment on this criterion (confirm OR rule out).
+  0.5 = some relevant signal but truly ambiguous.
+  0.0 = evidence is silent or irrelevant for this criterion.
 When unsure between 1.0 and 0.5, choose 0.5; between 0.5 and 0.0, choose 0.0.
 
 ## Step 2 — Option Judgment
-Based on the overall evidence for each option:
-  true    : evidence clearly establishes this option is correct
-  false   : evidence clearly establishes this option is incorrect
-  unknown : evidence is insufficient to determine whether this option is correct or not
+Based on the evidence as a whole:
+  true    : evidence (confirm or strong implication) makes this option correct
+  false   : evidence (refute or contradiction) makes this option incorrect
+  unknown : evidence cannot establish either direction
 
-## Step 3 — Missing Evidence Analysis
-If any option is "unknown", write ONE actionable sentence in "missing_evidence_analysis"
-naming the specific fact, time range, or event still needed to resolve it.
-Leave it empty string if no option is unknown.
+## Step 3 — Missing Evidence Analysis (structured)
+For options that ended up "unknown", describe what specific evidence is still missing.
+Leave fields null / empty list if no option is unknown.
 
-Return ONLY this JSON (use actual criterion names from the Rubric):
+## Output schema — return ONLY this JSON
 {
   "option_criteria_scores": {
-    "A": {"<criterion>": 0.0, ...},
-    "B": {"<criterion>": 0.0, ...}
+    "A": {"evidence_coverage": 1.0, "evidence_consistency": 0.5, "<other_criterion>": 0.0},
+    "B": {"evidence_coverage": 0.0, "evidence_consistency": 0.0, "<other_criterion>": 0.0},
+    "C": {"evidence_coverage": 0.0, "evidence_consistency": 0.0, "<other_criterion>": 0.0},
+    "D": {"evidence_coverage": 0.0, "evidence_consistency": 0.0, "<other_criterion>": 0.0}
   },
   "option_judgment": {
-    "A": "true|false|unknown",
-    "B": "true|false|unknown"
+    "A": "true",
+    "B": "false",
+    "C": "unknown",
+    "D": "unknown"
   },
-  "missing_evidence_analysis": "..."
-}"""
+  "missing_evidence_analysis": {
+    "focus_options": ["C", "D"],
+    "target_fact": "What the speaker says about ingredient counts after the second cut.",
+    "time_scope": "120s-180s",
+    "conflict": null
+  }
+}
 
-VERIFIER_SYS_WITH_ATTR = VERIFIER_SYS
+Rules for the JSON:
+- Criterion names in option_criteria_scores MUST match the Rubric names EXACTLY
+  (lowercase snake_case as written under [name] in the Rubric block).
+- Use the OPTION LETTERS that actually appear in the Options block.
+- target_fact: ONE actionable sentence naming the specific fact still needed.
+- time_scope: a range like "120s-180s" if evidence should come from a specific
+  segment, otherwise null.
+- conflict: name an unresolved contradiction across evidence if any, otherwise null.
+- focus_options = [] and other fields = null when all options are true/false."""
 
 # Looser variant — explicitly allows synthesizing indirect / partial evidence
 # instead of requiring verbatim restatement of the option.
@@ -176,145 +204,78 @@ VERIFIER_SYS_LOOSE = """\
 You evaluate whether retrieved video evidence is sufficient to judge each answer option.
 Output ONE strict JSON object — no prose, no markdown fences.
 
-## CRITICAL — How to read evidence
+## CORE PRINCIPLE — read carefully (this overrides common-sense scoring)
+You are NOT asked "does the evidence support option X?"
+You are asked "does the evidence ALLOW A JUDGMENT on option X?"
+
+Evidence that CLEARLY RULES OUT an option scores AS HIGH as evidence that CLEARLY CONFIRMS it.
+Both confirm and refute count as "sufficient to judge".
+
+LOOSE MODE — accept indirect / inferred evidence:
 Video memory is a high-level summary; it almost never restates an answer option verbatim.
-Treat evidence as INDIRECT and use these rules:
-  * If multiple evidence pieces together IMPLY an option (e.g. mentioning prices,
-    discussing $10 / $4000 → "price is a factor"), treat that as sufficient to JUDGE.
-  * If the speaker quotes a motive in dialogue (Speech / asr), that quote counts
-    as an explicit statement even if paraphrased.
-  * Visual descriptions (objects, actions, locations) count as judgable evidence
-    for perception / counting / spatial / temporal-order claims.
-  * Only return "unknown" when the evidence is genuinely off-topic, NOT just because
-    it lacks word-for-word phrasing of the option.
+Treat evidence as INDIRECT:
+- Multiple pieces that together IMPLY the option count as sufficient to judge.
+- Paraphrased speech / subtitle quotes count as explicit statements.
+- Visual descriptions (objects, actions, locations) count as judgable evidence
+  for perception / counting / spatial / temporal-order claims.
+- Only mark "silent" when the evidence is truly off-topic — NOT just because
+  it lacks word-for-word phrasing of the option.
+
+Examples:
+- Q: "What color is the car?" Option: "Red car". Evidence: "The car is blue."
+  → evidence_coverage = 1.0 (CAN judge: option is FALSE)
+- Q: "Why did the price drop?" Option: "Supply increase". Evidence: "$10 → $4000
+  over six months as more sellers entered the market."
+  → evidence_coverage = 1.0 (CAN judge by inference: option is TRUE)
 
 ## Step 1 — Per-Option Evidence Sufficiency Scoring
-For each option, score each rubric criterion:
-  1.0 = the cumulative evidence ALLOWS a judgment (confirm OR rule out)
-        — including via reasonable inference from indirect evidence.
+For each option × each rubric criterion (use the EXACT criterion names from the Rubric below):
+  1.0 = evidence allows a clear judgment (confirm OR rule out), including via
+        reasonable inference from indirect evidence.
   0.5 = some relevant signal but truly ambiguous.
   0.0 = no usable signal at all for this criterion.
 
 ## Step 2 — Option Judgment
-  true    : evidence (direct or by reasonable inference) establishes the option is correct
-  false   : evidence establishes the option is incorrect or contradicts it
+Prefer true / false over unknown whenever the evidence permits a reasonable inference.
+  true    : evidence (direct or by inference) establishes the option is correct
+  false   : evidence (refute or contradiction) establishes the option is incorrect
   unknown : evidence is genuinely silent on this option
 
-Prefer true/false over unknown whenever the evidence permits a reasonable inference.
+## Step 3 — Missing Evidence Analysis (structured)
+For options that ended up "unknown", describe what specific evidence is still missing.
+Leave fields null / empty list if no option is unknown.
 
-## Step 3 — Missing Evidence Analysis
-If any option is "unknown", write ONE actionable sentence naming the specific
-fact still needed. Leave empty if no option is unknown.
-
-Return ONLY this JSON:
+## Output schema — return ONLY this JSON
 {
   "option_criteria_scores": {
-    "A": {"<criterion>": 0.0, ...},
-    "B": {"<criterion>": 0.0, ...}
+    "A": {"evidence_coverage": 1.0, "evidence_consistency": 0.5, "<other_criterion>": 0.0},
+    "B": {"evidence_coverage": 0.0, "evidence_consistency": 0.0, "<other_criterion>": 0.0},
+    "C": {"evidence_coverage": 0.0, "evidence_consistency": 0.0, "<other_criterion>": 0.0},
+    "D": {"evidence_coverage": 0.0, "evidence_consistency": 0.0, "<other_criterion>": 0.0}
   },
   "option_judgment": {
-    "A": "true|false|unknown",
-    "B": "true|false|unknown"
+    "A": "true",
+    "B": "false",
+    "C": "unknown",
+    "D": "unknown"
   },
-  "missing_evidence_analysis": "..."
-}"""
-
-
-VERIFIER_SYS_NORUBRIC_ATTR = """\
-You judge whether retrieved video-segment evidence is sufficient to answer a multiple-choice question.
-No rubric scoring. Follow these THREE steps, then output ONE strict JSON object.
-
-## Step 1 — Evidence Attribution (internal)
-For each evidence chunk [E1]...[En], judge its role for EACH answer option:
-  support  : the evidence directly supports that option
-  refute   : the evidence directly contradicts or rules out that option
-  neutral  : the evidence has no clear effect on that option
-  conflict : the evidence conflicts with other evidence on a key fact for that option
-Use this step internally to reason about the evidence. Do NOT output per-evidence attribution.
-
-## Step 2 — Holistic Sufficiency Judgment
-Based on your internal evidence attribution, decide whether the evidence is sufficient to confidently pick an answer.
-  • "sufficient"   if you are confident the evidence supports a specific option
-  • "insufficient" otherwise
-
-## Step 3 — Reasoning & Missing Evidence
-Write 1-2 sentences in "reasoning" explaining your decision.
-If insufficient, output a SEMI-STRUCTURED "missing_evidence_analysis" object with:
-  - "focus_options": []
-  - "analysis": one dense, actionable sentence describing what evidence is still needed
-  - "time_scope": concrete time range if needed, otherwise null
-  - "conflict_fact": exact conflicting fact if any, otherwise null
-
-Return ONLY this JSON:
-{
-  "criteria":         {},
-  "score":            0.0,
-  "reasoning":        "...",
-  "label":            "sufficient" or "insufficient",
   "missing_evidence_analysis": {
-    "focus_options": [],
-    "analysis": "...",
-    "time_scope": null,
-    "conflict_fact": null
+    "focus_options": ["C", "D"],
+    "target_fact": "What the speaker says about ingredient counts after the second cut.",
+    "time_scope": "120s-180s",
+    "conflict": null
   }
-}"""
+}
 
-
-VERIFIER_SYS_NORUBRIC_ATTR_OPSTATUS = """\
-You judge whether retrieved video-segment evidence is sufficient to answer a multiple-choice question.
-No rubric scoring. Follow these FOUR steps, then output ONE strict JSON object.
-
-## Step 1 — Evidence Attribution (internal)
-For each evidence chunk [E1]...[En], judge its role for EACH answer option:
-  support  : the evidence directly supports that option
-  refute   : the evidence directly contradicts or rules out that option
-  neutral  : the evidence has no clear effect on that option
-  conflict : the evidence conflicts with other evidence on a key fact for that option
-Use this step internally to reason about the evidence. Do NOT output per-evidence attribution.
-
-## Step 2 — Per-Option Status & Distractor Identification
-Using the internal evidence attribution, judge EACH answer option:
-  verified    : evidence EXPLICITLY states the specific fact that maps to this option
-  excluded    : evidence EXPLICITLY contradicts or rules out this option with a concrete fact
-  unclear     : evidence is insufficient, ambiguous, or only implied — DEFAULT when in doubt
-  conflicting : evidence for this option contains unresolved contradiction
-Output "option_status" as an object mapping each option letter to one of these labels.
-Also output "distractor_ids": list of evidence chunk numbers (1-indexed) that are misleading,
-contradictory, or conflict-heavy across options.
-RULES:
-  - Use "verified" when the evidence clearly supports an option, including by direct inference or strong implication.
-  - Use "excluded" when the evidence contradicts or makes an option implausible, including by mutual exclusivity.
-  - Use "unclear" only when the evidence is genuinely ambiguous or absent for that option.
-
-## Step 3 — Holistic Sufficiency Judgment
-Based on option_status, decide whether the evidence is sufficient holistically.
-Do NOT apply a rubric score threshold — use your own judgment about whether you can confidently answer.
-  • "sufficient"   if you can identify a clear answer from the evidence
-  • "insufficient" otherwise
-
-## Step 4 — Reasoning & Missing Evidence
-Write 1-2 sentences in "reasoning" explaining your decision.
-If insufficient, output a SEMI-STRUCTURED "missing_evidence_analysis" object with:
-  - "focus_options": list of option letters still unclear or conflicting (e.g. ["A","C"])
-  - "analysis": one dense, actionable sentence describing what evidence is still needed
-  - "time_scope": concrete time range if needed, otherwise null
-  - "conflict_fact": exact conflicting fact if any, otherwise null
-
-Return ONLY this JSON:
-{
-  "criteria":         {},
-  "score":            0.0,
-  "option_status":    {"A": "unclear", "B": "unclear"},
-  "distractor_ids":   [],
-  "reasoning":        "...",
-  "label":            "sufficient" or "insufficient",
-  "missing_evidence_analysis": {
-    "focus_options": ["A"],
-    "analysis": "...",
-    "time_scope": null,
-    "conflict_fact": null
-  }
-}"""
+Rules for the JSON:
+- Criterion names in option_criteria_scores MUST match the Rubric names EXACTLY
+  (lowercase snake_case as written under [name] in the Rubric block).
+- Use the OPTION LETTERS that actually appear in the Options block.
+- target_fact: ONE actionable sentence naming the specific fact still needed.
+- time_scope: a range like "120s-180s" if evidence should come from a specific
+  segment, otherwise null.
+- conflict: name an unresolved contradiction across evidence if any, otherwise null.
+- focus_options = [] and other fields = null when all options are true/false."""
 
 
 VERIFIER_SYS_NORUBRIC = """\
@@ -390,6 +351,30 @@ def _format_evidence(evidence_texts: List[str]) -> str:
     return "\n".join(f"[E{i+1}] {t}" for i, t in enumerate(evidence_texts))
 
 
+def _format_missing_dict(d: dict) -> str:
+    """Render structured missing_evidence_analysis as one readable sentence.
+
+    Fields: focus_options, target_fact, time_scope, conflict.
+    Used downstream by planner — keeps backward-compat with string consumers.
+    """
+    parts: List[str] = []
+    target = str(d.get("target_fact") or "").strip()
+    if target:
+        parts.append(target)
+    focus = d.get("focus_options") or []
+    if isinstance(focus, list) and focus:
+        letters = [str(x).strip().upper()[:1] for x in focus if str(x).strip()]
+        if letters:
+            parts.append(f"(focus options: {', '.join(letters)})")
+    scope = str(d.get("time_scope") or "").strip()
+    if scope and scope.lower() != "null":
+        parts.append(f"around {scope}")
+    conflict = str(d.get("conflict") or "").strip()
+    if conflict and conflict.lower() != "null":
+        parts.append(f"unresolved conflict: {conflict}")
+    return " ".join(parts).strip()
+
+
 # ── Verifier class ─────────────────────────────────────────────────────────────
 
 class Verifier:
@@ -408,8 +393,6 @@ class Verifier:
         keyframe_images=(),
         rubric_judgment: bool = True,
         explicit_attribution: bool = False,
-        verifier_attr: bool = False,
-        verifier_opstatus: bool = False,
         margin_threshold: float = 0.20,
         loose: bool = False,
     ) -> Dict:
@@ -429,14 +412,8 @@ class Verifier:
         else:
             rubric_dict = rubric
 
-        # ── No-rubric path (unchanged) ─────────────────────────────────────────
+        # ── No-rubric path ────────────────────────────────────────────────────
         if not rubric_judgment:
-            if verifier_opstatus:
-                sys_prompt = VERIFIER_SYS_NORUBRIC_ATTR_OPSTATUS
-            elif verifier_attr:
-                sys_prompt = VERIFIER_SYS_NORUBRIC_ATTR
-            else:
-                sys_prompt = VERIFIER_SYS_NORUBRIC
             opts = "\n".join(f"  ({chr(ord('A')+i)}) {c}" for i, c in enumerate(candidates))
             ev   = _format_evidence(evidence_texts)
             user = "\n\n".join([
@@ -444,19 +421,21 @@ class Verifier:
                 f"Evidence Chain:\n{ev}", "Return the JSON now.",
             ])
             messages = [
-                {"role": "system", "content": sys_prompt},
+                {"role": "system", "content": VERIFIER_SYS_NORUBRIC},
                 {"role": "user",   "content": user},
             ]
             if keyframe_images and getattr(self.llm, '_api_endpoints', None):
                 messages[-1] = _inject_images(messages[-1], keyframe_images)
-            max_new_tokens = 512 if verifier_opstatus else (384 if verifier_attr else 256)
-            raw    = self.llm.chat(messages, max_new_tokens=max_new_tokens, enable_thinking=False)
+            raw    = self.llm.chat(messages, max_new_tokens=256, enable_thinking=False)
             parsed = extract_json(raw)
             label  = as_str(parsed.get("label", "insufficient")).lower()
             if label not in ("sufficient", "insufficient"):
                 label = "insufficient"
             raw_missing = parsed.get("missing_evidence_analysis") or parsed.get("missing_evidence")
-            missing = raw_missing if raw_missing else None
+            if isinstance(raw_missing, dict):
+                missing = _format_missing_dict(raw_missing) or None
+            else:
+                missing = raw_missing if raw_missing else None
             raw_opts = parsed.get("option_status") or {}
             option_status: Dict[str, str] = {}
             if isinstance(raw_opts, dict):
@@ -580,7 +559,9 @@ class Verifier:
                     if v < 0.5
                 ]
             raw_missing = parsed.get("missing_evidence_analysis")
-            if isinstance(raw_missing, str) and raw_missing.strip():
+            if isinstance(raw_missing, dict):
+                missing = _format_missing_dict(raw_missing) or missing
+            elif isinstance(raw_missing, str) and raw_missing.strip():
                 missing = raw_missing.strip()
 
         return {

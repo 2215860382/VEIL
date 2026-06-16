@@ -22,17 +22,44 @@ import numpy as np
 
 # ── Iter-0: sub-question decomposition ────────────────────────────────────────
 
-_SUBQ_SYS = """You are a question decomposer for a video question-answering system.
-Decompose the given multiple-choice question into 2-4 atomic sub-questions, each targeting a \
-specific piece of information needed to evaluate one or more answer options.
+_SUBQ_SYS = """\
+You are a retrieval planner for multiple-choice long-video question answering.
+
+Your task: generate retrieval subqueries that look for evidence in the video
+memory for or against each option.
+
+You must not answer the question.
 
 Rules:
-- Each sub-question must be self-contained and retrievable from video evidence.
-- For "which is NOT correct" / "which is incorrect" questions: generate one sub-question per option.
-- For other questions: identify the key atomic facts needed and generate one sub-question per fact.
-- Sub-questions must be SHORT (≤15 words), specific, and different from each other.
-- Do NOT include option letters in the sub-questions.
-- Return ONLY a JSON array of strings, e.g.: ["sub-question 1", "sub-question 2"]"""
+1. For each option (or set of related options), generate ONE search query
+   that targets the evidence needed to verify or refute it.
+2. Prefer queries that DISTINGUISH confusing options — focus on what differs
+   across options, not what they share.
+3. Use concrete keywords from the question and the options
+   (distinctive nouns, numbers, names, actions).
+4. Each query is one short sentence (≤ 15 words), self-contained,
+   without option letters (A/B/C/D).
+5. Do not invent details not in the question or options.
+6. Generate AT MOST 4 subqueries. If options share most content,
+   focus only on the distinguishing detail.
+
+Output valid JSON only.
+
+Output format (extend the arrays to cover ALL options, up to 4 subqueries):
+{
+  "question_focus": "<what evidence is needed to choose among options>",
+  "option_claims": [
+    {"option": "A", "claim": "<verifiable claim implied by option A>"},
+    {"option": "B", "claim": "<verifiable claim implied by option B>"},
+    {"option": "C", "claim": "<verifiable claim implied by option C>"},
+    {"option": "D", "claim": "<verifiable claim implied by option D>"}
+  ],
+  "subqueries": [
+    {"id": "q1", "related_options": ["A"], "query": "<query targeting A>"},
+    {"id": "q2", "related_options": ["B"], "query": "<query targeting B>"},
+    {"id": "q3", "related_options": ["C", "D"], "query": "<shared distinguishing query>"}
+  ]
+}"""
 
 
 def _decompose_into_subquestions(
@@ -40,23 +67,32 @@ def _decompose_into_subquestions(
     candidates: List[str],
     llm,
 ) -> List[str]:
-    """Iter-0: decompose a question into 2-4 atomic sub-questions."""
+    """Iter-0: decompose a question into ≤4 retrieval subqueries.
+
+    Expects the LLM to return a JSON object with a ``subqueries`` field
+    (option-grounded, evidence-typed); extracts the ``query`` string from each.
+    Falls back to the original question on parse failure.
+    """
     opts = "\n".join(f"  ({chr(ord('A')+i)}) {c}" for i, c in enumerate(candidates))
     user = (
         f"Question: {question}\n"
         f"Options:\n{opts}\n\n"
-        "Decompose into atomic sub-questions. Return ONLY a JSON array of strings."
+        "Generate the retrieval plan as JSON now. Output only the JSON object."
     )
     messages = [
         {"role": "system", "content": _SUBQ_SYS},
         {"role": "user",   "content": user},
     ]
-    raw = llm.chat(messages, max_new_tokens=200, enable_thinking=False)
-    m = re.search(r'\[.*\]', raw, re.DOTALL)
+    raw = llm.chat(messages, max_new_tokens=500, enable_thinking=False)
+    m = re.search(r'\{.*\}', raw, re.DOTALL)
     if m:
         try:
-            qs = _json.loads(m.group())
-            return [str(q).strip() for q in qs if str(q).strip()][:4]
+            obj = _json.loads(m.group())
+            subs = obj.get("subqueries") or []
+            queries = [str(s.get("query", "")).strip() for s in subs
+                       if isinstance(s, dict) and str(s.get("query", "")).strip()]
+            if queries:
+                return queries[:4]
         except Exception:
             pass
     return [question]
@@ -76,28 +112,45 @@ def _option_grounded_subquestions(question: str, candidates: List[str]) -> List[
 
 # ── Iter ≥1: Unified Planner ─────────────────────────────────────────────────
 
-_PLANNER_UNIFIED_SYS = """You are a retrieval strategy planner for a video question-answering system.
-Given the current evidence and what is still missing, decide the BEST next retrieval strategy.
+_PLANNER_UNIFIED_SYS = """\
+You are a retrieval planner for iterative video question answering.
 
-## Strategies
+Round-1+ context: A retrieval round has been completed. The user message
+gives you:
+- The question and options (some options may be tagged [UNKNOWN] — the
+  verifier could not yet judge them from current evidence)
+- Evidence already retrieved (and the time segments it covers)
+- Queries already tried in previous rounds
+- Missing evidence analysis from the verifier
+- Optionally, weak rubric criteria that still need supporting evidence
 
-**targeted** — Issue 1–4 focused queries to retrieve specific missing evidence.
-  Each query must be self-contained, target a single retrievable fact,
-  and not repeat queries already tried.
+Decide between two strategies:
 
-**broadcast** — Sample frames uniformly across the uncovered video timeline (no queries needed).
-  Use when coverage must span the ENTIRE video, including:
-  - Main theme, topic overview, synopsis, or overall narrative of the video
-  - Events spread throughout / across all segments / entire duration
-  - Chronological order, sequence of events, or timeline across the full video
-  - Targeted queries have repeatedly failed to find sufficient evidence
+**targeted** — Issue 1–4 new queries to fill specific gaps.
+  Each query MUST:
+  - Aim at a specific [UNKNOWN] option, a specific weak rubric criterion,
+    or a specific missing fact named in the verifier's analysis.
+  - Be NEW — do not repeat or paraphrase a previously-tried query.
+  - Be ≤ 15 words, atomic, retrieval-friendly.
+  - Use concrete keywords (distinctive nouns, numbers, names, actions);
+    do NOT include option letters (A/B/C/D).
 
-## Output format
-Return ONLY a JSON object:
+**broadcast** — Sample frames uniformly across uncovered video timeline.
+  Choose this when:
+  - The question needs full-video coverage (synopsis, overall theme,
+    full-video sequence of events, "throughout the video" reasoning).
+  - Previous rounds' targeted queries have repeatedly failed to surface
+    new useful evidence.
+  - There is no specific entity / fact left to search for, only a general
+    "what else is there" need.
+
+Do not answer the question; only plan retrieval.
+
+Output valid JSON only:
 {
   "strategy": "targeted" | "broadcast",
-  "queries": ["..."],
-  "reasoning": "<one sentence explaining the choice>"
+  "queries": ["...", "..."],
+  "reasoning": "<one sentence: which gap this targets, OR why broadcast>"
 }
 For broadcast, set queries to []."""
 
