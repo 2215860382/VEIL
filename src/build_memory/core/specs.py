@@ -1,7 +1,7 @@
 """Canonical benchmark paths, output dirs, and default hyper-parameters for memory builders.
 
 Not used by ``experiments/run_experiments.py`` (that reads ``configs/*.yaml``); it exists so
-``src.build_memory.similarity`` does not duplicate path logic, and the legacy
+``src.build_memory.build_single_similarity`` does not duplicate path logic, and the legacy
 fixedframe builder can reuse the same path defaults.
 
 Eval / baselines use ``configs/*.yaml``. Builders load this module unless paths are
@@ -78,7 +78,7 @@ def similarity_memory_cache_dir(name: BenchName) -> Path:
 
 
 def cfg_for_similarity_build(name: BenchName, bge_device: str = "cuda:0") -> dict[str, Any]:
-    """Minimal config dict for ``src.build_memory.similarity`` (benchmark + embedder + out dir)."""
+    """Minimal config dict for ``src.build_memory.build_single_similarity`` (benchmark + embedder + out dir)."""
     bench = benchmark_mlvu() if name == "mlvu" else benchmark_videomme()
     out = str(similarity_memory_cache_dir(name))
     return {

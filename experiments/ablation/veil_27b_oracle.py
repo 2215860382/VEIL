@@ -20,7 +20,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.config import load_config
 from src.utils.logging import get_logger
@@ -103,8 +103,6 @@ def main():
                     help="Parallel workers (safe with API-mode LLM)")
     ap.add_argument("--pipeline-name",       default=None,
                     help="Override PIPELINE_NAME (= output jsonl filename stem)")
-    ap.add_argument("--use-attr-evidence",   action="store_true",
-                    help="Append static_index_text to each chunk's evidence string")
     ap.add_argument("--per-chunk-keyframe-cap", type=int, default=1,
                     help="Max keyframes per chunk fed to VLM (1=baseline)")
     args = ap.parse_args()
@@ -276,7 +274,6 @@ def main():
             rubric_rerank=True,
             use_oracle=True,
             gold_answer=s.answer,
-            evidence_with_attr=args.use_attr_evidence,
             per_chunk_keyframe_cap=args.per_chunk_keyframe_cap,
         )
         return run_veil(s.question, s.candidates, bank, embedder, answerer, llm,

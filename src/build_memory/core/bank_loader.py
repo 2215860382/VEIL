@@ -1,10 +1,24 @@
-"""Load a MemoryBank from the new on-disk structure:
+"""Polymorphic ``MemoryBank`` loader. Accepts any of three layouts:
 
-    videomme_L_27B/{video_id}/
-        narrative.json       chunks[].narrative / caption / speech_text / keyframe_path
-        attributes.json      chunks[].static_index_text / static_attributes
-        vectors.npz          narrative_vecs / attribute_vecs / chunk_ids
+* **New single-file bank**:
+    ``{root}/{video_id}.json``  — written by ``MemoryBank.save()``.
+
+* **Legacy multi-file bank**:
+    ``{root}/{video_id}/``
+        narrative.json   chunks[].narrative / caption / speech_text / keyframe_ts
+        vectors.npz      narrative_vecs / chunk_ids
         frames/{cid:04d}_{i}.jpg
+
+* **Pyramid bank** (4-layer fixed-time, built by ``build_pyramid.py``):
+    ``{root}/{video_id}/``
+        L1.jsonl         one row per 10 s chunk: idx/t_start/t_end/text/frame_paths/visual_offsets
+        L1_text.npz      BGE-M3 vectors, shape (N_L1, 1024)
+        L1_visual.npz    SigLIP vectors, shape (sum_k, D_siglip)
+        frames/c{idx:05d}_f{local:02d}.jpg
+        meta.json        {video_id, duration, status, ...}
+
+The legacy ``attributes.json`` / ``vectors.npz["attribute_vecs"]`` are ignored —
+the static attribute layer is no longer in the schema.
 """
 from __future__ import annotations
 
@@ -16,33 +30,21 @@ import numpy as np
 from .schema import MemoryBank, MemoryChunk
 
 
-def load_bank(video_dir: str | Path) -> MemoryBank:
-    """Build an in-memory MemoryBank from a video folder under videomme_L_27B/."""
-    vd = Path(video_dir)
+def _load_legacy_dir(vd: Path) -> MemoryBank:
+    """Load a legacy {video_id}/ directory bank (narrative + vectors only)."""
     video_id = vd.name
     narr = json.loads((vd / "narrative.json").read_text())
-    attrs = json.loads((vd / "attributes.json").read_text())
     vecs = np.load(vd / "vectors.npz")
 
-    attr_map = {c["chunk_id"]: c for c in attrs.get("chunks", [])}
     n_vecs = vecs["narrative_vecs"]
-    a_vecs = vecs["attribute_vecs"]
     chunk_ids = vecs["chunk_ids"]
     cid_to_vidx = {int(cid): i for i, cid in enumerate(chunk_ids)}
 
     chunks = []
     for nc in narr.get("chunks", []):
         cid = nc["chunk_id"]
-        ac = attr_map.get(cid, {})
         vi = cid_to_vidx.get(cid)
         v_dynamic = n_vecs[vi].tolist() if vi is not None else []
-        v_static = a_vecs[vi].tolist() if vi is not None else []
-
-        # Representative keyframe = first frame of the attribute layer
-        # (fall back to chunk-id-based convention if attributes layer is missing)
-        fps = ac.get("frame_paths") or []
-        kf_rel = fps[0] if fps else f"frames/{cid:04d}_0.jpg"
-        kf_abs = str(vd / kf_rel)
 
         chunks.append(MemoryChunk(
             video_id=video_id,
@@ -53,12 +55,8 @@ def load_bank(video_dir: str | Path) -> MemoryBank:
             visual_caption=" | ".join(nc.get("caption", []) or []),
             asr=nc.get("speech_text", "") or "",
             sampled_frames=nc.get("sampled_frames", []) or [],
-            keyframe_path=kf_abs,
             keyframe_ts=nc.get("keyframe_ts", 0.0),
             v_dynamic=v_dynamic,
-            v_static=v_static,
-            static_index_text=ac.get("static_index_text", "") or "",
-            static_attributes=[],
         ))
 
     return MemoryBank(
@@ -67,3 +65,128 @@ def load_bank(video_dir: str | Path) -> MemoryBank:
         chunks=chunks,
         memory_kind="similarity_group",
     )
+
+
+def _load_pyramid_upper(vd: Path, layer: int, video_id: str, id_offset: int) -> list:
+    """Load one upper pyramid layer (L2/L3/L4) into MemoryChunk list.
+
+    chunk_id = id_offset + row["idx"] to keep ids globally unique across layers.
+    These chunks carry no visual info (keyframe_path="", v_visual=[]).
+    memory_text = row["text"] (the summary; timeline/causality prepended for display).
+    """
+    jsonl = vd / f"L{layer}.jsonl"
+    npz   = vd / f"L{layer}.npz"
+    if not jsonl.exists():
+        return []
+    rows = [json.loads(l) for l in jsonl.open()]
+    vecs = np.load(npz)["vectors"] if npz.exists() else None  # (N, 1024)
+
+    chunks = []
+    for row in rows:
+        idx = row["idx"]
+        v_dyn = vecs[idx].tolist() if (vecs is not None and idx < len(vecs)) else []
+
+        # Build a richer display text: summary + timeline bullets
+        text = row.get("text", "")
+        timeline = row.get("timeline", [])
+        if timeline:
+            tl_str = " → ".join(timeline)
+            display = f"[L{layer}][{row['t_start']:.0f}s-{row['t_end']:.0f}s] {text}\nTimeline: {tl_str}"
+        else:
+            display = f"[L{layer}][{row['t_start']:.0f}s-{row['t_end']:.0f}s] {text}"
+
+        chunks.append(MemoryChunk(
+            video_id=video_id,
+            chunk_id=id_offset + idx,
+            start_time=row["t_start"],
+            end_time=row["t_end"],
+            memory_text=display,
+            v_dynamic=v_dyn,
+            layer=layer,
+        ))
+    return chunks
+
+
+def _load_pyramid_dir(vd: Path) -> MemoryBank:
+    """Load a pyramid-format {video_id}/ directory (build_pyramid.py output).
+
+    L1 chunks go into bank.chunks (fine-grained, with visual frames).
+    L2/L3/L4 chunks go into bank.l2/l3/l4_chunks (coarser, text-only).
+    chunk_id offsets: L1=raw idx, L2=100000+idx, L3=200000+idx, L4=300000+idx.
+    """
+    video_id = vd.name
+    meta = json.loads((vd / "meta.json").read_text())
+    duration = meta.get("duration", 0.0)
+
+    rows = [json.loads(l) for l in (vd / "L1.jsonl").open()]
+    text_vecs = np.load(vd / "L1_text.npz")["vectors"]   # (N, 1024)
+    vis_vecs  = np.load(vd / "L1_visual.npz")["vectors"] if (vd / "L1_visual.npz").exists() else None
+
+    chunks = []
+    for row in rows:
+        idx = row["idx"]
+        v_dyn = text_vecs[idx].tolist() if idx < len(text_vecs) else []
+
+        # mean SigLIP over this chunk's frames for cross-chunk visual dedup
+        offsets = row.get("visual_offsets", [])
+        if vis_vecs is not None and offsets:
+            v_vis = vis_vecs[offsets].mean(axis=0).tolist()
+        elif vis_vecs is not None:
+            v_vis = [0.0] * vis_vecs.shape[1]  # no frames: neutral zero vector
+        else:
+            v_vis = []
+
+        # absolute path to sharpest (first) representative frame
+        fps = row.get("frame_paths", [])
+        kf_path = str(vd / fps[0]) if fps else ""
+
+        chunks.append(MemoryChunk(
+            video_id=video_id,
+            chunk_id=idx,
+            start_time=row["t_start"],
+            end_time=row["t_end"],
+            memory_text=row.get("text", ""),
+            v_dynamic=v_dyn,
+            v_visual=v_vis,
+            keyframe_path=kf_path,
+            keyframe_ts=(row.get("frame_ts") or [row["t_start"]])[0],
+            layer=1,
+        ))
+
+    l2 = _load_pyramid_upper(vd, 2, video_id, id_offset=100_000)
+    l3 = _load_pyramid_upper(vd, 3, video_id, id_offset=200_000)
+    l4 = _load_pyramid_upper(vd, 4, video_id, id_offset=300_000)
+
+    return MemoryBank(
+        video_id=video_id,
+        duration=duration,
+        chunks=chunks,
+        l2_chunks=l2,
+        l3_chunks=l3,
+        l4_chunks=l4,
+        memory_kind="pyramid_L1",
+    )
+
+
+def load_bank(path: str | Path) -> MemoryBank:
+    """Load a MemoryBank from either layout.
+
+    ``path`` may point to either:
+      * a ``{video_id}.json`` file (new single-file bank), or
+      * a ``{video_id}/`` directory (legacy multi-file bank).
+
+    Anything else raises ``FileNotFoundError``. The caller need not know
+    which format is on disk.
+    """
+    p = Path(path)
+    if p.is_file():
+        return MemoryBank.model_validate_json(p.read_text())
+    if p.is_dir():
+        if (p / "L1.jsonl").exists():
+            return _load_pyramid_dir(p)
+        return _load_legacy_dir(p)
+    # Convenience: if {path}.json exists alongside, treat that as the bank.
+    sibling_json = p.with_suffix(".json")
+    if sibling_json.is_file():
+        return MemoryBank.model_validate_json(sibling_json.read_text())
+    raise FileNotFoundError(f"no bank found at {path}")

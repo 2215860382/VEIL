@@ -1,14 +1,15 @@
-"""VEIL-27B WITHOUT RUBRIC — evidence sufficiency judgment w/o rubric scoring.
+"""VEIL-27B SINGLE QUERY — no iter-0 decomposition, use original question directly.
 
-Ablation: rubric_judgment=False
-- Verifier judges evidence sufficiency without rubric criteria
-- Falls back to holistic missing evidence analysis text
+Ablation: single_query_iter0=True
+- Iter-0: Instead of decomposing into 2-4 sub-questions or 4 option-grounded queries,
+  directly use the original question as a single search query
+- Tests whether decomposition helps or if simpler single-query approach is better
 
 Answerer / Planner / Verifier all use Qwen3.5-27B via --vlm-api-url / --llm-api-url.
 
 Usage:
     cd /home2/ycj/Project/VEIL
-    PYTHONPATH=. python experiments/veil_27b_no_rubric_judge.py \\
+    PYTHONPATH=. python experiments/veil_27b_singlequery.py \\
         --config configs/videomme_memory_bank.yaml \\
         --vlm-api-url http://localhost:8000 \\
         --llm-api-url http://localhost:8001 \\
@@ -24,13 +25,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.config import load_config
 from src.utils.logging import get_logger
 from experiments.core.veil import run_veil
 
-PIPELINE_NAME = "veil_27b_no_rubric_judge"
+PIPELINE_NAME = "veil_27b_singlequery"
 
 log = get_logger(PIPELINE_NAME)
 
@@ -116,7 +117,7 @@ def main():
                  out_root / "memory" / f"{bench}_L_27b_27b"
     default_out_dir = Path(cfg.get("eval", {}).get("output_dir") or (out_root / "results" / bench))
     out_path = Path(args.out) if args.out else \
-               default_out_dir / "veil_27b_no_rubric_judge.jsonl"
+               default_out_dir / "veil_27b_singlequery.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     filter_vids: set | None = None
@@ -254,7 +255,7 @@ def main():
             answer_keyframe_cap=akk,
             verifier_evidence_cap=vek,
             rubric_rerank=True,
-            rubric_judgment=False,  # ABLATION: disable rubric scoring
+            single_query_iter0=True,  # ABLATION: no decomposition, use original question
         )
         return run_veil(s.question, s.candidates, bank, embedder, answerer, llm,
                         task_type=s.question_type, **kw), None

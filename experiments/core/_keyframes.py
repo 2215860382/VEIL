@@ -18,18 +18,54 @@ def load_keyframe_pil(path: str):
     return None
 
 
-def keyframe_path(keyframe_dir, video_id: str, chunk_id: int) -> str:
-    """Pick the lowest-index surviving frame for a chunk (post-dedup _0 may be gone)."""
+def keyframe_path(keyframe_dir, video_id: str, chunk_id: int, chunk=None) -> str:
+    """Return the sharpest representative frame for a chunk.
+
+    Prefers ``chunk.keyframe_path`` (set at build time to the sharpest frame by
+    Laplacian variance) when it exists on disk. Falls back to the lowest-index
+    glob match so old banks without the field still work.
+    """
+    if chunk is not None:
+        kp = getattr(chunk, "keyframe_path", "") or ""
+        if kp and Path(kp).is_file():
+            return kp
     frames_dir = Path(keyframe_dir) / video_id / "frames"
     matches = sorted(frames_dir.glob(f"{chunk_id:04d}_*.jpg"))
     return str(matches[0]) if matches else ""
 
 
-def keyframe_paths(keyframe_dir, video_id: str, chunk_id: int, cap: int = 3) -> List[str]:
-    """All surviving frames for a chunk, sorted by index, capped to ``cap``."""
+def _sharpest(paths: List[str]) -> str:
+    """Return the path with highest Laplacian variance (sharpest). Falls back to paths[0]."""
+    import cv2
+    best_path, best_score = paths[0], -1.0
+    for p in paths:
+        img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        score = float(cv2.Laplacian(img, cv2.CV_64F).var())
+        if score > best_score:
+            best_score, best_path = score, p
+    return best_path
+
+
+def keyframe_paths(keyframe_dir, video_id: str, chunk_id: int, cap: int = 3,
+                   chunk=None) -> List[str]:
+    """All surviving frames for a chunk, capped to ``cap``.
+
+    The sharpest frame (by Laplacian variance over existing disk files) is placed
+    first so that cap=1 always returns the best frame.
+    """
     frames_dir = Path(keyframe_dir) / video_id / "frames"
-    matches = sorted(frames_dir.glob(f"{chunk_id:04d}_*.jpg"))
-    return [str(p) for p in matches[:cap]]
+    all_matches = [str(p) for p in sorted(frames_dir.glob(f"{chunk_id:04d}_*.jpg"))]
+    # pyramid naming: c{chunk_id:05d}_f*.jpg
+    if not all_matches:
+        all_matches = [str(p) for p in sorted(frames_dir.glob(f"c{chunk_id:05d}_f*.jpg"))]
+    if not all_matches:
+        return []
+
+    best = _sharpest(all_matches) if len(all_matches) > 1 else all_matches[0]
+    rest = [p for p in all_matches if p != best]
+    return ([best] + rest)[:cap]
 
 
 def visual_dedup(chunks_with_imgs: List[Tuple], threshold: float = 0.92) -> List:
@@ -59,6 +95,6 @@ def load_keyframes(
     """Load, dedup, and cap keyframe images for a list of MemoryChunks."""
     pairs = []
     for c in chunks:
-        kp = keyframe_path(keyframe_dir, video_id, c.chunk_id)
+        kp = keyframe_path(keyframe_dir, video_id, c.chunk_id, chunk=c)
         pairs.append((c, load_keyframe_pil(kp)))
     return visual_dedup(pairs, dedup_threshold)[:cap]

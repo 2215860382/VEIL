@@ -16,8 +16,8 @@ veil_loop:
   max_iter: 3
   query_history_dedup_threshold: 0.9      # Jaccard, query vs history
   evidence_dedup_threshold: 0.9           # BGE cosine, evidence chunk vs accumulated
-  query_evidence_dedup_threshold: 0.9     # BGE cosine, new query vs existing evidence (drift)
-  kf_dedup_threshold: 0.9                 # SigLIP cosine, keyframe vs keyframe
+  query_evidence_dedup_threshold: 0.7     # BGE cosine, new query vs existing evidence (drift)
+  kf_dedup_threshold: 0.92                # SigLIP cosine, keyframe vs keyframe
 
 eval:
   output_dir: /home2/ycj/Project/VEIL/outputs/results/videomme

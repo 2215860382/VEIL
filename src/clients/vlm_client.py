@@ -149,6 +149,49 @@ class VLMClient:
             result = result.split("</think>", 1)[1]
         return result.strip()
 
+    def chat_with_content(
+        self,
+        content: list,
+        max_new_tokens: int | None = None,
+        temperature: float = 0.0,
+        enable_thinking: bool = False,
+    ) -> str:
+        """Send a pre-built mixed content list (text + image_url blocks) to the API.
+
+        ``content`` is a list of OpenAI-style content items:
+          {"type": "text", "text": "..."}
+          {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+        The caller is responsible for encoding images to base64.
+        """
+        if not self._api_endpoints:
+            raise NotImplementedError("chat_with_content is only supported in API mode")
+        payload = {
+            "model": self._api_model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": max_new_tokens or self.default_max_new_tokens,
+            "temperature": temperature if temperature > 0 else 0.0,
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
+        }
+        with self._api_lock:
+            ep = self._api_endpoints[self._api_rr % len(self._api_endpoints)]
+            self._api_rr += 1
+        resp = self._requests.post(ep, json=payload, timeout=300)
+        if resp.status_code in (400, 500):
+            import logging
+            logging.getLogger(__name__).warning(
+                "VLM API %s error with mixed content — retrying text-only", resp.status_code)
+            text_only = [item for item in content if item.get("type") == "text"]
+            payload["messages"] = [{"role": "user", "content": text_only}]
+            with self._api_lock:
+                ep = self._api_endpoints[self._api_rr % len(self._api_endpoints)]
+                self._api_rr += 1
+            resp = self._requests.post(ep, json=payload, timeout=300)
+        resp.raise_for_status()
+        result = resp.json()["choices"][0]["message"]["content"]
+        if "</think>" in result:
+            result = result.split("</think>", 1)[1]
+        return result.strip()
+
     @torch.inference_mode()
     def chat_with_video(
         self,

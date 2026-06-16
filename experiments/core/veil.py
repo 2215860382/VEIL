@@ -33,12 +33,10 @@ def _broadcast_retrieve(
     bank: MemoryBank,
     seen_ids: Set[int],
     n: int = 8,
-    evidence_with_attr: bool = False,
     dialogue_first: bool = False,
 ) -> tuple[list, list, list]:
     """Uniformly sample n unseen chunks across the video timeline."""
     texts_ev  = bank.memory_texts(with_time=True, with_asr=True,
-                                  with_layers=evidence_with_attr,
                                   dialogue_first=dialogue_first)
     idx_map   = {c.chunk_id: i for i, c in enumerate(bank.chunks)}
     unseen    = [c for c in bank.chunks if c.chunk_id not in seen_ids]
@@ -144,13 +142,62 @@ def _rerank_by_rubric(
         try:
             order = _json.loads(m.group())
             n = len(evidence_texts)
-            valid = [i for i in order if isinstance(i, int) and 0 <= i < n]
-            seen  = set(valid)
+            seen: set = set()
+            valid: list = []
+            for i in order:
+                if isinstance(i, int) and 0 <= i < n and i not in seen:
+                    seen.add(i)
+                    valid.append(i)
             missing = [i for i in range(n) if i not in seen]
             return valid + missing
         except Exception:
             pass
     return list(range(len(evidence_texts)))
+
+
+# ── Text-first visual gating ─────────────────────────────────────────────────
+
+def _text_first_select_visuals(
+    question:   str,
+    candidates: List[str],
+    ev_texts:   List[str],
+    ev_ids:     List[int],
+    llm,
+) -> tuple[set, str]:
+    """LLM (text-only) decides which chunks need visual confirmation.
+
+    Returns (selected_chunk_ids, parse_status). parse_status is one of:
+      "ok"     — LLM returned a valid JSON list (possibly empty)
+      "fail"   — parse failed, caller should fall back to using all keyframes
+    """
+    if not ev_texts:
+        return set(), "ok"
+    opts   = "\n".join(f"({chr(65+i)}) {c}" for i, c in enumerate(candidates))
+    ev_fmt = "\n".join(f"[C{cid}] {t[:400]}" for cid, t in zip(ev_ids, ev_texts))
+    user = (
+        f"Question: {question}\n"
+        f"Options:\n{opts}\n\n"
+        f"Evidence chunks (chunk_id in brackets):\n{ev_fmt}\n\n"
+        "Read the text evidence. Your default is to REQUEST video frames for a chunk "
+        "unless the text alone makes the answer to the question completely unambiguous "
+        "(i.e. the exact fact needed is stated explicitly, no visual verification required).\n"
+        "When in doubt — include the chunk_id. Omit a chunk ONLY if you are certain "
+        "the text is fully sufficient to answer that part of the question.\n"
+        "Output ONLY a JSON array of chunk_ids that need visual confirmation, e.g. "
+        "[3, 7] — or [] only if text alone is 100%% sufficient for ALL chunks. No prose."
+    )
+    raw = llm.chat([{"role": "user", "content": user}],
+                   max_new_tokens=120, enable_thinking=False)
+    import json as _json
+    m = re.search(r'\[[\d,\s]*\]', raw)
+    if not m:
+        return set(), "fail"
+    try:
+        ids = _json.loads(m.group())
+        valid_ids = {int(x) for x in ids if isinstance(x, int) and x in set(ev_ids)}
+        return valid_ids, "ok"
+    except Exception:
+        return set(), "fail"
 
 
 # ── Chunk-level evidence dedup ───────────────────────────────────────────────
@@ -194,16 +241,11 @@ def _query_retrieve(
     siglip=None,
     text_alpha: float = 0.6,
     vis_query: str = "",
-    evidence_with_attr: bool = False,
-    retrieval_static_alpha: float = 1.0,
     dialogue_first: bool = False,
     asr_alpha: float = 0.0,
 ) -> tuple[List[str], List[int], List[List[float]]]:
     """Return (evidence_texts, chunk_ids, v_dynamic_vecs), skipping already-seen chunks.
 
-    evidence_with_attr=True  → append static_index_text to each chunk's evidence string
-    retrieval_static_alpha<1 → blend v_static into the BGE scoring channel
-                               final_bge = α·(q·v_dynamic) + (1-α)·(q·v_static)
     dialogue_first=True      → put ASR up front with [DIALOGUE] tag in evidence text
     asr_alpha>0              → blend an ASR-only BGE channel into scoring
                                final = (1-asr_alpha)·q·v_dynamic + asr_alpha·q·v_asr
@@ -211,7 +253,6 @@ def _query_retrieve(
     """
     texts    = bank.memory_texts()
     texts_ev = bank.memory_texts(with_time=True, with_asr=True,
-                                 with_layers=evidence_with_attr,
                                  dialogue_first=dialogue_first)
     q_vec  = embedder.encode([query])[0]
     if bank.chunks[0].v_dynamic:
@@ -219,11 +260,6 @@ def _query_retrieve(
     else:
         doc_vecs = embedder.encode(texts)
     scores = doc_vecs @ q_vec
-
-    if retrieval_static_alpha < 1.0 and bank.chunks[0].v_static:
-        static_vecs   = np.array([c.v_static for c in bank.chunks], dtype=np.float32)
-        static_scores = static_vecs @ q_vec
-        scores = retrieval_static_alpha * scores + (1 - retrieval_static_alpha) * static_scores
 
     if asr_alpha > 0.0:
         asr_vecs = getattr(bank, "_asr_vecs_cache", None)
@@ -256,6 +292,186 @@ def _query_retrieve(
         [bank.chunks[i].chunk_id for i in new_idx],
         [bank.chunks[i].v_dynamic for i in new_idx],
     )
+
+
+# ── Multi-layer pyramid retrieval helpers ────────────────────────────────────
+
+def _retrieve_on_chunks(
+    query: str,
+    chunks: list,
+    embedder,
+    top_k: int,
+    exclude_ids: Set[int],
+    dialogue_first: bool = False,
+) -> tuple[List[str], List[int], List[List[float]]]:
+    """BGE retrieval on an explicit chunk list; skip chunks in exclude_ids."""
+    if not chunks:
+        return [], [], []
+    q_vec = embedder.encode([query])[0]
+    doc_vecs = np.array([c.v_dynamic for c in chunks], dtype=np.float32)
+    scores = doc_vecs @ q_vec
+    order = np.argsort(-scores)
+
+    out_texts, out_ids, out_vecs = [], [], []
+    for i in order:
+        c = chunks[i]
+        if c.chunk_id in exclude_ids:
+            continue
+        parts = [f"[{c.start_time:.0f}s-{c.end_time:.0f}s]", c.memory_text]
+        if getattr(c, "asr", "").strip():
+            if dialogue_first:
+                parts.insert(1, f'[DIALOGUE] "{c.asr.strip()}"')
+            else:
+                parts.append(f"Speech: {c.asr}")
+        out_texts.append("\n".join(parts))
+        out_ids.append(c.chunk_id)
+        out_vecs.append(c.v_dynamic)
+        if len(out_ids) >= top_k:
+            break
+    return out_texts, out_ids, out_vecs
+
+
+def _coarse_to_fine_retrieve(
+    query: str,
+    bank: "MemoryBank",
+    embedder,
+    reranker,
+    coarse_top_k: int,
+    final_top_k: int,
+    exclude_ids: Set[int],
+    siglip=None,
+    text_alpha: float = 0.6,
+    vis_query: str = "",
+    dialogue_first: bool = False,
+    asr_alpha: float = 0.0,
+    l3_top_k: int = 2,
+) -> tuple[List[str], List[int], List[List[float]]]:
+    """Mode A: use top-2 L3 windows to filter L1 candidates, then fine retrieve."""
+    if not bank.l3_chunks:
+        return _query_retrieve(query, bank, embedder, reranker, coarse_top_k, final_top_k,
+                               exclude_ids, siglip=siglip, text_alpha=text_alpha,
+                               vis_query=vis_query, dialogue_first=dialogue_first,
+                               asr_alpha=asr_alpha)
+
+    q_vec = embedder.encode([query])[0]
+    l3_vecs = np.array([c.v_dynamic for c in bank.l3_chunks], dtype=np.float32)
+    l3_scores = l3_vecs @ q_vec
+    top_l3 = np.argsort(-l3_scores)[:l3_top_k]
+    windows = [(bank.l3_chunks[i].start_time, bank.l3_chunks[i].end_time) for i in top_l3]
+
+    def _overlaps(c):
+        return any(c.start_time < te and c.end_time > ts for ts, te in windows)
+
+    in_window = [c for c in bank.chunks if _overlaps(c)]
+    out_window = [c for c in bank.chunks if not _overlaps(c)]
+    # Put in-window first; fall back to out-window if pool is too small
+    candidate_pool = in_window + out_window
+
+    if not candidate_pool:
+        return [], [], []
+
+    doc_vecs = np.array([c.v_dynamic for c in candidate_pool], dtype=np.float32)
+    scores = doc_vecs @ q_vec
+
+    k = min(coarse_top_k, len(scores))
+    coarse = np.argpartition(-scores, k - 1)[:k]
+    coarse = coarse[np.argsort(-scores[coarse])]
+
+    def _ev_text(c):
+        parts = [f"[{c.start_time:.0f}s-{c.end_time:.0f}s]", c.memory_text]
+        if getattr(c, "asr", "").strip():
+            if dialogue_first:
+                parts.insert(1, f'[DIALOGUE] "{c.asr.strip()}"')
+            else:
+                parts.append(f"Speech: {c.asr}")
+        return "\n".join(parts)
+
+    ev_texts_pool = [_ev_text(candidate_pool[i]) for i in range(len(candidate_pool))]
+
+    if reranker is not None:
+        reranked = reranker.rerank(query, [ev_texts_pool[i] for i in coarse], top_k=final_top_k)
+        final_idx = [int(coarse[i]) for i, _ in reranked]
+    else:
+        final_idx = list(coarse[:final_top_k])
+
+    new_idx = [i for i in final_idx if candidate_pool[i].chunk_id not in exclude_ids]
+    return (
+        [ev_texts_pool[i] for i in new_idx],
+        [candidate_pool[i].chunk_id for i in new_idx],
+        [candidate_pool[i].v_dynamic for i in new_idx],
+    )
+
+
+def _multi_pool_retrieve(
+    query: str,
+    bank: "MemoryBank",
+    embedder,
+    reranker,
+    coarse_top_k: int,
+    final_top_k: int,
+    exclude_ids: Set[int],
+    dialogue_first: bool = False,
+    l2_cap: int = 4,
+) -> tuple[List[str], List[int], List[List[float]]]:
+    """Mode B: retrieve from L1 and L2 pools, merge by score."""
+    if not bank.l2_chunks:
+        return _query_retrieve(query, bank, embedder, reranker, coarse_top_k, final_top_k,
+                               exclude_ids, dialogue_first=dialogue_first)
+
+    q_vec = embedder.encode([query])[0]
+
+    # L1 pool
+    l1_vecs = np.array([c.v_dynamic for c in bank.chunks], dtype=np.float32)
+    l1_scores = l1_vecs @ q_vec
+    l1_order = np.argsort(-l1_scores)[:coarse_top_k]
+
+    # L2 pool (smaller cap)
+    l2_vecs = np.array([c.v_dynamic for c in bank.l2_chunks], dtype=np.float32)
+    l2_scores = l2_vecs @ q_vec
+    l2_order = np.argsort(-l2_scores)[:l2_cap]
+
+    # Merge by score
+    def _l1_ev(c):
+        parts = [f"[{c.start_time:.0f}s-{c.end_time:.0f}s]", c.memory_text]
+        if getattr(c, "asr", "").strip():
+            if dialogue_first:
+                parts.insert(1, f'[DIALOGUE] "{c.asr.strip()}"')
+            else:
+                parts.append(f"Speech: {c.asr}")
+        return "\n".join(parts)
+
+    candidates = []
+    for i in l1_order:
+        c = bank.chunks[i]
+        if c.chunk_id not in exclude_ids:
+            candidates.append((float(l1_scores[i]), c, _l1_ev(c)))
+    for i in l2_order:
+        c = bank.l2_chunks[i]
+        if c.chunk_id not in exclude_ids:
+            candidates.append((float(l2_scores[i]), c, c.memory_text))
+
+    candidates.sort(key=lambda x: -x[0])
+    selected = candidates[:final_top_k]
+    return (
+        [ev for _, _, ev in selected],
+        [c.chunk_id for _, c, _ in selected],
+        [c.v_dynamic for _, c, _ in selected],
+    )
+
+
+def _get_l3_context(question: str, bank: "MemoryBank", embedder, top_k: int = 2) -> str:
+    """Mode C: retrieve top-k L3 summaries most relevant to the question."""
+    if not bank.l3_chunks:
+        return ""
+    q_vec = embedder.encode([question])[0]
+    l3_vecs = np.array([c.v_dynamic for c in bank.l3_chunks], dtype=np.float32)
+    scores = l3_vecs @ q_vec
+    order = np.argsort(-scores)[:top_k]
+    parts = []
+    for i in order:
+        c = bank.l3_chunks[i]
+        parts.append(f"[{c.start_time:.0f}s-{c.end_time:.0f}s] {c.memory_text}")
+    return "\n\n".join(parts)
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
@@ -295,13 +511,14 @@ def run_veil(
     use_oracle:            bool         = False,
     gold_answer:           str          = "",
     oracle_no_second_rerank: bool       = False,
-    evidence_with_attr:    bool         = False,
-    retrieval_static_alpha: float       = 1.0,
     per_chunk_keyframe_cap: int         = 1,
     pass_verifier_judgment_to_answerer: bool = False,
     loose_verifier:        bool         = False,
     dialogue_first:        bool         = False,
     asr_alpha:             float        = 0.0,
+    text_first_keyframes:  bool         = False,
+    image_placement:       str          = "images_first",
+    multi_layer_mode:      str          = "none",
 ) -> dict:
     """Iter-0 sub-question decomposition + iter ≥1 unified-planner repair.
 
@@ -326,6 +543,10 @@ def run_veil(
     plan_history:       List[List[str]]   = [[question]]  # seed with original question for dedup
     iterations:         List[dict]        = []
     chunk_by_id = {c.chunk_id: c for c in bank.chunks}
+    # For multi-pool mode: include L2 chunks so keyframe lookup doesn't skip them
+    # (L2 chunks have no frames, so they'll naturally produce no keyframes)
+    if multi_layer_mode == "multi_pool":
+        chunk_by_id.update({c.chunk_id: c for c in bank.l2_chunks})
 
     # Pruning distractors requires distractor_ids from the verifier.
     # verifier_opstatus already outputs distractor_ids; only fall back to explicit_attribution otherwise.
@@ -356,10 +577,13 @@ def run_veil(
         # ── Plan (iter ≥ 1): generate new queries from last verdict + history ─
         if it > 0:
             verdict_for_planning = {} if ignore_verifier_signal else last_verdict
+            planner_ctx = (_get_l3_context(question, bank, embedder)
+                           if multi_layer_mode == "planner_ctx" else "")
             next_plan, m_desc, _weak = planner.plan_next(
                 question, candidates, all_evidence_texts, verdict_for_planning, plan_history,
                 rubric_judgment=rubric_judgment,
                 prune_satisfied=prune_satisfied,
+                global_context=planner_ctx,
             )
             next_plan = planner.filter_targeted_queries(
                 next_plan, plan_history, embedder, all_ev_vecs,
@@ -378,22 +602,33 @@ def run_veil(
         if do_broadcast:
             new_texts, new_ids, new_vecs = _broadcast_retrieve(
                 bank, seen_ids, n=final_top_k,
-                evidence_with_attr=evidence_with_attr,
                 dialogue_first=dialogue_first,
             )
             iter_query = "[broadcast]"
         else:
             for q in queries_this_iter:
                 vq = vis_query if it == 0 else q
-                t, i, v = _query_retrieve(
-                    q, bank, embedder, reranker,
-                    coarse_top_k, final_top_k, seen_ids,
-                    siglip=siglip, text_alpha=text_alpha, vis_query=vq,
-                    evidence_with_attr=evidence_with_attr,
-                    retrieval_static_alpha=retrieval_static_alpha,
-                    dialogue_first=dialogue_first,
-                    asr_alpha=asr_alpha,
-                )
+                if multi_layer_mode == "coarse_to_fine":
+                    t, i, v = _coarse_to_fine_retrieve(
+                        q, bank, embedder, reranker,
+                        coarse_top_k, final_top_k, seen_ids,
+                        siglip=siglip, text_alpha=text_alpha, vis_query=vq,
+                        dialogue_first=dialogue_first, asr_alpha=asr_alpha,
+                    )
+                elif multi_layer_mode == "multi_pool":
+                    t, i, v = _multi_pool_retrieve(
+                        q, bank, embedder, reranker,
+                        coarse_top_k, final_top_k, seen_ids,
+                        dialogue_first=dialogue_first,
+                    )
+                else:
+                    t, i, v = _query_retrieve(
+                        q, bank, embedder, reranker,
+                        coarse_top_k, final_top_k, seen_ids,
+                        siglip=siglip, text_alpha=text_alpha, vis_query=vq,
+                        dialogue_first=dialogue_first,
+                        asr_alpha=asr_alpha,
+                    )
                 new_texts.extend(t); new_ids.extend(i); new_vecs.extend(v)
                 seen_ids.update(i)
             iter_query = (" | ".join(queries_this_iter) if len(queries_this_iter) > 1
@@ -420,7 +655,7 @@ def run_veil(
                     if float(np.max(np.array(all_kf_vecs, dtype=np.float32) @ v)) >= kf_dedup_threshold:
                         continue
                 paths = keyframe_paths(keyframe_dir, bank.video_id, c.chunk_id,
-                                       cap=per_chunk_keyframe_cap)
+                                       cap=per_chunk_keyframe_cap, chunk=c)
                 added = False
                 for p in paths:
                     img = load_keyframe_pil(p)
@@ -556,7 +791,19 @@ def run_veil(
             ev_texts = [ev_texts[i] for i in order]
             ev_ids   = [ev_ids[i]   for i in order]
 
-        kf_for_answer = all_keyframes
+        kf_for_answer        = all_keyframes
+        kf_chunk_ids_for_ans = all_kf_chunk_ids
+        text_first_status    = None
+        text_first_kept_cids = None
+        if text_first_keyframes and kf_for_answer:
+            needed_cids, status = _text_first_select_visuals(
+                question, candidates, ev_texts, ev_ids, llm)
+            text_first_status    = status
+            text_first_kept_cids = sorted(needed_cids) if status == "ok" else None
+            if status == "ok":
+                keep_idx = [i for i, cid in enumerate(kf_chunk_ids_for_ans)
+                            if cid in needed_cids]
+                kf_for_answer = [kf_for_answer[i] for i in keep_idx]
         if answer_keyframe_cap is not None and len(kf_for_answer) > answer_keyframe_cap:
             kf_for_answer = kf_for_answer[:answer_keyframe_cap]
 
@@ -568,10 +815,16 @@ def run_veil(
 
         result = answerer.answer(question, candidates, ev_texts,
                                  keyframe_images=kf_for_answer,
+                                 keyframe_chunk_ids=kf_chunk_ids_for_ans,
+                                 evidence_chunk_ids=ev_ids,
+                                 image_placement=image_placement,
                                  verifier_option_judgment=verifier_hint_oj,
                                  verifier_option_scores=verifier_hint_scores)
         result["n_keyframes_to_answer"] = len(kf_for_answer)
         result["n_evidence_to_answer"]  = len(ev_texts)
+        if text_first_status is not None:
+            result["text_first_status"]    = text_first_status
+            result["text_first_kept_cids"] = text_first_kept_cids
     result["evidence_chunk_ids"] = ev_ids
     result["evidence_texts"]     = ev_texts
     result["trace_iters"]        = iterations

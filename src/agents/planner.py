@@ -123,6 +123,7 @@ def _plan_next(
     unknown_options: Optional[List[str]] = None,
     weak_rubric_criteria: Optional[dict] = None,
     prune_satisfied: bool = False,
+    global_context: str = "",
 ) -> dict:
     """Unified planner for iter ≥1: pick {targeted (n queries), broadcast}.
 
@@ -136,7 +137,10 @@ def _plan_next(
         opts_lines.append(f"  ({letter}) {c}{tag}")
     opts = "\n".join(opts_lines)
 
-    parts = [f"Question: {question}", f"Options:\n{opts}"]
+    parts = []
+    if global_context:
+        parts.append(f"[Video Context — coarse overview to guide query generation]\n{global_context}")
+    parts += [f"Question: {question}", f"Options:\n{opts}"]
     if unknown_options:
         parts.append(f"Current unresolved options: {unknown_options}.")
     if weak_rubric_criteria:
@@ -290,10 +294,12 @@ class Planner:
         *,
         rubric_judgment: bool = True,
         prune_satisfied: bool = False,
+        global_context: str = "",
     ) -> Tuple[dict, str, Optional[List[str]]]:
         """Pick the next iter plan from the verifier verdict.
 
         Returns (plan, missing_description, weak_rubric_criteria).
+        global_context: optional coarse video overview (e.g. top-2 L3 summaries) prepended to prompt.
         """
         m_desc, weak = _planner_repair_context(verdict, rubric_judgment)
 
@@ -303,6 +309,7 @@ class Planner:
             unknown_options=unk_opts,
             weak_rubric_criteria=weak if rubric_judgment else None,
             prune_satisfied=prune_satisfied,
+            global_context=global_context,
         )
         return plan, m_desc, weak
 

@@ -1,11 +1,15 @@
-"""VEIL-27B — iterative evidence retrieval with rubric judgment + rubric rerank.
+"""VEIL-27B WITHOUT RUBRIC — evidence sufficiency judgment w/o rubric scoring.
+
+Ablation: rubric_judgment=False
+- Verifier judges evidence sufficiency without rubric criteria
+- Falls back to holistic missing evidence analysis text
 
 Answerer / Planner / Verifier all use Qwen3.5-27B via --vlm-api-url / --llm-api-url.
 
 Usage:
     cd /home2/ycj/Project/VEIL
-    PYTHONPATH=. python experiments/veil_27b.py \\
-        --config configs/mlvu_memory_bank.yaml \\
+    PYTHONPATH=. python experiments/veil_27b_no_rubric_judge.py \\
+        --config configs/videomme_memory_bank.yaml \\
         --vlm-api-url http://localhost:8000 \\
         --llm-api-url http://localhost:8001 \\
         --bge-gpu cuda:3
@@ -20,13 +24,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.config import load_config
 from src.utils.logging import get_logger
 from experiments.core.veil import run_veil
 
-PIPELINE_NAME = "veil_27b"
+PIPELINE_NAME = "veil_27b_no_rubric_judge"
 
 log = get_logger(PIPELINE_NAME)
 
@@ -72,8 +76,6 @@ def main():
     ap.add_argument("--llm-gpu",        default="cuda:1")
     ap.add_argument("--siglip-gpu",     default=None,
                     help="GPU for SigLIP visual scoring; defaults to --bge-gpu")
-    ap.add_argument("--embed-api-url",  default=None,
-                    help="Embedding service URL (BGE+SigLIP); skips loading locally")
     ap.add_argument("--no-siglip",      action="store_true",
                     help="Disable SigLIP dual-path fusion")
     ap.add_argument("--no-keyframes",   action="store_true",
@@ -101,51 +103,22 @@ def main():
                     help="Override frame_sampling.max_frames from config")
     ap.add_argument("--workers",             type=int, default=1,
                     help="Parallel workers (safe with API-mode LLM)")
-    ap.add_argument("--pipeline-name",       default=None,
-                    help="Override PIPELINE_NAME (= output jsonl filename stem)")
-    ap.add_argument("--use-attr-evidence",   action="store_true",
-                    help="Append static_index_text to each chunk's evidence string")
-    ap.add_argument("--use-attr-retrieval",  action="store_true",
-                    help="Blend v_static into BGE scoring (α=0.5)")
-    ap.add_argument("--use-attr-verifier",   action="store_true",
-                    help="Pass verifier_attr=True so verifier sees the attribute layer")
-    ap.add_argument("--per-chunk-keyframe-cap", type=int, default=1,
-                    help="Max keyframes per chunk fed to VLM (1=current behaviour)")
-    ap.add_argument("--single-query-iter0",  action="store_true",
-                    help="At iter 0, use the original question as a single query "
-                         "instead of LLM-decomposing into per-option sub-queries")
-    ap.add_argument("--pass-verifier-judgment", action="store_true",
-                    help="Pass verifier's last option_judgment+scores into the final answerer prompt")
-    ap.add_argument("--loose-verifier", action="store_true",
-                    help="Use VERIFIER_SYS_LOOSE that accepts indirect/synthesized evidence")
-    ap.add_argument("--dialogue-first", action="store_true",
-                    help="Reformat evidence_texts to put ASR/Speech first with [DIALOGUE] tag")
-    ap.add_argument("--asr-alpha", type=float, default=0.0,
-                    help="Blend an ASR-only BGE channel into retrieval scoring (0=off, 0.4=balanced)")
     args = ap.parse_args()
-    global PIPELINE_NAME
-    if args.pipeline_name:
-        PIPELINE_NAME = args.pipeline_name
 
     cfg      = load_config(args.config)
     bench    = cfg["benchmark"]["name"]
     out_root = Path(cfg.get("paths", {}).get("outputs_root", "outputs"))
 
     _vl = cfg.get("veil_loop", {})
-    veil_max_iter   = int(_vl.get("max_iter", 3))
-    q_hist_dedup    = float(_vl.get("query_history_dedup_threshold", 0.9))
-    ev_dedup        = float(_vl.get("evidence_dedup_threshold", 0.9))
-    q_ev_dedup      = float(_vl.get("query_evidence_dedup_threshold", 0.9))
-    kf_dedup_thresh = float(_vl.get("kf_dedup_threshold", 0.9))
+    veil_max_iter = int(_vl.get("max_iter", 3))
 
     memory_dir = Path(args.memory_dir) if args.memory_dir else \
-                 out_root / "memory" / f"{bench}_L_27B"
+                 out_root / "memory" / f"{bench}_L_27b_27b"
     default_out_dir = Path(cfg.get("eval", {}).get("output_dir") or (out_root / "results" / bench))
     out_path = Path(args.out) if args.out else \
-               default_out_dir / "veil_27b.jsonl"
+               default_out_dir / "veil_27b_no_rubric_judge.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Filter video ids
     filter_vids: set | None = None
     if args.filter_from:
         filter_vids = set()
@@ -162,7 +135,6 @@ def main():
     log.info("loaded %d samples (%d videos)", len(samples),
              len({s.video_id for s in samples}))
 
-    # Resume
     done_keys: set[str] = set()
     if out_path.exists():
         for line in out_path.open():
@@ -170,7 +142,6 @@ def main():
             except: pass
     log.info("already done: %d records", len(done_keys))
 
-    # ── Model loading ──────────────────────────────────────────────────────────
     needs_siglip  = not args.no_siglip
     siglip_device = (args.siglip_gpu if args.siglip_gpu is not None else args.bge_gpu) if needs_siglip else None
 
@@ -191,18 +162,14 @@ def main():
     log.info("  VLM ready")
 
     from src.clients.embedder import BGEM3Embedder
-    if args.embed_api_url:
-        log.info("loading BGE-M3 via API %s ...", args.embed_api_url)
-        embedder = BGEM3Embedder(api_url=args.embed_api_url)
-    else:
-        log.info("loading BGE-M3 on %s ...", args.bge_gpu)
-        t0 = time.time()
-        embedder = BGEM3Embedder(
-            model_path=cfg["models"]["embedder"]["model_path"],
-            use_fp16=cfg["models"]["embedder"].get("use_fp16", True),
-            device=args.bge_gpu,
-        )
-        log.info("  BGE-M3 ready (%.1fs)", time.time() - t0)
+    log.info("loading BGE-M3 on %s ...", args.bge_gpu)
+    t0 = time.time()
+    embedder = BGEM3Embedder(
+        model_path=cfg["models"]["embedder"]["model_path"],
+        use_fp16=cfg["models"]["embedder"].get("use_fp16", True),
+        device=args.bge_gpu,
+    )
+    log.info("  BGE-M3 ready (%.1fs)", time.time() - t0)
 
     from src.clients.llm_client import LLMClient
     if args.llm_api_url:
@@ -224,19 +191,14 @@ def main():
         )
         log.info("  LLM ready (%.1fs)", time.time() - t0)
 
-    if needs_siglip:
+    if needs_siglip and siglip_device:
         from src.clients.siglip_embedder import SigLIPEmbedder
-        if args.embed_api_url:
-            log.info("loading SigLIP via API %s ...", args.embed_api_url)
-            siglip = SigLIPEmbedder(api_url=args.embed_api_url)
-        elif siglip_device:
-            siglip_model = "/home2/ycj/Models/google/siglip-large-patch16-384"
-            log.info("loading SigLIP on %s ...", siglip_device)
-            t0 = time.time()
-            siglip = SigLIPEmbedder(model_path=siglip_model, device=siglip_device)
-            log.info("  SigLIP ready (%.1fs)", time.time() - t0)
+        siglip_model = "/home2/ycj/Models/google/siglip-large-patch16-384"
+        log.info("loading SigLIP on %s ...", siglip_device)
+        t0 = time.time()
+        siglip = SigLIPEmbedder(model_path=siglip_model, device=siglip_device)
+        log.info("  SigLIP ready (%.1fs)", time.time() - t0)
 
-    # ── Thread safety (GPU models are not thread-safe) ────────────────────────
     _gpu_lock = threading.Lock()
 
     class _LockedModel:
@@ -254,7 +216,6 @@ def main():
     if embedder: embedder = _LockedModel(embedder)
     if siglip:   siglip   = _LockedModel(siglip)
 
-    # ── Bank cache ────────────────────────────────────────────────────────────
     _bank_cache:  dict = {}
     _cache_lock = threading.Lock()
 
@@ -275,7 +236,7 @@ def main():
 
     aek    = args.answer_evidence_k
     vek    = args.verifier_evidence_k
-    akk    = None if args.answer_keyframe_k is not None and args.answer_keyframe_k < 0 else args.answer_keyframe_k
+    akk    = args.answer_keyframe_k
     kf_dir = None if args.no_keyframes else memory_dir
 
     def run_sample(s):
@@ -285,29 +246,19 @@ def main():
         kw = dict(
             reranker=None, coarse_top_k=8, final_top_k=8,
             max_iter=veil_max_iter,
-            query_history_dedup_threshold=q_hist_dedup,
-            evidence_dedup_threshold=ev_dedup,
-            query_evidence_dedup_threshold=q_ev_dedup,
-            kf_dedup_threshold=kf_dedup_thresh,
+            query_history_dedup_threshold=0.9,      # default
+            evidence_dedup_threshold=0.90,           # default
+            query_evidence_dedup_threshold=0.70,    # default
             siglip=siglip, text_alpha=args.text_alpha, keyframe_dir=kf_dir,
             answer_evidence_cap=aek,
             answer_keyframe_cap=akk,
             verifier_evidence_cap=vek,
             rubric_rerank=True,
-            evidence_with_attr=args.use_attr_evidence,
-            retrieval_static_alpha=0.5 if args.use_attr_retrieval else 1.0,
-            verifier_attr=args.use_attr_verifier,
-            per_chunk_keyframe_cap=args.per_chunk_keyframe_cap,
-            single_query_iter0=args.single_query_iter0,
-            pass_verifier_judgment_to_answerer=args.pass_verifier_judgment,
-            loose_verifier=args.loose_verifier,
-            dialogue_first=args.dialogue_first,
-            asr_alpha=args.asr_alpha,
+            rubric_judgment=False,  # ABLATION: disable rubric scoring
         )
         return run_veil(s.question, s.candidates, bank, embedder, answerer, llm,
                         task_type=s.question_type, **kw), None
 
-    # ── Run loop ──────────────────────────────────────────────────────────────
     out_fh      = out_path.open("a")
     _write_lock = threading.Lock()
     _stats_lock = threading.Lock()
@@ -357,8 +308,6 @@ def main():
             "pred_text":        pred_text,
             "correct":          correct,
             "evidence_chunk_ids": (result or {}).get("evidence_chunk_ids", []),
-            "n_keyframes_to_answer": (result or {}).get("n_keyframes_to_answer"),
-            "n_evidence_to_answer":  (result or {}).get("n_evidence_to_answer"),
             "trace_iters":      trace,
             "elapsed":          round(elapsed, 2),
             "error":            err,
@@ -388,7 +337,6 @@ def main():
 
     out_fh.close()
 
-    # ── Report ────────────────────────────────────────────────────────────────
     print("\n=== Accuracy ===")
     qtypes = sorted(correct_by)
     print(f"{'Pipeline':<20}" + "".join(f"{qt[:8]:>10}" for qt in qtypes) + f"{'Overall':>10}")
