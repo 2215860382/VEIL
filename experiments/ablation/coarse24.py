@@ -85,7 +85,7 @@ def main():
     ap.add_argument("--vlm-api-url",    default=None,
                     help="vLLM API base URL")
     ap.add_argument("--vlm-api-model",  default=None)
-    ap.add_argument("--answer-keyframe-k",   type=int, default=16,
+    ap.add_argument("--answer-keyframe-k",   type=int, default=32,
                     help="Cap keyframe images passed to the final answerer")
     ap.add_argument("--max-frames",          type=int, default=None,
                     help="Override frame_sampling.max_frames from config")

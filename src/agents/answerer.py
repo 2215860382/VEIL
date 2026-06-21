@@ -25,13 +25,17 @@ _PROMPT = (
     "Answer with a single letter (A/B/C/D) only, no explanation:"
 )
 
-_PROMPT_HEADER = (
+_QF_HEADER = (
     "You are answering a multiple-choice question about a long video.\n"
-    "Below are {n} relevant video segments retrieved from the video.\n\n"
+    "Question: {question}\n"
+    "Choices: {choices}\n\n"
+    "Inspect the {n_kf} keyframes and {n_seg} retrieved segments below, "
+    "then choose A/B/C/D.\n"
 )
 
-_PROMPT_FOOTER = (
-    "\n{hint}"
+_QF_TAIL = (
+    "{hint}"
+    "{evidence}\n\n"
     "Question: {question}\n"
     "Choices: {choices}\n"
     "Answer with a single letter (A/B/C/D) only, no explanation:"
@@ -60,76 +64,14 @@ def _img_block(img) -> dict:
     return {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_pil_to_b64(img)}"}}
 
 
-def _build_content(
-    prompt: str,
-    frames: list,
-    image_placement: str,
-    evidence_texts: List[str],
-    ev_chunk_ids: Sequence,
-    kf_chunk_ids: Sequence,
-) -> list:
-    """Build the OpenAI-style content list for the given image_placement strategy."""
-    if image_placement == "text_first":
-        content = [{"type": "text", "text": prompt}]
-        content += [_img_block(img) for img in frames]
-        return content
-
-    if image_placement == "interleaved" and ev_chunk_ids and kf_chunk_ids:
-        # Build a map: chunk_id → list of images (in order)
-        cid_to_imgs: dict = {}
-        for img, cid in zip(frames, kf_chunk_ids):
-            cid_to_imgs.setdefault(cid, []).append(img)
-
-        n = len(evidence_texts)
-        header = _PROMPT_HEADER.format(n=n)
-        footer = _PROMPT_FOOTER  # filled by caller via prompt suffix
-
-        # Extract footer from the full prompt (everything after the last segment)
-        # The footer is: hint + Question + Choices + Answer instruction
-        # We rebuild it separately from the header + evidence body.
-        # For simplicity: split prompt at the evidence block boundary.
-        # Since we have evidence_texts, we can reconstruct header and footer directly.
-        # (prompt already has the full text; we re-derive the footer from it.)
-        # Simpler: just use the pre-built prompt but split at each "--- Segment" boundary.
-        # Actually cleanest: re-derive content from scratch without relying on full prompt.
-
-        # Re-derive hint+question+choices from the full prompt by stripping the evidence section.
-        # The evidence section is everything between header and "\n\nQuestion:" (or hint).
-        # Instead, pass them as already-rendered strings and reconstruct.
-        # We already have `prompt` which is the full assembled text.
-        # Split: header part | segments | footer part
-        # Since prompt = header + evidence_block + "\n\n" + hint + question..., we know:
-        #   - header ends after "...from the video.\n\n"
-        #   - footer starts at "\n\n" + hint (or "Question:" if no hint)
-        # Easiest: find where evidence ends.
-        last_seg_marker = f"--- Segment {n} ---\n" if n else ""
-        if last_seg_marker and last_seg_marker in prompt:
-            after_last = prompt.split(last_seg_marker, 1)[1]
-            # after_last = "<last segment text>\n\n<footer>"
-            # find the double-newline that separates last segment text from footer
-            sep = "\n\n"
-            sep_idx = after_last.find(sep)
-            if sep_idx >= 0:
-                footer_text = after_last[sep_idx + len(sep):]
-            else:
-                footer_text = after_last
-        else:
-            # Fallback: no segments, put full prompt as footer
-            footer_text = prompt
-
-        content = [{"type": "text", "text": header}]
-        for i, (txt, cid) in enumerate(zip(evidence_texts, ev_chunk_ids)):
-            seg_text = f"--- Segment {i+1} ---\n{txt}"
-            content.append({"type": "text", "text": seg_text})
-            for img in cid_to_imgs.get(cid, []):
-                content.append(_img_block(img))
-        content.append({"type": "text", "text": "\n" + footer_text})
-        return content
-
-    # images_first (default / fallback)
-    content = [_img_block(img) for img in frames]
-    content.append({"type": "text", "text": prompt})
-    return content
+def _image_label(ts: float | None, seg_idx: int | None) -> str:
+    """Short text block to prepend before an image when --image-timestamps is on."""
+    parts = []
+    if ts is not None:
+        parts.append(f"at {ts:.0f}s")
+    if seg_idx is not None and seg_idx > 0:
+        parts.append(f"Segment {seg_idx}")
+    return f"[Frame {' — '.join(parts)}]" if parts else "[Frame]"
 
 
 class Answerer:
@@ -143,8 +85,10 @@ class Answerer:
         evidence_texts: List[str],
         keyframe_images=(),
         keyframe_chunk_ids=(),
+        keyframe_ts: Sequence[float] = (),
         evidence_chunk_ids=(),
-        image_placement: str = "images_first",
+        image_timestamps: bool = False,
+        question_first: bool = False,
         max_evidence_chars: int = 80000,
         focused_texts: List[str] = (),
         verifier_option_judgment: dict | None = None,
@@ -159,32 +103,70 @@ class Answerer:
         evidence = _format_evidence(list(focused_texts) + list(evidence_texts))
         choices  = _format_options(candidates)
         hint     = _format_verifier_hint(verifier_option_judgment or {}, verifier_option_scores)
-        prompt   = _PROMPT.format(
-            n=len(focused_texts) + len(evidence_texts),
-            evidence=evidence,
-            hint=hint,
-            question=question,
-            choices=choices,
-        )
-        frames = [img for img in keyframe_images if img is not None]
+        n_seg    = len(focused_texts) + len(evidence_texts)
 
-        if image_placement != "images_first" and frames and hasattr(self.model, "chat_with_content"):
-            # Combine focused_texts + evidence_texts for interleaved alignment.
-            # focused_texts don't have chunk IDs; prepend them without images.
-            all_ev_texts = list(focused_texts) + list(evidence_texts)
-            # chunk IDs only for the evidence_texts portion; focused_texts get sentinel -1
-            all_ev_cids = [-1] * len(focused_texts) + list(evidence_chunk_ids)
-            content = _build_content(
-                prompt=prompt,
-                frames=frames,
-                image_placement=image_placement,
-                evidence_texts=all_ev_texts,
-                ev_chunk_ids=all_ev_cids,
-                kf_chunk_ids=keyframe_chunk_ids,
+        # Filter to non-null frames, aligning ts and cid lists by position.
+        frames = []
+        ts_list: List[float | None] = []
+        cid_list: List[int] = []
+        kf_ts_seq = list(keyframe_ts)
+        kf_cid_seq = list(keyframe_chunk_ids)
+        for i, img in enumerate(keyframe_images):
+            if img is None:
+                continue
+            frames.append(img)
+            ts_list.append(kf_ts_seq[i] if i < len(kf_ts_seq) else None)
+            cid_list.append(kf_cid_seq[i] if i < len(kf_cid_seq) else -1)
+
+        # chunk_id → 1-based segment index (for image labels)
+        seg_idx_for_cid = {int(cid): i + 1 for i, cid in enumerate(evidence_chunk_ids)}
+
+        # ── Default path: no flags → original chat_with_frames behaviour ─────
+        if not image_timestamps and not question_first:
+            prompt = _PROMPT.format(
+                n=n_seg, evidence=evidence, hint=hint,
+                question=question, choices=choices,
             )
-            raw = self.model.chat_with_content(content, max_new_tokens=16, enable_thinking=False)
+            raw = self.model.chat_with_frames(
+                frames, prompt, max_new_tokens=16, enable_thinking=False
+            )
         else:
-            raw = self.model.chat_with_frames(frames, prompt, max_new_tokens=16, enable_thinking=False)
+            content: list = []
+            if question_first:
+                content.append({
+                    "type": "text",
+                    "text": _QF_HEADER.format(
+                        question=question, choices=choices,
+                        n_kf=len(frames), n_seg=n_seg,
+                    ),
+                })
+            # Images, optionally each preceded by a [Frame at Xs — Segment N] label.
+            if image_timestamps:
+                for img, ts, cid in zip(frames, ts_list, cid_list):
+                    label = _image_label(ts, seg_idx_for_cid.get(int(cid)))
+                    content.append({"type": "text", "text": label})
+                    content.append(_img_block(img))
+            else:
+                for img in frames:
+                    content.append(_img_block(img))
+            # Evidence + question/answer instructions.
+            if question_first:
+                content.append({
+                    "type": "text",
+                    "text": _QF_TAIL.format(
+                        hint=hint, evidence=evidence,
+                        question=question, choices=choices,
+                    ),
+                })
+            else:
+                prompt = _PROMPT.format(
+                    n=n_seg, evidence=evidence, hint=hint,
+                    question=question, choices=choices,
+                )
+                content.append({"type": "text", "text": prompt})
+            raw = self.model.chat_with_content(
+                content, max_new_tokens=16, enable_thinking=False
+            )
 
         m = re.search(r"\b([A-D])\b", raw)
         letter = m.group(1) if m else ""

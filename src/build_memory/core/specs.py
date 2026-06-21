@@ -66,8 +66,8 @@ def embedder_bge_m3(device: str = "cuda:0") -> dict[str, Any]:
         "model_path": "/home2/ycj/Models/BAAI/bge-m3",
         "use_fp16": True,
         "device": device,
-        "batch_size": 32,
-        "max_length": 512,
+        "batch_size": 16,
+        "max_length": 4096,
     }
 
 

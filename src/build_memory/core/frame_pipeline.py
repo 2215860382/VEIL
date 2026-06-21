@@ -1,30 +1,34 @@
 """Shared frame pipeline: extract → drop blank → drop blurry → SigLIP group →
-per-chunk dHash dedup → persist to ``{out_dir}/frames/{cid:04d}_{i}.jpg``.
+persist all post-cleanup frames + one keyframe per chunk (Binlu-aligned).
+
+Output directories under each ``{out_dir}/``:
+* ``frames_raw/{cid:04d}/{i:04d}.jpg`` — every post-cleanup frame for the chunk
+  (used as narrative VLM input). Always at original resolution.
+* ``keyframes_origin/{cid:04d}_0.jpg`` — exactly one keyframe per chunk at
+  original resolution (canonical).
+* ``keyframes_resized/{cid:04d}_0.jpg`` — same file, resized so longer
+  side ≤ ``frame_max_dim`` (eval-time VLM input cost control).
 
 Exposes both the full pipeline (``clean_and_group_frames`` — used by
 ``build_single_similarity.py`` for similarity-grouped single-granularity banks)
 and the raw building blocks (``extract_frames``, ``group_frames``,
 ``select_sharpest`` — used by ``build_multi_pyramid.py`` for fixed-time pyramid
-banks which slice frames into hard time windows and reuse only the SigLIP-based
-dedup step). Downstream code (``experiments/core/_keyframes.py``) reads the
-persisted frames via ``glob("frames/{cid:04d}_*.jpg")``.
+banks).  Downstream code (``experiments/core/_keyframes.py``) reads
+keyframes via ``glob("{keyframes_origin|keyframes_resized}/{cid:04d}_*.jpg")``.
 
-Decisions:
-* Dedup is per-chunk (post-grouping), not global — recurring shots across time
-  windows (e.g. anchor / speaker cut-back) must keep their occurrences.
-* Two dedup gates inside each chunk, in order:
-    1. dHash Hamming ≤ 4 (pixel-level near-identical)
-    2. SigLIP cosine ≥ 0.95 (semantic-level near-identical, catches the
-       low-texture cases dHash sees through — e.g. white-background scenes
-       where the subject moves but the bulk of the 8×8 thumbnail is white)
-  Same two-gate combo the legacy attribute build used, matching the old bank's
-  mean ≈ 3–4 frames per chunk.
-* No hard cap on frames per chunk — if all the frames are genuinely distinct
-  (above both thresholds), they all survive. The thresholds decide what is
-  "different", not an arbitrary count.
-* Blank detection by file size (≥1000B = ok), same threshold the legacy
-  attribute build used; cheap, no decoding.
-* Blur detection: ``cv2.Laplacian(gray).var() < blur_threshold``.
+Decisions (Binlu-aligned, see Binlu/videolens/build/build_index_multiscale.py
+:_pick_keyframe_idx):
+* No dedup. Pre-dedup (dHash window=10 before SigLIP) and per-chunk dHash+SigLIP
+  dedup both removed — recurring shots and near-identical frames all kept,
+  matching Binlu's "every 1fps frame survives" policy.
+* One keyframe per chunk: the group center frame, unless its Laplacian
+  variance is below ``KEYFRAME_LAPLACIAN_THRESH`` (=100) in which case the
+  sharpest frame in the chunk is used instead. No top-k retention.
+* Blank detection by file size (≥3000B = ok) + pixel mean/std check (catches
+  near-uniform white/black fades that the size pre-filter misses); cheap.
+* Blur detection: ``cv2.Laplacian(gray).var() < blur_threshold``, with a
+  fail-safe that disables the filter when it would drop the majority of frames
+  (low-texture content like PPT slides or anime).
 """
 from __future__ import annotations
 
@@ -58,9 +62,14 @@ BLUR_FAILSAFE_RATIO      = 0.5    # if blur filter would drop > this fraction of
                                   # → skip the blur pass entirely.
 DEFAULT_GROUP_THETA      = 0.80   # SigLIP cosine threshold for grouping
 DEFAULT_GROUP_N_MAX      = 30
-DEFAULT_DEDUP_HAMMING    = 4      # gate 1: pixel-level near-identical
-DEFAULT_DEDUP_SIGLIP_COS = 0.95   # gate 2: semantic-level near-identical
-DHASH_SIZE               = 8      # 8×8 difference hash → 64-bit string
+DEFAULT_DEDUP_HAMMING    = 4      # legacy; dedup is disabled in the current
+DEFAULT_DEDUP_SIGLIP_COS = 0.95   # pipeline (Binlu-aligned). Kept for callers
+DHASH_SIZE               = 8      # that re-enable dedup (e.g. multi-pyramid).
+KEYFRAME_LAPLACIAN_THRESH = 100.0 # Binlu build_index_multiscale.py default:
+                                  # center frame is used as the chunk's single
+                                  # keyframe unless its Laplacian variance is
+                                  # below this, in which case the sharpest
+                                  # frame in the chunk replaces it.
 
 
 # ── Output schemas ─────────────────────────────────────────────────────────────
@@ -96,7 +105,10 @@ class CleanedGroup:
     # All cleaned (post-blank, post-blur, pre-dedup) frames for this chunk.
     all_frame_paths: List[Path]        # persisted under out_dir/frames_raw/
     all_timestamps: List[float]
-    # Dedup-survived representative subset, persisted under out_dir/frames/.
+    # Dedup-survived representative subset.
+    # kept_frame_paths points to keyframes_origin/ (full res, canonical).
+    # A parallel resized copy exists under keyframes_resized/ with identical
+    # filenames; the loader picks subdir at eval time.
     kept_frame_paths: List[Path]
     kept_timestamps: List[float]
     kept_v_visual: np.ndarray          # (N_kept, D) SigLIP vecs for kept frames
@@ -106,11 +118,16 @@ class CleanedGroup:
 # ── Frame extraction (was similarity.extract_frames) ───────────────────────────
 
 def extract_frames(video_path: str, out_dir: Path, fps: float = DEFAULT_FPS) -> List[Path]:
-    """ffmpeg → frame_000001.jpg, frame_000002.jpg, … in out_dir."""
+    """ffmpeg → frame_000001.jpg, frame_000002.jpg, … in out_dir.
+
+    ``-q:v 2`` (≈ JPEG q95) matches Binlu extract_frames.py — keep narrative
+    frames near-lossless so the multi-image VLM call sees full detail before
+    the 448-side downscale at the API boundary.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg", "-i", str(video_path),
-        "-vf", f"fps={fps}", "-q:v", "3",
+        "-vf", f"fps={fps}", "-q:v", "2",
         str(out_dir / "frame_%06d.jpg"),
         "-hide_banner", "-loglevel", "error", "-y",
     ]
@@ -327,6 +344,21 @@ def group_frames(
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
+def _persist_frame(src: Path, dst: Path, max_dim: Optional[int]) -> None:
+    """Copy ``src`` JPEG to ``dst``. If ``max_dim`` is given, also resize so the
+    longer side is at most ``max_dim`` (preserving aspect ratio; LANCZOS + q=85).
+    """
+    if max_dim is None:
+        shutil.copyfile(src, dst)
+        return
+    from PIL import Image
+    img = Image.open(src)
+    if max(img.size) > max_dim:
+        img = img.copy()
+        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+    img.convert("RGB").save(dst, format="JPEG", quality=85)
+
+
 def clean_and_group_frames(
     video_path: str,
     out_dir: Path,
@@ -336,32 +368,37 @@ def clean_and_group_frames(
     blank_bytes_min: int = DEFAULT_BLANK_BYTES_MIN,
     theta: float = DEFAULT_GROUP_THETA,
     n_max: int = DEFAULT_GROUP_N_MAX,
-    dedup_hamming: int = DEFAULT_DEDUP_HAMMING,
-    dedup_siglip_cos: Optional[float] = DEFAULT_DEDUP_SIGLIP_COS,
+    frame_max_dim: Optional[int] = 448,
+    keyframe_laplacian_thresh: float = KEYFRAME_LAPLACIAN_THRESH,
 ) -> List[CleanedGroup]:
-    """Run the shared pre-build frame pipeline for one video.
+    """Run the shared pre-build frame pipeline for one video (Binlu-aligned).
 
     Steps:
-        1. ffmpeg extract at ``fps`` into a tempdir
-        2. drop blank frames (file-size threshold)
+        1. ffmpeg extract at ``fps`` into a tempdir (-q:v 2)
+        2. drop blank frames (file-size + pixel mean/std check)
         3. drop blurry frames (Laplacian variance) — fail-safe disables on
            low-texture clips that would lose the majority of frames
         4. SigLIP-encode survivors
         5. greedy grouping (``group_frames``)
         6. persist the full post-cleanup chunk to
-           ``{out_dir}/frames_raw/{cid:04d}/{i:04d}.jpg`` (used by the
-           narrative caption layer)
-        7. per-chunk dHash + SigLIP dedup → representative subset, persisted
-           to ``{out_dir}/frames/{cid:04d}_{i}.jpg`` (used by keyframe / visual
-           embedding / anything wanting a sparse set)
+           ``{out_dir}/frames_raw/{cid:04d}/{i:04d}.jpg`` (narrative VLM input)
+           — always at original resolution
+        7. pick a single keyframe per chunk: group center frame, unless its
+           Laplacian variance is below ``keyframe_laplacian_thresh`` in which
+           case the sharpest frame in the chunk replaces it. Persisted to
+           ``{out_dir}/keyframes_origin/{cid:04d}_0.jpg`` (full res) and
+           ``{out_dir}/keyframes_resized/{cid:04d}_0.jpg`` (≤ frame_max_dim).
+           ``frame_max_dim`` no longer affects ``frames_raw/``.
 
-    Returns one ``CleanedGroup`` per chunk; chunks whose dedup pass yields
-    zero survivors are dropped, and ``chunk_id`` is reassigned to stay
-    contiguous from 0.
+    Returns one ``CleanedGroup`` per chunk; chunks with zero post-cleanup
+    frames are dropped, and ``chunk_id`` is reassigned to stay contiguous
+    from 0.
     """
-    out_frames_dir = out_dir / "frames"
-    out_raw_dir = out_dir / "frames_raw"
-    out_frames_dir.mkdir(parents=True, exist_ok=True)
+    out_kf_origin  = out_dir / "keyframes_origin"
+    out_kf_resized = out_dir / "keyframes_resized"
+    out_raw_dir    = out_dir / "frames_raw"
+    out_kf_origin.mkdir(parents=True, exist_ok=True)
+    out_kf_resized.mkdir(parents=True, exist_ok=True)
     out_raw_dir.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="veil_frames_") as tmp:
@@ -398,15 +435,9 @@ def clean_and_group_frames(
         survived_paths = [p for _, p in survived]
         survived_timestamps = [idx / fps for idx, _ in survived]
 
-        # 4a. Pre-dedup: remove near-identical consecutive frames (dHash,
-        # window=10) before SigLIP encoding to avoid wasting GPU on static
-        # scenes.  Conservative threshold — same as per-chunk dedup — so only
-        # truly identical / near-identical frames are dropped.
-        prededup = _prededup_frames(survived_paths)
-        survived_paths      = [survived_paths[i]      for i in prededup]
-        survived_timestamps = [survived_timestamps[i] for i in prededup]
-
-        # 4. SigLIP encode (only on survivors — saves GPU)
+        # 4. SigLIP encode (Binlu-aligned: no pre-dedup; all post-cleanup
+        #    frames go to the encoder so the chunk grouping sees the full
+        #    sequence and recurring shots are not silently merged).
         v_frames = siglip.encode_images([str(p) for p in survived_paths])
 
         # 5. Group
@@ -417,57 +448,57 @@ def clean_and_group_frames(
             n_max=n_max,
         )
 
-        # 6–7. Persist both the full cleaned chunk (frames_raw/) and the dedup
-        # representative subset (frames/), with contiguous chunk_id reassignment.
+        # 6–7. Persist the full cleaned chunk (frames_raw/) and one keyframe
+        # per chunk (keyframes_origin / keyframes_resized), with contiguous
+        # chunk_id reassignment. No per-chunk dedup, no top-k cap.
         cleaned: List[CleanedGroup] = []
         next_cid = 0
         for g in groups:
             group_paths = [survived_paths[i] for i in g.frame_indices]
             group_ts    = [survived_timestamps[i] for i in g.frame_indices]
             group_vecs  = v_frames[g.frame_indices]
-            center_in_group = g.frame_indices.index(g.center_idx) \
-                if g.center_idx in g.frame_indices else len(group_paths) // 2
-
-            kept_local = _dedup_chunk(
-                group_paths, group_vecs,
-                hamming_threshold=dedup_hamming,
-                siglip_cos_threshold=dedup_siglip_cos,
-            )
-            if not kept_local:
+            if not group_paths:
                 continue
-
-            # Cap to top-2 sharpest frames; preserves temporal order.
-            if len(kept_local) > 2:
-                subset_paths = [group_paths[i] for i in kept_local]
-                top2 = select_top_k_sharpest(subset_paths, k=2)
-                kept_local = [kept_local[i] for i in top2]
 
             cid = next_cid
             next_cid += 1
 
             # Persist the full cleaned chunk to frames_raw/{cid:04d}/{i:04d}.jpg
+            # — always at original resolution (frame_max_dim is keyframe-only).
             raw_chunk_dir = out_raw_dir / f"{cid:04d}"
             raw_chunk_dir.mkdir(parents=True, exist_ok=True)
             all_paths_out: List[Path] = []
             for i, src in enumerate(group_paths):
                 dst = raw_chunk_dir / f"{i:04d}.jpg"
-                shutil.copyfile(src, dst)
+                _persist_frame(src, dst, None)
                 all_paths_out.append(dst)
 
-            # Persist the dedup representative subset to frames/{cid:04d}_{i}.jpg
-            kept_paths_out: List[Path] = []
-            kept_ts_out: List[float] = []
-            for i, local_i in enumerate(kept_local):
-                dst = out_frames_dir / f"{cid:04d}_{i}.jpg"
-                shutil.copyfile(group_paths[local_i], dst)
-                kept_paths_out.append(dst)
-                kept_ts_out.append(group_ts[local_i])
-            kept_vecs_out = group_vecs[kept_local]
+            # Pick ONE keyframe: chunk center, unless its Laplacian variance
+            # is below the threshold and there's more than one frame to choose
+            # from — then use the sharpest frame in the chunk
+            # (Binlu/videolens/build/build_index_multiscale.py:_pick_keyframe_idx).
+            center_local = len(group_paths) // 2
+            kf_local = center_local
+            if len(group_paths) > 1:
+                center_path = group_paths[center_local]
+                import cv2
+                cimg = cv2.imread(str(center_path), cv2.IMREAD_GRAYSCALE)
+                center_lap = float(cv2.Laplacian(cimg, cv2.CV_64F).var()) if cimg is not None else 0.0
+                if center_lap < keyframe_laplacian_thresh:
+                    kf_local = select_sharpest(
+                        [str(p) for p in group_paths],
+                        list(range(len(group_paths))),
+                    )
 
-            # Pick the sharpest kept frame as the visual representative.
-            center_kept = select_sharpest(
-                [str(p) for p in kept_paths_out], list(range(len(kept_paths_out)))
-            )
+            # Persist the single keyframe under both subdirs (full res + resized).
+            name = f"{cid:04d}_0.jpg"
+            dst_origin  = out_kf_origin  / name
+            dst_resized = out_kf_resized / name
+            _persist_frame(group_paths[kf_local], dst_origin,  None)
+            _persist_frame(group_paths[kf_local], dst_resized, frame_max_dim)
+            kept_paths_out  = [dst_origin]
+            kept_ts_out     = [group_ts[kf_local]]
+            kept_vecs_out   = group_vecs[[kf_local]]
 
             cleaned.append(CleanedGroup(
                 chunk_id=cid,
@@ -478,7 +509,7 @@ def clean_and_group_frames(
                 kept_frame_paths=kept_paths_out,
                 kept_timestamps=kept_ts_out,
                 kept_v_visual=kept_vecs_out,
-                center_idx=center_kept,
+                center_idx=0,
             ))
 
         return cleaned

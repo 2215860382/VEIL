@@ -119,11 +119,21 @@ def main():
     ap.add_argument("--text-first-keyframes", action="store_true",
                     help="Two-stage answerer: LLM (text-only) picks which chunks need visual "
                          "confirmation; VLM gets keyframes only for those chunks")
-    ap.add_argument("--image-placement",
-                    choices=["images_first", "text_first", "interleaved"],
-                    default="images_first",
-                    help="Image placement in answerer prompt: images_first (default), "
-                         "text_first (all text then images), interleaved (text+image per segment)")
+    ap.add_argument("--image-timestamps", action="store_true",
+                    help="Prepend a [Frame at Xs — Segment N] text label before each keyframe "
+                         "image in the answerer prompt")
+    ap.add_argument("--no-question-first", action="store_false", dest="question_first",
+                    default=True,
+                    help="Disable question-first prompting (default: on). With question-first, "
+                         "the question + choices appear at the TOP of the answerer prompt "
+                         "before images and evidence, then repeat at the end")
+    ap.add_argument("--align-images-to-evidence", action="store_true",
+                    help="Reorder keyframes so they follow the rubric-reranked evidence order "
+                         "(image i sits alongside evidence segment i by chunk_id)")
+    ap.add_argument("--use-oracle", action="store_true",
+                    help="At each iter, also call answerer with gold_answer known; if "
+                         "oracle_pred == gold, freeze that result as final answer. "
+                         "Upper-bound estimate of system ceiling given current bank+retrieval.")
     ap.add_argument("--multi-layer-mode",
                     choices=["none", "coarse_to_fine", "multi_pool", "planner_ctx"],
                     default="none",
@@ -311,7 +321,11 @@ def main():
             dialogue_first=args.dialogue_first,
             asr_alpha=args.asr_alpha,
             text_first_keyframes=args.text_first_keyframes,
-            image_placement=args.image_placement,
+            image_timestamps=args.image_timestamps,
+            question_first=args.question_first,
+            align_images_to_evidence=args.align_images_to_evidence,
+            use_oracle=args.use_oracle,
+            gold_answer=s.answer if args.use_oracle else "",
             multi_layer_mode=args.multi_layer_mode,
         )
         return run_veil(s.question, s.candidates, bank, embedder, answerer, llm,

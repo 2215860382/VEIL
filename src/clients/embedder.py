@@ -12,8 +12,8 @@ class BGEM3Embedder:
         model_path: str = "",
         use_fp16: bool = True,
         device: str = "cuda:0",
-        batch_size: int = 32,
-        max_length: int = 512,
+        batch_size: int = 16,
+        max_length: int = 4096,
         api_url: str | None = None,
     ):
         self.batch_size = batch_size

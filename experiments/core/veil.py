@@ -503,6 +503,8 @@ def run_veil(
     single_query_iter0:    bool         = False,
     ignore_verifier_signal:    bool     = False,
     force_option_subquestions: bool     = False,
+    verifier_attr:         bool         = False,
+    verifier_opstatus:     bool         = False,
     rubric_rerank:         bool         = False,
     explicit_attribution:  bool         = False,
     prune_distractors:     bool         = False,
@@ -515,7 +517,9 @@ def run_veil(
     dialogue_first:        bool         = False,
     asr_alpha:             float        = 0.0,
     text_first_keyframes:  bool         = False,
-    image_placement:       str          = "images_first",
+    image_timestamps:      bool         = False,
+    question_first:        bool         = True,
+    align_images_to_evidence: bool      = False,
     multi_layer_mode:      str          = "none",
 ) -> dict:
     """Iter-0 sub-question decomposition + iter ≥1 unified-planner repair.
@@ -537,6 +541,7 @@ def run_veil(
     all_keyframes:      List              = []
     all_kf_vecs:        List[List[float]] = []
     all_kf_chunk_ids:   List[int]         = []
+    all_kf_ts:          List[float]       = []
     seen_ids:           Set[int]          = set()
     plan_history:       List[List[str]]   = [[question]]  # seed with original question for dedup
     iterations:         List[dict]        = []
@@ -546,8 +551,9 @@ def run_veil(
     if multi_layer_mode == "multi_pool":
         chunk_by_id.update({c.chunk_id: c for c in bank.l2_chunks})
 
-    # Pruning distractors requires distractor_ids; use explicit_attribution path.
-    if prune_distractors and not explicit_attribution:
+    # Pruning distractors requires distractor_ids from the verifier.
+    # verifier_opstatus already outputs distractor_ids; only fall back to explicit_attribution otherwise.
+    if prune_distractors and not explicit_attribution and not verifier_opstatus:
         explicit_attribution = True
 
     # ── Iter-0 plan: sub-question decomposition ──────────────────────────────
@@ -574,13 +580,10 @@ def run_veil(
         # ── Plan (iter ≥ 1): generate new queries from last verdict + history ─
         if it > 0:
             verdict_for_planning = {} if ignore_verifier_signal else last_verdict
-            planner_ctx = (_get_l3_context(question, bank, embedder)
-                           if multi_layer_mode == "planner_ctx" else "")
             next_plan, m_desc, _weak = planner.plan_next(
                 question, candidates, all_evidence_texts, verdict_for_planning, plan_history,
                 rubric_judgment=rubric_judgment,
                 prune_satisfied=prune_satisfied,
-                global_context=planner_ctx,
             )
             next_plan = planner.filter_targeted_queries(
                 next_plan, plan_history, embedder, all_ev_vecs,
@@ -660,6 +663,7 @@ def run_veil(
                         continue
                     all_keyframes.append(img)
                     all_kf_chunk_ids.append(cid)
+                    all_kf_ts.append(float(c.keyframe_ts or c.start_time or 0.0))
                     added = True
                 if added:
                     all_kf_vecs.append(c.v_visual if c.v_visual else [])
@@ -680,6 +684,8 @@ def run_veil(
                                   keyframe_images=kf_for_verifier,
                                   rubric_judgment=rubric_judgment,
                                   explicit_attribution=explicit_attribution,
+                                  verifier_attr=verifier_attr,
+                                  verifier_opstatus=verifier_opstatus,
                                   loose=loose_verifier)
 
         # ── Oracle check (post-verifier) ──────────────────────────────────────
@@ -745,6 +751,7 @@ def run_veil(
                     all_keyframes    = [all_keyframes[j]    for j in kf_keep]
                     all_kf_vecs      = [all_kf_vecs[j]      for j in kf_keep]
                     all_kf_chunk_ids = [all_kf_chunk_ids[j] for j in kf_keep]
+                    all_kf_ts        = [all_kf_ts[j]        for j in kf_keep]
 
         # ── Trace ────────────────────────────────────────────────────────────
         iterations.append({
@@ -788,6 +795,24 @@ def run_veil(
 
         kf_for_answer        = all_keyframes
         kf_chunk_ids_for_ans = all_kf_chunk_ids
+        kf_ts_for_ans        = all_kf_ts
+
+        # Reorder keyframes so they follow the rubric-reranked evidence order:
+        # images whose chunk_id matches ev_ids[0] come first, then ev_ids[1], ...
+        # Orphans (cid not in ev_ids) go to the tail.
+        if align_images_to_evidence and kf_for_answer and ev_ids:
+            cid_to_idx: dict = {}
+            for j, cid in enumerate(kf_chunk_ids_for_ans):
+                cid_to_idx.setdefault(cid, []).append(j)
+            order_idx: list = []
+            for cid in ev_ids:
+                order_idx.extend(cid_to_idx.pop(cid, []))
+            for j_list in cid_to_idx.values():
+                order_idx.extend(j_list)
+            kf_for_answer        = [kf_for_answer[j]        for j in order_idx]
+            kf_chunk_ids_for_ans = [kf_chunk_ids_for_ans[j] for j in order_idx]
+            kf_ts_for_ans        = [kf_ts_for_ans[j]        for j in order_idx]
+
         text_first_status    = None
         text_first_kept_cids = None
         if text_first_keyframes and kf_for_answer:
@@ -798,9 +823,13 @@ def run_veil(
             if status == "ok":
                 keep_idx = [i for i, cid in enumerate(kf_chunk_ids_for_ans)
                             if cid in needed_cids]
-                kf_for_answer = [kf_for_answer[i] for i in keep_idx]
+                kf_for_answer        = [kf_for_answer[i]        for i in keep_idx]
+                kf_chunk_ids_for_ans = [kf_chunk_ids_for_ans[i] for i in keep_idx]
+                kf_ts_for_ans        = [kf_ts_for_ans[i]        for i in keep_idx]
         if answer_keyframe_cap is not None and len(kf_for_answer) > answer_keyframe_cap:
-            kf_for_answer = kf_for_answer[:answer_keyframe_cap]
+            kf_for_answer        = kf_for_answer[:answer_keyframe_cap]
+            kf_chunk_ids_for_ans = kf_chunk_ids_for_ans[:answer_keyframe_cap]
+            kf_ts_for_ans        = kf_ts_for_ans[:answer_keyframe_cap]
 
         verifier_hint_oj = None
         verifier_hint_scores = None
@@ -811,8 +840,10 @@ def run_veil(
         result = answerer.answer(question, candidates, ev_texts,
                                  keyframe_images=kf_for_answer,
                                  keyframe_chunk_ids=kf_chunk_ids_for_ans,
+                                 keyframe_ts=kf_ts_for_ans,
                                  evidence_chunk_ids=ev_ids,
-                                 image_placement=image_placement,
+                                 image_timestamps=image_timestamps,
+                                 question_first=question_first,
                                  verifier_option_judgment=verifier_hint_oj,
                                  verifier_option_scores=verifier_hint_scores)
         result["n_keyframes_to_answer"] = len(kf_for_answer)

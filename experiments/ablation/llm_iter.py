@@ -97,7 +97,7 @@ def main():
                     help="OpenAI-compatible API base URL")
     ap.add_argument("--llm-api-model",  default=None,
                     help="Served model id for --llm-api-url (default: Qwen3.5-27B)")
-    ap.add_argument("--answer-keyframe-k",   type=int, default=16,
+    ap.add_argument("--answer-keyframe-k",   type=int, default=32,
                     help="Cap keyframe images passed to the final answerer")
     ap.add_argument("--max-frames",          type=int, default=None,
                     help="Override frame_sampling.max_frames from config")

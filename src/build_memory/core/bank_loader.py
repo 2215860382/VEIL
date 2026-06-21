@@ -31,12 +31,19 @@ from .schema import MemoryBank, MemoryChunk
 
 
 def _load_legacy_dir(vd: Path) -> MemoryBank:
-    """Load a legacy {video_id}/ directory bank (narrative + vectors only)."""
+    """Load a legacy {video_id}/ directory bank (narrative + vectors only).
+
+    visual_vecs in vectors.npz is optional (pre-2026-06-19 banks stored
+    v_visual inside narrative.json instead). Fall back to the per-chunk JSON
+    field when npz visual_vecs is absent, then leave v_visual=[] if neither
+    source has it — downstream visual rerank gates on truthy v_visual.
+    """
     video_id = vd.name
     narr = json.loads((vd / "narrative.json").read_text())
     vecs = np.load(vd / "vectors.npz")
 
     n_vecs = vecs["narrative_vecs"]
+    v_vecs = vecs["visual_vecs"] if "visual_vecs" in vecs.files else None
     chunk_ids = vecs["chunk_ids"]
     cid_to_vidx = {int(cid): i for i, cid in enumerate(chunk_ids)}
 
@@ -45,6 +52,10 @@ def _load_legacy_dir(vd: Path) -> MemoryBank:
         cid = nc["chunk_id"]
         vi = cid_to_vidx.get(cid)
         v_dynamic = n_vecs[vi].tolist() if vi is not None else []
+        if v_vecs is not None and vi is not None:
+            v_visual = v_vecs[vi].tolist()
+        else:
+            v_visual = nc.get("v_visual", []) or []
 
         chunks.append(MemoryChunk(
             video_id=video_id,
@@ -56,7 +67,9 @@ def _load_legacy_dir(vd: Path) -> MemoryBank:
             asr=nc.get("speech_text", "") or "",
             sampled_frames=nc.get("sampled_frames", []) or [],
             keyframe_ts=nc.get("keyframe_ts", 0.0),
+            keyframe_path=nc.get("keyframe_path", "") or "",
             v_dynamic=v_dynamic,
+            v_visual=v_visual,
         ))
 
     return MemoryBank(

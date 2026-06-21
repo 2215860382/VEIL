@@ -1,37 +1,52 @@
 """Build single-granularity similarity-grouped memory banks.
 
+Narration method: one multi-image VLM call per chunk — frames are interleaved
+with timestamp labels, the overlapping subtitle lines are injected with their
+time ranges, and the model writes a single chunk-level caption. This replaces
+the earlier per-frame caption + LLM summary baseline (which lost frame-to-frame
+continuity and laundered facts through a second LLM hop).
+
+For the alternative structured "Memory: <paragraph>\\nKey details: <comma list>"
+two-line variant, see ``build_single_similarity_newprompt.py``.
+
 Pipeline per video:
   1. ffmpeg 1fps → JPEG frames
   2. Blank + blur filter (with failsafe)
   3. Pre-dedup (dHash, window=10) — removes near-identical consecutive frames
   4. SigLIP encode survivors → cosine-similarity grouping (θ≥0.8)
-  5. Per-chunk dHash+SigLIP dedup → top-2 sharpest kept frames
-  6. SRT → speech_text per chunk (if subtitle_dir supplied)
-  7. Multi-image VLM call: kept frames + speech → narrative paragraph
-  8. BGE-M3 → semantic embedding of (narrative + speech)
-  9. Save MemoryBank (memory_text = narrative, memory_kind = similarity_group)
+  5. Per-chunk dHash+SigLIP dedup → kept_frame_paths (visual representative subset)
+     + top-2 sharpest cap on kept set → keyframe / v_visual
+     all_frame_paths (post pre-dedup, no chunk-cap) is preserved for narrative VLM.
+  6. SRT → speech_text + speech_lines per chunk (if subtitle_dir supplied)
+  7. Narrative — single multi-image VLM call per chunk:
+     - Down-sample g.all_frame_paths evenly to --narrative-max-frames (default 30)
+     - One call: system prompt + segment window + transcript lines + interleaved
+       (frame timestamp, image) pairs → single paragraph caption
+  8. BGE-M3 encode (narrative + speech), max_length=4096
+  9. Write legacy directory bank:
+        {out_dir}/{video_id}/narrative.json       chunks[].{narrative, caption,
+                                                  speech_text, sampled_frames,
+                                                  keyframe_ts, keyframe_path, v_visual}
+        {out_dir}/{video_id}/vectors.npz          narrative_vecs + chunk_ids
+        {out_dir}/{video_id}/keyframes_origin/    dedup kept frames at original res
+        {out_dir}/{video_id}/keyframes_resized/   same files resized to ≤ frame_max_dim
+        {out_dir}/{video_id}/frames_raw/          all post-cleanup frames per chunk (original res)
 
 Usage:
     cd /home2/ycj/Project/VEIL
     PYTHONPATH=. python -m src.build_memory.build_single_similarity \\
         --benchmark videomme \\
-        --siglip-model /path/to/siglip \\
-        --api-url http://localhost:8001 \\
-        --api-model Qwen2.5-VL-7B-Instruct \\
-        --siglip-gpu cuda:0 --bge-gpu cuda:0
-
-    # Local VLM (no API):
-    PYTHONPATH=. python -m src.build_memory.build_single_similarity \\
-        --benchmark videomme \\
-        --siglip-model /path/to/siglip \\
-        --vlm-model /path/to/Qwen-VL \\
-        --vlm-gpu cuda:0 --siglip-gpu cuda:0 --bge-gpu cuda:0
+        --siglip-model /home2/ycj/Models/google/siglip-large-patch16-384 \\
+        --siglip-gpu cuda:1 --bge-gpu cuda:1 \\
+        --api-url http://10.82.1.145:8001,http://10.82.1.145:8002 \\
+        --api-model Qwen3.5-27B
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import base64
+import io
 import json
 import re
 import sys
@@ -39,104 +54,64 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import numpy as np
+from PIL import Image
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import load_config
 from src.utils.logging import get_logger
 
-log = get_logger("build_similarity_memory")
+log = get_logger("build_single_similarity")
 
-MEMORY_KIND = "similarity_group"
 
-# ── Narrative prompt ───────────────────────────────────────────────────────────
+# ── Prompts (Binlu-style segment captioning, one multi-image call per chunk) ──
 
-CHUNK_NARRATIVE_PROMPT = """\
-You are building a searchable memory for long-video question answering.
+SYSTEM_PROMPT = (
+    "You are an expert video captioner.\n"
+    "\n"
+    "You will receive a short video segment represented by ordered frames, "
+    "each labeled with its timestamp in the video, and optionally the "
+    "transcript lines of the speech with their time ranges on the same "
+    "timeline.\n"
+    "Write a single paragraph caption describing the visual content and, when "
+    "transcript lines are provided, the spoken content.\n"
+    "\n"
+    "Guidelines:\n"
+    "- Describe visible people, actions, objects, and the setting.\n"
+    "- Present actions and events in their temporal order; use the timestamps "
+    "to align speech with what is shown.\n"
+    "- When transcript lines are provided, weave what is said into the "
+    "caption; do not describe sounds you cannot know from the frames or "
+    "transcript.\n"
+    "- Preserve names, numbers, and on-screen text (OCR) verbatim. Do not "
+    "invent details.\n"
+    "- Keep the caption factual and neutral.\n"
+    "- Do not mention frames, transcripts, timestamps, or how the input was "
+    "produced.\n"
+    "- Avoid speculation about emotions or intentions unless clearly visible "
+    "or stated in the transcript.\n"
+    "\n"
+    "Output only the final caption text."
+)
 
-Given {n_frames} key frame(s) and aligned speech/subtitles from one video chunk
-[t={t_start:.0f}s–{t_end:.0f}s) (frames at t = {timestamps}, in chronological
-order), write a compact memory entry that preserves the evidence needed to
-answer future questions.
+USER_HEADER_TEMPLATE = (
+    "Segment window: {t0} to {t1}\n"
+    "{transcript_block}"
+    "The following frames are ordered chronologically within the segment."
+)
+TRANSCRIPT_BLOCK_TEMPLATE = "Transcript lines:\n{lines}\n"
+NO_TRANSCRIPT_LINE = "- No transcript lines overlap this segment."
+FRAME_TS_TEMPLATE = "Frame timestamp: {ts}"
+USER_TRAILER = "Write the caption for this segment."
 
-{subtitle_block}
 
-Requirements:
-1. Summarize the main event or scene progression in temporal order. Do not
-   refer to "frame 1/2/3"; use narrative time ("at the start", "then", "finally").
-2. Preserve concrete visual details: people (count, clothing, posture, position
-   in frame), objects, scene, actions, locations, colors, numbers, text/OCR,
-   spatial relations. Prefer specific descriptors ("woman in red jacket")
-   over generic ones ("a person").
-3. If speech/subtitles are present, preserve their important content,
-   especially names, facts, decisions, explanations, questions, answers,
-   and numbers. Quote OCR/text verbatim.
-4. Only connect speech to visible events when the link is clear; otherwise
-   list them separately.
-5. Do not add facts not supported by the frames or speech.
-6. If evidence is ambiguous, state the ambiguity instead of resolving it.
-
-Output format (exactly these two lines, nothing else):
-Memory: <one English paragraph, ≤ 100 words, describing what happens in this chunk>
-Key details: <≤ 20 comma-separated searchable items: OCR strings, numbers,
-named people, distinctive objects, key actions>
-
-Example of "Key details":
-Key details: woman in red jacket, man "John Smith", OCR "EXIT 47",
-3 children, kitchen, hands shuffling cards, "we need to leave by 5"
-"""
-
-PER_FRAME_CAPTION_PROMPT = """\
-Describe this video frame for later long-video question answering.
-
-Focus on concrete, searchable visual evidence:
-- people (count, clothing, posture, position in frame), objects, scene, actions
-- spatial relations (left/right, foreground/background, who relates to whom)
-- visible text/OCR, numbers, logos, signs, brands, colors, distinctive attributes
-- states or attributes directly visible in this single frame
-
-Rules:
-- Use only what is visible. Do not infer identities, intentions, causes,
-  or events happening outside or before/after this frame.
-- Prefer specific descriptors ("woman in red jacket holding a microphone")
-  over generic ones ("a person"). Avoid vague placeholders.
-- Quote on-screen text inside double quotes, exactly as written.
-- If something is unclear, hedge with "appears to be" or "possibly".
-  Do not omit it silently.
-- Output: one dense paragraph (1–2 short sentences), ≤ 50 words.
-  No bullet points, no preamble, no closing remarks."""
-
-CAPTION_SUMMARY_PROMPT = """\
-You are building a searchable memory for long-video question answering.
-
-Given frame-level captions and aligned speech/subtitles from one video chunk
-[t={t_start:.0f}s–{t_end:.0f}s), write a compact memory entry that preserves
-the evidence needed to answer future questions.
-
-{subtitle_block}
-Frame captions (in chronological order):
-{cap_block}
-
-Requirements:
-1. Summarize the main event or scene progression in temporal order. Do not
-   refer to "frame 1/2/3"; use narrative time ("at the start", "then", "finally").
-2. Preserve concrete visual details: people, objects, actions, locations,
-   colors, clothing, numbers, text/OCR, and spatial relations.
-3. Preserve important speech/subtitle content, especially names, facts,
-   decisions, explanations, questions, answers, and numbers. Quote OCR/text verbatim.
-4. Only connect speech to visible events when the link is clear; otherwise
-   list them separately.
-5. Do not add facts not supported by the captions or speech.
-6. If evidence is ambiguous, state the ambiguity instead of resolving it.
-
-Output format (exactly these two lines, nothing else):
-Memory: <one English paragraph, ≤ 100 words, describing what happens in this chunk>
-Key details: <≤ 20 comma-separated searchable items: OCR strings, numbers,
-named people, distinctive objects, key actions>
-
-Example of "Key details":
-Key details: woman in red jacket, man "John Smith", OCR "EXIT 47",
-3 children, kitchen, hands shuffling cards, "we need to leave by 5"
-"""
+def _hms(seconds: float) -> str:
+    # Round (not truncate) — matches Binlu multiscale_segment.hms() so the
+    # timestamps in the VLM prompt line up with where speech/actions actually
+    # happen (truncation drifts by up to a second per chunk boundary).
+    s = int(round(seconds))
+    return f"{s // 3600:02d}:{(s // 60) % 60:02d}:{s % 60:02d}"
 
 
 # ── SRT parsing & subtitle alignment ──────────────────────────────────────────
@@ -202,245 +177,198 @@ def align_subtitles(
     return speech
 
 
-# ── Narrative generation ───────────────────────────────────────────────────────
+def collect_speech_lines(
+    entries: List[Tuple[float, float, str]],
+    t_start: float,
+    t_end: float,
+) -> List[Tuple[float, float, str]]:
+    """Return SRT entries overlapping [t_start, t_end], preserving timestamps."""
+    return [(es, ee, txt) for es, ee, txt in entries if ee >= t_start and es <= t_end]
 
-# Round-robin endpoint dispatch (supports comma-separated --api-url)
-_endpoint_state: dict = {"endpoints": [], "rr": 0}
+
+# ── Narrative-input frame down-sampler ────────────────────────────────────────
+
+def _select_narrative_frames(
+    paths: List[Path], timestamps: List[float], n_max: int,
+) -> Tuple[List[Path], List[float]]:
+    """Evenly down-sample (paths, timestamps) to at most ``n_max`` items.
+
+    Bounds VLM input cost regardless of how many post-cleanup frames the
+    chunk has. Preserves temporal order.
+    """
+    n = len(paths)
+    if n <= n_max:
+        return list(paths), list(timestamps)
+    step = n / n_max
+    idxs = [int(i * step) for i in range(n_max)]
+    return [paths[i] for i in idxs], [timestamps[i] for i in idxs]
 
 
-def _parse_endpoints(api_url: str) -> list[str]:
-    return [u.strip().rstrip("/") for u in api_url.split(",") if u.strip()]
+# ── API endpoint round-robin ──────────────────────────────────────────────────
+
+_endpoint_state: dict = {"endpoints": [], "rr": 0, "lock": None}
 
 
 def _init_endpoints(api_url: str) -> None:
-    _endpoint_state["endpoints"] = _parse_endpoints(api_url)
+    _endpoint_state["endpoints"] = [
+        u.strip().rstrip("/") for u in api_url.split(",") if u.strip()
+    ]
     _endpoint_state["rr"] = 0
+    _endpoint_state["lock"] = asyncio.Lock()
 
 
-async def _next_chat_url() -> str:
-    eps = _endpoint_state["endpoints"]
-    if not eps:
-        raise RuntimeError("endpoints not initialized")
-    ep = eps[_endpoint_state["rr"] % len(eps)]
-    _endpoint_state["rr"] += 1
-    return f"{ep}/v1/chat/completions"
+async def _pick_endpoint() -> str:
+    async with _endpoint_state["lock"]:
+        eps = _endpoint_state["endpoints"]
+        ep = eps[_endpoint_state["rr"] % len(eps)]
+        _endpoint_state["rr"] += 1
+    return ep
 
 
-def _build_narrative_prompt(
-    n_frames: int,
-    t_start: float,
-    t_end: float,
-    timestamps: List[float],
-    speech: str,
+async def _call_api(
+    session, messages, api_model: str, max_tokens: int = 150,
+    max_retries: int = 5, retry_base_delay: float = 2.0,
 ) -> str:
-    ts_str = ", ".join(f"{t:.0f}s" for t in timestamps)
-    if speech.strip():
-        subtitle_block = f"Speech/subtitles in this segment:\n{speech.strip()}"
-    else:
-        subtitle_block = "No subtitles in this segment."
-    return CHUNK_NARRATIVE_PROMPT.format(
-        n_frames=n_frames,
-        t_start=t_start,
-        t_end=t_end,
-        timestamps=ts_str,
-        subtitle_block=subtitle_block,
-    )
-
-
-async def _narrate_one_api(
-    session,
-    sem: asyncio.Semaphore,
-    frame_paths: List[Path],
-    timestamps: List[float],
-    speech: str,
-    t_start: float,
-    t_end: float,
-    api_url: str,
-    api_model: str,
-) -> str:
-    prompt = _build_narrative_prompt(len(frame_paths), t_start, t_end, timestamps, speech)
-    content: list = []
-    for p in frame_paths:
-        b64 = base64.b64encode(p.read_bytes()).decode()
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-    content.append({"type": "text", "text": prompt})
-    payload = {
+    """Exponential-backoff retry on connection drops / 5xx (matches Binlu
+    api_backend.py:79-101). Only retries network-level failures; 4xx and JSON
+    parse errors still propagate."""
+    import aiohttp
+    payload_base = {
         "model": api_model,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 350,
+        "messages": messages,
+        "max_tokens": max_tokens,
         "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": False},
     }
-    import aiohttp
-    async with sem:
+    last_err: Exception | None = None
+    for attempt in range(max_retries):
+        ep = await _pick_endpoint()
         try:
-            url = await _next_chat_url()
             async with session.post(
-                url,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=120),
+                f"{ep}/v1/chat/completions", json=payload_base,
+                timeout=aiohttp.ClientTimeout(total=180),
             ) as r:
                 data = await r.json()
-                text = data["choices"][0]["message"]["content"].strip()
-                if "</think>" in text:
-                    text = text.split("</think>", 1)[1].strip()
-                return text
+            text = data["choices"][0]["message"]["content"]
+            if "</think>" in text:
+                text = text.split("</think>", 1)[1]
+            return text.strip()
+        except (aiohttp.ClientConnectionError,
+                aiohttp.ServerDisconnectedError,
+                asyncio.TimeoutError) as e:
+            last_err = e
+            if attempt == max_retries - 1:
+                raise
+            delay = min(retry_base_delay * (2 ** attempt), 60.0)
+            await asyncio.sleep(delay)
+    raise last_err  # unreachable
+
+
+def _img_block(path: Path, max_side: int = 448) -> dict:
+    """Long-edge resize → JPEG q=85 → base64 (mirrors Binlu api_backend.py:104-119).
+    Matters most for the multi-image narrative call: raw 1fps frames are 1280+
+    on the long edge; sending 30 of them un-scaled triples the prompt-token
+    budget and bloats attention noise, dragging caption quality down."""
+    img = Image.open(path).convert("RGB")
+    if max(img.size) > max_side:
+        scale = max_side / max(img.size)
+        img = img.resize(
+            (round(img.width * scale), round(img.height * scale)),
+            Image.LANCZOS,
+        )
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+
+
+# ── Narrative (single multi-image VLM call per chunk) ─────────────────────────
+
+def _format_transcript_block(
+    speech_lines: List[Tuple[float, float, str]],
+    video_has_speech: bool,
+) -> str:
+    """Three-way subtitle handling matching Binlu segment_caption.py:155-165:
+    - video has no SRT at all → block omitted entirely
+    - video has SRT but this chunk has no overlap → explicit NO_TRANSCRIPT marker
+    - chunk has overlapping lines → list with time ranges
+    """
+    if not video_has_speech:
+        return ""
+    if speech_lines:
+        lines = "\n".join(
+            f"- [{_hms(es)} --> {_hms(ee)}] {txt}"
+            for es, ee, txt in speech_lines
+        )
+    else:
+        lines = NO_TRANSCRIPT_LINE
+    return TRANSCRIPT_BLOCK_TEMPLATE.format(lines=lines)
+
+
+async def _narrate_chunk(
+    session, sem, info: dict, api_model: str, video_has_speech: bool,
+) -> str:
+    fps = info["narrative_frame_paths"]
+    ts = info["narrative_timestamps"]
+    speech_lines = info.get("speech_lines", [])
+    t_start = info["t_start"]
+    t_end = info["t_end"]
+
+    if not fps:
+        return ""
+
+    transcript_block = _format_transcript_block(speech_lines, video_has_speech)
+    header = USER_HEADER_TEMPLATE.format(
+        t0=_hms(t_start), t1=_hms(t_end),
+        transcript_block=transcript_block,
+    )
+    content: list = [{"type": "text", "text": header}]
+    for tt, fp in zip(ts, fps):
+        content.append({"type": "text", "text": FRAME_TS_TEMPLATE.format(ts=_hms(tt))})
+        content.append(_img_block(fp))
+    content.append({"type": "text", "text": USER_TRAILER})
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": content},
+    ]
+    async with sem:
+        try:
+            return await _call_api(
+                session, messages, api_model=api_model, max_tokens=400,
+            )
         except Exception as e:
-            log.warning("  API narrate [%.0f-%.0f s]: %s", t_start, t_end, e)
-            return f"[narration unavailable at t={t_start:.0f}s–{t_end:.0f}s]"
+            return f"[narrative failed: {e}]"
 
 
-async def _narrate_all_api(
-    chunks_info: List[dict],
-    api_url: str,
-    api_model: str,
-    concurrency: int,
-) -> List[str]:
+async def _narrate_all(chunks_info: List[dict], api_model: str, concurrency: int) -> List[str]:
     import aiohttp
+    # Per-video flag: if any chunk has SRT overlap, we treat the video as having
+    # speech; chunks without overlap then get the NO_TRANSCRIPT marker rather
+    # than dropping the transcript block silently.
+    video_has_speech = any(
+        c.get("speech_lines") or c.get("speech", "").strip()
+        for c in chunks_info
+    )
     sem = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(limit=concurrency + 4)
+    connector = aiohttp.TCPConnector(limit=concurrency + 8)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [
-            _narrate_one_api(
-                session, sem,
-                c["kept_frame_paths"], c["kept_timestamps"],
-                c["speech"], c["t_start"], c["t_end"],
-                api_url, api_model,
-            )
+            _narrate_chunk(session, sem, c, api_model, video_has_speech)
             for c in chunks_info
         ]
         return list(await asyncio.gather(*tasks))
 
 
-def narrate_chunks_api(
-    chunks_info: List[dict],
-    api_url: str,
-    api_model: str,
-    concurrency: int = 16,
+def narrate_chunks(
+    chunks_info: List[dict], api_url: str, api_model: str, concurrency: int = 16,
 ) -> List[str]:
-    """Async-batch multi-image narrative for all chunks of one video (API mode)."""
+    """One multi-image VLM call per chunk → single paragraph caption."""
     _init_endpoints(api_url)
-    return asyncio.run(_narrate_all_api(chunks_info, api_url, api_model, concurrency))
+    return asyncio.run(_narrate_all(chunks_info, api_model, concurrency))
 
 
-# ── Caption + Summary narrative (per-frame caption → LLM summary) ──────────────
-
-async def _caption_one_api(session, sem, fp: Path,
-                           api_url: str, api_model: str) -> str:
-    import aiohttp
-    b64 = base64.b64encode(Path(fp).read_bytes()).decode()
-    content = [
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-        {"type": "text", "text": PER_FRAME_CAPTION_PROMPT},
-    ]
-    payload = {
-        "model": api_model,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 80, "temperature": 0,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    async with sem:
-        try:
-            url = await _next_chat_url()
-            async with session.post(
-                url,
-                json=payload, timeout=aiohttp.ClientTimeout(total=120),
-            ) as r:
-                data = await r.json()
-            t = data["choices"][0]["message"]["content"].strip()
-            if "</think>" in t:
-                t = t.split("</think>", 1)[1].strip()
-            return t
-        except Exception:
-            return ""
-
-
-async def _summarize_one_api(session, sem,
-                             captions: List[str], timestamps: List[float],
-                             speech: str, t_start: float, t_end: float,
-                             api_url: str, api_model: str) -> str:
-    import aiohttp
-    labeled = [f"[t={t:.0f}s] {c}" for t, c in zip(timestamps, captions) if c.strip()]
-    if not labeled:
-        return ""
-    sub = f"Speech/subtitles: {speech.strip()}\n" if speech.strip() else ""
-    prompt = CAPTION_SUMMARY_PROMPT.format(
-        t_start=t_start, t_end=t_end,
-        subtitle_block=sub, cap_block="\n".join(labeled),
-    )
-    payload = {
-        "model": api_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 350, "temperature": 0,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    async with sem:
-        try:
-            url = await _next_chat_url()
-            async with session.post(
-                url,
-                json=payload, timeout=aiohttp.ClientTimeout(total=120),
-            ) as r:
-                data = await r.json()
-            t = data["choices"][0]["message"]["content"].strip()
-            if "</think>" in t:
-                t = t.split("</think>", 1)[1].strip()
-            return t
-        except Exception:
-            return labeled[0].split("] ", 1)[-1]
-
-
-async def _narrate_caption_summary(chunks_info: List[dict],
-                                   api_url: str, api_model: str,
-                                   concurrency: int) -> List[str]:
-    import aiohttp
-    sem = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(limit=concurrency + 8)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # Phase 1: per-frame captions
-        async def caption_chunk(c):
-            tasks = [_caption_one_api(session, sem, fp, api_url, api_model)
-                     for fp in c["narrative_frame_paths"]]
-            return await asyncio.gather(*tasks)
-        all_caps = await asyncio.gather(*[caption_chunk(c) for c in chunks_info])
-        # Phase 2: LLM summary
-        sum_tasks = [
-            _summarize_one_api(session, sem,
-                               caps, c["narrative_timestamps"],
-                               c["speech"], c["t_start"], c["t_end"],
-                               api_url, api_model)
-            for caps, c in zip(all_caps, chunks_info)
-        ]
-        return list(await asyncio.gather(*sum_tasks))
-
-
-def narrate_chunks_caption_summary(chunks_info: List[dict], api_url: str,
-                                   api_model: str, concurrency: int = 16) -> List[str]:
-    """Per-frame caption + LLM summary; one video at a time."""
-    _init_endpoints(api_url)
-    return asyncio.run(_narrate_caption_summary(chunks_info, api_url, api_model, concurrency))
-
-
-def narrate_chunk_local(
-    frame_paths: List[Path],
-    timestamps: List[float],
-    speech: str,
-    t_start: float,
-    t_end: float,
-    vlm,
-) -> str:
-    """Single-chunk multi-image narrative (local VLM mode)."""
-    from PIL import Image
-    prompt = _build_narrative_prompt(len(frame_paths), t_start, t_end, timestamps, speech)
-    pil_frames = [Image.open(str(p)).convert("RGB") for p in frame_paths]
-    try:
-        return vlm.chat_with_frames(pil_frames, prompt, max_new_tokens=200).strip()
-    except Exception as e:
-        log.warning("  local narrate [%.0f-%.0f s]: %s", t_start, t_end, e)
-        return f"[narration unavailable at t={t_start:.0f}s–{t_end:.0f}s]"
-
-
-# ── Video paths ────────────────────────────────────────────────────────────────
+# ── Video paths ───────────────────────────────────────────────────────────────
 
 def _get_video_paths(cfg: dict) -> dict[str, str]:
     bench = cfg["benchmark"]["name"]
@@ -473,43 +401,36 @@ def _get_video_paths(cfg: dict) -> dict[str, str]:
         raise ValueError(f"Unsupported benchmark: {bench}")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--benchmark", choices=["mlvu", "videomme"])
     src.add_argument("--config", help="Legacy YAML path")
-    ap.add_argument("--vlm-model",       default=None,
-                    help="Local VLM checkpoint (required without --api-url)")
-    ap.add_argument("--vlm-gpu",         default="cuda:0")
-    ap.add_argument("--siglip-model",    required=True)
-    ap.add_argument("--siglip-gpu",      default="cuda:0")
-    ap.add_argument("--bge-gpu",         default="cuda:0")
-    ap.add_argument("--subtitle-dir",    default=None)
-    ap.add_argument("--filter-from",     default=None)
-    ap.add_argument("--fps",             type=float, default=1.0)
-    ap.add_argument("--theta",           type=float, default=0.80)
-    ap.add_argument("--n-max",           type=int,   default=30)
-    ap.add_argument("--api-url",         default=None,
-                    help="vLLM OpenAI-compatible base URL")
-    ap.add_argument("--api-model",       default=None,
-                    help="Required with --api-url")
-    ap.add_argument("--api-concurrency", type=int, default=16)
-    ap.add_argument("--out-dir",         default=None)
-    ap.add_argument("--narrative-mode",  choices=["multi_image", "caption_summary"],
-                    default="multi_image",
-                    help="multi_image: send all kept frames to VLM in one call; "
-                         "caption_summary: per-frame caption + LLM summary")
-    ap.add_argument("--narrative-max-frames", type=int, default=12,
-                    help="In caption_summary mode, cap input frames per chunk")
+    ap.add_argument("--siglip-model",     required=True)
+    ap.add_argument("--siglip-gpu",       default="cuda:0")
+    ap.add_argument("--bge-gpu",          default="cuda:0")
+    ap.add_argument("--subtitle-dir",     default=None)
+    ap.add_argument("--filter-from",      default=None)
+    ap.add_argument("--fps",              type=float, default=1.0)
+    ap.add_argument("--theta",            type=float, default=0.80)
+    ap.add_argument("--n-max",            type=int,   default=30)
+    ap.add_argument("--api-url",          required=True,
+                    help="vLLM OpenAI-compatible base URL(s); comma-separated"
+                         " = round-robin")
+    ap.add_argument("--api-model",        required=True)
+    ap.add_argument("--api-concurrency",  type=int, default=16)
+    ap.add_argument("--out-dir",          default=None)
+    ap.add_argument("--narrative-max-frames", type=int, default=30,
+                    help="Cap frames per chunk fed to the single multi-image VLM"
+                         " call; evenly down-sampled from g.all_frame_paths when"
+                         " exceeded")
+    ap.add_argument("--frame-max-dim", type=int, default=448,
+                    help="Longer-side target for keyframes_resized/. Origin"
+                         " keyframes and frames_raw are always full res."
+                         " Default 448 matches Binlu save_keyframe (build_index.py).")
     args = ap.parse_args()
-
-    use_api = bool(args.api_url)
-    if use_api and not args.api_model:
-        ap.error("--api-model is required when --api-url is set.")
-    if not use_api and not args.vlm_model:
-        ap.error("--vlm-model is required when --api-url is not set.")
 
     if args.benchmark is not None:
         from src.build_memory.core import specs as build_specs
@@ -548,15 +469,7 @@ def main():
     siglip = SigLIPEmbedder(args.siglip_model, device=args.siglip_gpu)
     log.info("  SigLIP ready (%.1fs)", time.time() - t0)
 
-    vlm = None
-    if not use_api:
-        log.info("Loading VLM %s on %s …", args.vlm_model, args.vlm_gpu)
-        t0 = time.time()
-        from src.clients.vlm_client import VLMClient
-        vlm = VLMClient(model_path=args.vlm_model, device=args.vlm_gpu, max_new_tokens=64)
-        log.info("  VLM ready (%.1fs)", time.time() - t0)
-    else:
-        log.info("API mode — VLM at %s (%s)", args.api_url, args.api_model)
+    log.info("API mode — VLM/LLM at %s (%s)", args.api_url, args.api_model)
 
     log.info("Loading BGE-M3 on %s …", args.bge_gpu)
     t0 = time.time()
@@ -583,16 +496,28 @@ def main():
         log.info("Filtered to %d videos", len(video_paths))
 
     from src.build_memory.core.frame_pipeline import clean_and_group_frames
-    from src.build_memory.core.schema import MemoryBank, MemoryChunk
+    from queue import Queue
+    from threading import Thread
 
-    for video_id, video_path in sorted(video_paths.items()):
-        out_path = out_dir / f"{video_id}.json"
-        if out_path.exists():
+    # ── Pipeline: prepare next video on a worker thread while main runs VLM ──
+    # The prepare stage is ffmpeg-extract + SigLIP-encode/group + SRT parse,
+    # which runs on CPU + GPU 1 (SigLIP). The build stage is the VLM caption
+    # (vLLM 8000+8001 on GPU 1/3) + BGE encode + disk write. By the time the
+    # main thread finishes captioning video N (~150 s), the worker has already
+    # finished preparing video N+1 (~40-70 s), so the next caption can start
+    # immediately. Queue size 1 caps the worker at one video ahead of main.
+
+    def _prepare_video(video_id: str, video_path: str):
+        """Pre-caption stage. Returns dict for build, or None to skip."""
+        video_dir = out_dir / video_id
+        narr_path = video_dir / "narrative.json"
+        vec_path  = video_dir / "vectors.npz"
+        if narr_path.exists() and vec_path.exists():
             log.info("[%s] already built, skipping", video_id)
-            continue
+            return None
         if not Path(video_path).exists():
             log.warning("[%s] not found: %s", video_id, video_path)
-            continue
+            return None
 
         srt_entries: List[Tuple[float, float, str]] = []
         if subtitle_dir is not None:
@@ -609,120 +534,153 @@ def main():
         log.info("[%s] starting …", video_id)
         t_video = time.time()
 
-        # 1–5: frame pipeline (extract → filter → pre-dedup → SigLIP group →
-        #      per-chunk dedup → top-2 sharpest)
         cleaned = clean_and_group_frames(
             video_path=video_path,
-            out_dir=out_dir / video_id,
+            out_dir=video_dir,
             siglip=siglip,
             fps=args.fps,
             theta=args.theta,
             n_max=args.n_max,
+            frame_max_dim=args.frame_max_dim,
         )
         duration = max((g.t_end for g in cleaned), default=0.0)
-        log.info("  %d chunks, %d kept frames total",
-                 len(cleaned), sum(len(g.kept_frame_paths) for g in cleaned))
+        log.info("  [%s] %d chunks, %d kept frames total",
+                 video_id, len(cleaned),
+                 sum(len(g.kept_frame_paths) for g in cleaned))
 
-        # 6: subtitle alignment
         speech_texts = [
             align_subtitles(srt_entries, g.t_start, g.t_end) if srt_entries else ""
             for g in cleaned
         ]
-
-        # 7: narrative generation
-        t0 = time.time()
-        if args.narrative_mode == "caption_summary":
-            # Use all clean frames in chunk (pre per-chunk dedup); evenly downsample
-            # if exceeding cap to bound API cost on rare 20+ frame chunks.
-            def _pick_narr_frames(g):
-                fps = list(g.all_frame_paths)
-                ts  = list(g.all_timestamps)
-                n = args.narrative_max_frames
-                if len(fps) > n:
-                    step = len(fps) / n
-                    idxs = [int(i * step) for i in range(n)]
-                    fps  = [fps[i] for i in idxs]
-                    ts   = [ts[i]  for i in idxs]
-                return fps, ts
-            picked = [_pick_narr_frames(g) for g in cleaned]
-            chunks_info = [
-                {
-                    "narrative_frame_paths": fps,
-                    "narrative_timestamps":  ts,
-                    "speech":  sp,
-                    "t_start": g.t_start,
-                    "t_end":   g.t_end,
-                }
-                for g, sp, (fps, ts) in zip(cleaned, speech_texts, picked)
-            ]
-            if use_api:
-                narratives = narrate_chunks_caption_summary(
-                    chunks_info, args.api_url, args.api_model,
-                    concurrency=args.api_concurrency,
-                )
-            else:
-                raise NotImplementedError("caption_summary mode requires --api-url")
-        elif use_api:
-            chunks_info = [
-                {
-                    "kept_frame_paths": g.kept_frame_paths,
-                    "kept_timestamps":  g.kept_timestamps,
-                    "speech":           sp,
-                    "t_start":          g.t_start,
-                    "t_end":            g.t_end,
-                }
-                for g, sp in zip(cleaned, speech_texts)
-            ]
-            narratives = narrate_chunks_api(
-                chunks_info, args.api_url, args.api_model,
-                concurrency=args.api_concurrency,
+        speech_lines_per_chunk = [
+            collect_speech_lines(srt_entries, g.t_start, g.t_end) if srt_entries else []
+            for g in cleaned
+        ]
+        picked = [
+            _select_narrative_frames(g.all_frame_paths, g.all_timestamps,
+                                     args.narrative_max_frames)
+            for g in cleaned
+        ]
+        chunks_info = [
+            {
+                "narrative_frame_paths": fps,
+                "narrative_timestamps":  ts,
+                "speech":        sp,
+                "speech_lines":  sl,
+                "t_start": g.t_start,
+                "t_end":   g.t_end,
+            }
+            for g, sp, sl, (fps, ts) in zip(
+                cleaned, speech_texts, speech_lines_per_chunk, picked,
             )
-        else:
-            narratives = [
-                narrate_chunk_local(
-                    g.kept_frame_paths, g.kept_timestamps,
-                    sp, g.t_start, g.t_end, vlm,
-                )
-                for g, sp in zip(cleaned, speech_texts)
-            ]
-        log.info("  narratives done (%.1fs)", time.time() - t0)
+        ]
+        return {
+            "video_id":     video_id,
+            "video_dir":    video_dir,
+            "narr_path":    narr_path,
+            "vec_path":     vec_path,
+            "cleaned":      cleaned,
+            "duration":     duration,
+            "speech_texts": speech_texts,
+            "chunks_info":  chunks_info,
+            "t_video":      t_video,
+        }
 
-        # 8: BGE-M3 encode (narrative + speech)
+    # Iterate videos in the order they came in (videomme loader returns samples
+    # by sample_idx, and dict preserves first-seen insertion order). For
+    # --filter-from, the filtered dict also preserves the same order.
+    SENTINEL: object = object()
+    prep_queue: Queue = Queue(maxsize=1)
+
+    def _producer():
+        try:
+            for video_id, video_path in video_paths.items():
+                try:
+                    item = _prepare_video(video_id, video_path)
+                except Exception as e:
+                    log.exception("[%s] prepare failed: %s", video_id, e)
+                    item = None
+                prep_queue.put(item)
+        finally:
+            prep_queue.put(SENTINEL)
+
+    prod_thread = Thread(target=_producer, name="prepare", daemon=True)
+    prod_thread.start()
+
+    while True:
+        item = prep_queue.get()
+        if item is SENTINEL:
+            break
+        if item is None:
+            continue
+        video_id     = item["video_id"]
+        video_dir    = item["video_dir"]
+        narr_path    = item["narr_path"]
+        vec_path     = item["vec_path"]
+        cleaned      = item["cleaned"]
+        duration     = item["duration"]
+        speech_texts = item["speech_texts"]
+        chunks_info  = item["chunks_info"]
+        t_video      = item["t_video"]
+
+        t0 = time.time()
+        narratives = narrate_chunks(
+            chunks_info, args.api_url, args.api_model,
+            concurrency=args.api_concurrency,
+        )
+        log.info("  [%s] narratives done (%.1fs)", video_id, time.time() - t0)
+
         embed_texts = [
             f"{narr}\n\n{sp}" if sp.strip() else narr
             for narr, sp in zip(narratives, speech_texts)
         ]
         sem_vecs = embedder.encode(embed_texts)
 
-        # 9: build MemoryChunks
-        chunks = []
+        # v_visual lives in vectors.npz["visual_vecs"] (one row per chunk in the
+        # same order as narrative_vecs / chunk_ids), NOT inside narrative.json.
+        narr_chunks = []
+        n_vecs = []
+        v_vecs = []
+        chunk_ids = []
         for g, narr, speech in zip(cleaned, narratives, speech_texts):
             center = g.center_idx
-            chunks.append(MemoryChunk(
-                video_id=video_id,
-                chunk_id=g.chunk_id,
-                start_time=g.t_start,
-                end_time=g.t_end,
-                memory_text=narr,
-                asr=speech,
-                sampled_frames=g.all_timestamps,
-                keyframe_path=str(g.kept_frame_paths[center]),
-                keyframe_ts=g.kept_timestamps[center],
-                v_dynamic=sem_vecs[g.chunk_id].tolist(),
-                v_visual=g.kept_v_visual[center].tolist(),
-            ))
+            kf_path = g.kept_frame_paths[center]
+            try:
+                kf_rel = str(kf_path.relative_to(video_dir))
+            except ValueError:
+                kf_rel = str(kf_path)
+            narr_chunks.append({
+                "chunk_id":       g.chunk_id,
+                "start_time":     g.t_start,
+                "end_time":       g.t_end,
+                "narrative":      narr,
+                "caption":        [],
+                "speech_text":    speech,
+                "sampled_frames": g.all_timestamps,
+                "keyframe_ts":    g.kept_timestamps[center],
+                "keyframe_path":  kf_rel,
+            })
+            n_vecs.append(sem_vecs[g.chunk_id])
+            v_vecs.append(g.kept_v_visual[center])
+            chunk_ids.append(g.chunk_id)
 
-        bank = MemoryBank(
-            video_id=video_id,
-            duration=duration,
-            chunks=chunks,
-            fps=args.fps,
-            memory_kind=MEMORY_KIND,
+        narr_json = {
+            "video_id":   video_id,
+            "duration":   duration,
+            "num_chunks": len(narr_chunks),
+            "chunks":     narr_chunks,
+        }
+        narr_path.write_text(json.dumps(narr_json, ensure_ascii=False))
+        np.savez(
+            vec_path,
+            narrative_vecs=np.array(n_vecs, dtype=np.float32),
+            visual_vecs=np.array(v_vecs, dtype=np.float32),
+            chunk_ids=np.array(chunk_ids, dtype=np.int64),
         )
-        bank.save(out_path)
         log.info("[%s] saved %d chunks (%.1fs total)",
-                 video_id, len(chunks), time.time() - t_video)
+                 video_id, len(narr_chunks), time.time() - t_video)
 
+    prod_thread.join()
     log.info("Done — output in %s", out_dir)
 
 

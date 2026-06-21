@@ -38,6 +38,9 @@ def _to_pil(frame, max_pixels: int | None = None) -> Image.Image:
 
 
 def _pil_to_b64(img: Image.Image) -> str:
+    """Encode PIL image to base64 JPEG (no resize — image-size control belongs
+    in the build pipeline, see ``--frame-max-dim`` in
+    ``src.build_memory.build_single_similarity``)."""
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode()

@@ -18,19 +18,51 @@ def load_keyframe_pil(path: str):
     return None
 
 
-def keyframe_path(keyframe_dir, video_id: str, chunk_id: int, chunk=None) -> str:
+DEFAULT_KEYFRAME_SUBDIR = "keyframes_origin"
+LEGACY_KEYFRAME_SUBDIR  = "frames"
+
+
+def _resolve_subdir(video_dir: Path, subdir: str) -> str:
+    """Pick the actual keyframe subdir for this bank.
+
+    New layout is ``keyframes_origin/`` (+ ``keyframes_resized/``); legacy banks
+    only have ``frames/``. If the requested subdir is missing, fall back to
+    legacy ``frames/`` so old banks still work.
+    """
+    if (video_dir / subdir).is_dir():
+        return subdir
+    if (video_dir / LEGACY_KEYFRAME_SUBDIR).is_dir():
+        return LEGACY_KEYFRAME_SUBDIR
+    return subdir
+
+
+def keyframe_path(keyframe_dir, video_id: str, chunk_id: int, chunk=None,
+                  subdir: str = DEFAULT_KEYFRAME_SUBDIR) -> str:
     """Return the sharpest representative frame for a chunk.
 
-    Prefers ``chunk.keyframe_path`` (set at build time to the sharpest frame by
-    Laplacian variance) when it exists on disk. Falls back to the lowest-index
-    glob match so old banks without the field still work.
+    Looks under ``{keyframe_dir}/{video_id}/{subdir}/`` (default
+    ``keyframes_origin``). Falls back to ``frames/`` for legacy banks that
+    predate the origin/resized split. ``chunk.keyframe_path`` is consulted
+    only when its on-disk file exists; otherwise the chunk_id glob is used so
+    the subdir switch (origin ↔ resized) is honoured.
     """
+    video_dir = Path(keyframe_dir) / video_id
+    actual = _resolve_subdir(video_dir, subdir)
+
     if chunk is not None:
         kp = getattr(chunk, "keyframe_path", "") or ""
-        if kp and Path(kp).is_file():
-            return kp
-    frames_dir = Path(keyframe_dir) / video_id / "frames"
-    matches = sorted(frames_dir.glob(f"{chunk_id:04d}_*.jpg"))
+        if kp:
+            kp_path = Path(kp)
+            if kp_path.is_absolute() and kp_path.is_file():
+                return str(kp_path)
+            # If chunk.keyframe_path points to a different subdir than the
+            # caller wants, swap to the requested actual subdir and try glob.
+            name = kp_path.name
+            alt = video_dir / actual / name
+            if alt.is_file():
+                return str(alt)
+
+    matches = sorted((video_dir / actual).glob(f"{chunk_id:04d}_*.jpg"))
     return str(matches[0]) if matches else ""
 
 
@@ -49,13 +81,17 @@ def _sharpest(paths: List[str]) -> str:
 
 
 def keyframe_paths(keyframe_dir, video_id: str, chunk_id: int, cap: int = 3,
-                   chunk=None) -> List[str]:
+                   chunk=None, subdir: str = DEFAULT_KEYFRAME_SUBDIR) -> List[str]:
     """All surviving frames for a chunk, capped to ``cap``.
 
     The sharpest frame (by Laplacian variance over existing disk files) is placed
-    first so that cap=1 always returns the best frame.
+    first so that cap=1 always returns the best frame. ``subdir`` selects
+    ``keyframes_origin`` vs ``keyframes_resized``; falls back to legacy
+    ``frames/`` if the requested subdir is missing.
     """
-    frames_dir = Path(keyframe_dir) / video_id / "frames"
+    video_dir = Path(keyframe_dir) / video_id
+    actual = _resolve_subdir(video_dir, subdir)
+    frames_dir = video_dir / actual
     all_matches = [str(p) for p in sorted(frames_dir.glob(f"{chunk_id:04d}_*.jpg"))]
     # pyramid naming: c{chunk_id:05d}_f*.jpg
     if not all_matches:
@@ -91,10 +127,11 @@ def load_keyframes(
     video_id: str,
     dedup_threshold: float = 0.92,
     cap: int = 8,
+    subdir: str = DEFAULT_KEYFRAME_SUBDIR,
 ) -> List:
     """Load, dedup, and cap keyframe images for a list of MemoryChunks."""
     pairs = []
     for c in chunks:
-        kp = keyframe_path(keyframe_dir, video_id, c.chunk_id, chunk=c)
+        kp = keyframe_path(keyframe_dir, video_id, c.chunk_id, chunk=c, subdir=subdir)
         pairs.append((c, load_keyframe_pil(kp)))
     return visual_dedup(pairs, dedup_threshold)[:cap]

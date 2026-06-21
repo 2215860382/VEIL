@@ -97,7 +97,7 @@ def main():
                     help="Cap evidence blocks passed to the final answerer")
     ap.add_argument("--verifier-evidence-k", type=int, default=None,
                     help="Cap evidence blocks passed to verifier")
-    ap.add_argument("--answer-keyframe-k",   type=int, default=16,
+    ap.add_argument("--answer-keyframe-k",   type=int, default=32,
                     help="Cap keyframe images passed to the final answerer")
     ap.add_argument("--max-frames",          type=int, default=None,
                     help="Override frame_sampling.max_frames from config")
