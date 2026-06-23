@@ -6,9 +6,8 @@ Rubric-guided judgment:
   3. Rubric criteria      – explicit 0 / 0.5 / 1 per criterion; aggregated to a score.
   4. Label and gaps       – label follows the rubric threshold; gaps drive the next query.
 
-Rubric lives in ``rubric_templates.yaml`` (structured YAML, pluggable per task_type).
-Currently all questions use ``templates.default``; extend ``type_aliases`` / ``keyword_rules``
-in the yaml to route different types to different templates without code changes.
+Rubric configurations live in ``src/rubric/templates/``.
+Use ``type_aliases`` / ``keyword_rules`` to route question types without code changes.
 """
 from __future__ import annotations
 
@@ -41,9 +40,26 @@ def _inject_images(message: dict, pil_images) -> dict:
 
 # ── YAML loading ───────────────────────────────────────────────────────────────
 
-@lru_cache(maxsize=1)
-def _rubric_config() -> Tuple[Dict, Dict, Dict[str, str], List[Tuple[List[str], str]]]:
-    path = Path(__file__).with_name("rubric_templates.yaml")
+RUBRIC_TEMPLATE_FILES = {
+    "legacy": "legacy.yaml",
+    "generated_v2": "generated_v2.yaml",
+}
+
+
+@lru_cache(maxsize=None)
+def _rubric_config(
+    template_name: str = "generated_v2",
+) -> Tuple[Dict, Dict, Dict[str, str], List[Tuple[List[str], str]]]:
+    filename = RUBRIC_TEMPLATE_FILES.get(template_name)
+    if filename is None:
+        valid = ", ".join(sorted(RUBRIC_TEMPLATE_FILES))
+        raise ValueError(f"Unknown rubric template {template_name!r}; choose from: {valid}")
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "rubric"
+        / "templates"
+        / filename
+    )
     if not path.is_file():
         raise FileNotFoundError(f"VEIL rubric templates missing: {path}")
     with path.open(encoding="utf-8") as f:
@@ -51,7 +67,7 @@ def _rubric_config() -> Tuple[Dict, Dict, Dict[str, str], List[Tuple[List[str], 
 
     general: Dict = data.get("general") or {}
     if not general.get("rubric_criteria"):
-        raise ValueError("rubric_templates.yaml must define general.rubric_criteria")
+        raise ValueError(f"{path} must define general.rubric_criteria")
 
     templates: Dict = {}
     for k, v in (data.get("templates") or {}).items():
@@ -70,14 +86,18 @@ def _rubric_config() -> Tuple[Dict, Dict, Dict[str, str], List[Tuple[List[str], 
     return general, templates, aliases, keyword_rules
 
 
-def get_rubric_dict(question: str, task_type: Optional[str] = None) -> dict:
+def get_rubric_dict(
+    question: str,
+    task_type: Optional[str] = None,
+    template_name: str = "generated_v2",
+) -> dict:
     """Return the combined rubric dict for the given question / task type.
 
     Always includes general criteria. If a type-specific template matches,
     its criteria are appended and its scoring_rule / sufficient_threshold apply.
     Falls back to general's scoring_rule / sufficient_threshold when no type matches.
     """
-    general, templates, aliases, keyword_rules = _rubric_config()
+    general, templates, aliases, keyword_rules = _rubric_config(template_name)
 
     # Resolve type-specific template key
     key: Optional[str] = None
@@ -104,9 +124,13 @@ def get_rubric_dict(question: str, task_type: Optional[str] = None) -> dict:
     return dict(general)
 
 
-def get_rubric(question: str, task_type: Optional[str] = None) -> str:
+def get_rubric(
+    question: str,
+    task_type: Optional[str] = None,
+    template_name: str = "generated_v2",
+) -> str:
     """Return the rubric as a formatted text string (backward-compat helper)."""
-    d = get_rubric_dict(question, task_type)
+    d = get_rubric_dict(question, task_type, template_name)
     if "_legacy_text" in d:
         return d["_legacy_text"]
     return _format_rubric_as_text(d)
@@ -150,7 +174,14 @@ Based on the overall evidence for each option:
   false   : evidence clearly establishes this option is incorrect
   unknown : evidence is insufficient to determine whether this option is correct or not
 
-## Step 3 — Missing Evidence Analysis
+## Step 3 — Per-(Option, Criterion) Failure Diagnosis
+For EACH (option, criterion) pair whose score is BELOW 1.0, write ONE concrete sentence
+(≤ 20 words) naming the SPECIFIC missing fact, time range, or entity that prevents a
+full-confidence judgment. Be concrete (entity names, time anchors, events) — not
+generic ("more context needed").
+Skip pairs that scored 1.0. Leave the inner dict empty if no failures.
+
+## Step 4 — Missing Evidence Analysis
 If any option is "unknown", write ONE actionable sentence in "missing_evidence_analysis"
 naming the specific fact, time range, or event still needed to resolve it.
 Leave it empty string if no option is unknown.
@@ -160,6 +191,10 @@ Return ONLY this JSON (use actual criterion names from the Rubric):
   "option_criteria_scores": {
     "A": {"<criterion>": 0.0, ...},
     "B": {"<criterion>": 0.0, ...}
+  },
+  "criteria_diagnosis": {
+    "A": {"<criterion>": "specific missing fact for A on this criterion"},
+    "B": {"<criterion>": "..."}
   },
   "option_judgment": {
     "A": "true|false|unknown",
@@ -202,7 +237,12 @@ For each option, score each rubric criterion:
 
 Prefer true/false over unknown whenever the evidence permits a reasonable inference.
 
-## Step 3 — Missing Evidence Analysis
+## Step 3 — Per-(Option, Criterion) Failure Diagnosis
+For each (option, criterion) pair scored below 1.0, write ONE concrete sentence
+(≤ 20 words) naming the specific missing fact, entity, or time anchor. Be concrete,
+not generic. Skip 1.0 pairs. Leave inner dict empty if no failures.
+
+## Step 4 — Missing Evidence Analysis
 If any option is "unknown", write ONE actionable sentence naming the specific
 fact still needed. Leave empty if no option is unknown.
 
@@ -211,6 +251,10 @@ Return ONLY this JSON:
   "option_criteria_scores": {
     "A": {"<criterion>": 0.0, ...},
     "B": {"<criterion>": 0.0, ...}
+  },
+  "criteria_diagnosis": {
+    "A": {"<criterion>": "specific missing fact for A on this criterion"},
+    "B": {"<criterion>": "..."}
   },
   "option_judgment": {
     "A": "true|false|unknown",
@@ -384,6 +428,23 @@ def _criterion_weights(rubric: dict) -> Dict[str, float]:
     return weights
 
 
+def _criterion_metadata(rubric: dict) -> Dict[str, Dict]:
+    """Return {criterion_name: {description, failure_repair_action}}.
+
+    Used to enrich weak_rubric_criteria entries with action hints for planner.
+    """
+    meta: Dict[str, Dict] = {}
+    for crit in rubric.get("rubric_criteria") or []:
+        name = str(crit.get("name") or "").strip()
+        if not name:
+            continue
+        meta[name] = {
+            "description": str(crit.get("description") or ""),
+            "failure_repair_action": str(crit.get("failure_repair_action") or "refine_query"),
+        }
+    return meta
+
+
 def _format_evidence(evidence_texts: List[str]) -> str:
     if not evidence_texts:
         return "(no evidence retrieved yet)"
@@ -494,7 +555,7 @@ class Verifier:
         ]
         if keyframe_images and getattr(self.llm, '_api_endpoints', None):
             messages[-1] = _inject_images(messages[-1], keyframe_images)
-        raw    = self.llm.chat(messages, max_new_tokens=800, enable_thinking=False)
+        raw    = self.llm.chat(messages, max_new_tokens=1200, enable_thinking=False)
         parsed = extract_json(raw)
 
         # ── Parse option_criteria_scores ───────────────────────────────────────
@@ -513,6 +574,22 @@ class Verifier:
                         scores[str(cname).strip()] = 0.0
                 if scores:
                     option_criteria_scores[opt] = scores
+
+        # ── Parse criteria_diagnosis: {opt: {criterion: "why fail"}} ─────────
+        raw_diag = parsed.get("criteria_diagnosis") or {}
+        criteria_diagnosis: Dict[str, Dict[str, str]] = {}
+        if isinstance(raw_diag, dict):
+            for opt_key, crit_dict in raw_diag.items():
+                opt = as_str(opt_key).strip().upper()[:1]
+                if not opt or not isinstance(crit_dict, dict):
+                    continue
+                per_crit: Dict[str, str] = {}
+                for cname, ctext in crit_dict.items():
+                    text = as_str(ctext).strip()
+                    if text:
+                        per_crit[str(cname).strip()] = text
+                if per_crit:
+                    criteria_diagnosis[opt] = per_crit
 
         # ── Compute option_rubric_scores (weighted average per option) ─────────
         weights = _criterion_weights(rubric_dict)
@@ -563,22 +640,70 @@ class Verifier:
         else:
             label = "INSUFFICIENT"
 
-        # ── Weak rubric criteria (from unknown options only) ───────────────────
-        weak_rubric_criteria: List[str] = []
+        # ── Weak rubric criteria (structured: name + score + action + desc) ──
+        # On INSUFFICIENT, gather criterion-level averages across the option set
+        # that's still in question. Two changes vs. the old logic:
+        #   * Fall back to ALL options when unknown_opts is empty so verdict
+        #     INSUFFICIENT never sends silent feedback to the planner.
+        #   * Use sufficient_threshold (default 0.75) as the "weak" cutoff so
+        #     0.5-0.7 grey-zone criteria stop disappearing.
+        # Always keep at least the lowest-scoring TOP_K so planner gets a hint
+        # even when every criterion is borderline.
+        weak_rubric_criteria: List[Dict] = []
         missing: Optional[str] = None
-        if label == "INSUFFICIENT" and unknown_opts:
+        TOP_K_WEAK = 3
+        if label == "INSUFFICIENT":
+            target_opts = unknown_opts if unknown_opts else all_opts
             crit_totals: Dict[str, float] = {}
             crit_counts: Dict[str, int]   = {}
-            for opt in unknown_opts:
+            for opt in target_opts:
                 for crit, sc in option_criteria_scores.get(opt, {}).items():
                     crit_totals[crit] = crit_totals.get(crit, 0.0) + sc
                     crit_counts[crit] = crit_counts.get(crit, 0) + 1
+            crit_meta = _criterion_metadata(rubric_dict)
             if crit_totals:
                 crit_avgs = {k: crit_totals[k] / crit_counts[k] for k in crit_totals}
-                weak_rubric_criteria = [
-                    k for k, v in sorted(crit_avgs.items(), key=lambda x: x[1])
-                    if v < 0.5
-                ]
+                ranked = sorted(crit_avgs.items(), key=lambda x: x[1])  # weakest first
+                below_thr = [(k, v) for k, v in ranked if v < sufficient_threshold]
+                # If filter wipes everything (all criteria >= threshold yet label
+                # is INSUFFICIENT — typical grey-zone case), keep the bottom K.
+                picked = below_thr if below_thr else ranked[:TOP_K_WEAK]
+                for name, score in picked:
+                    m = crit_meta.get(name, {})
+                    failing_opts = [
+                        opt for opt in target_opts
+                        if option_criteria_scores.get(opt, {}).get(name, 1.0) < sufficient_threshold
+                    ]
+                    diag_for_crit: Dict[str, str] = {}
+                    for opt in failing_opts:
+                        d = criteria_diagnosis.get(opt, {}).get(name)
+                        if d:
+                            diag_for_crit[opt] = d
+                    weak_rubric_criteria.append({
+                        "name":                  name,
+                        "score":                 round(float(score), 3),
+                        "failure_repair_action": m.get("failure_repair_action", "refine_query"),
+                        "description":           m.get("description", ""),
+                        "failing_options":       failing_opts,
+                        "diagnosis":             diag_for_crit,
+                    })
+            elif crit_meta:
+                # LLM gave no criteria scores at all — surface metadata as a hint
+                # so planner still sees "what should have been checked".
+                for name, m in list(crit_meta.items())[:TOP_K_WEAK]:
+                    weak_rubric_criteria.append({
+                        "name":                  name,
+                        "score":                 0.0,
+                        "failure_repair_action": m.get("failure_repair_action", "refine_query"),
+                        "description":           m.get("description", ""),
+                        "failing_options":       list(target_opts),
+                        "diagnosis":             {
+                            opt: d for opt, d in (
+                                (opt, criteria_diagnosis.get(opt, {}).get(name))
+                                for opt in target_opts
+                            ) if d
+                        },
+                    })
             raw_missing = parsed.get("missing_evidence_analysis")
             if isinstance(raw_missing, str) and raw_missing.strip():
                 missing = raw_missing.strip()

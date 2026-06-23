@@ -95,9 +95,17 @@ src/
     _keyframes.py
   agents/
     planner.py                       # iter-0 decomposition + iter≥1 unified planner
-    verifier.py
+    verifier.py                      # rubric-guided evidence verification
     answerer.py
-    rubric_templates.yaml
+  rubric/
+    templates/
+      legacy.yaml                    # earlier experiment rubric
+      generated_v2.yaml              # current generated rubric
+    generation/
+      generate_instance.py           # per-question rubric generation
+      distill.py                      # question-type/general distillation
+      prompts/
+    artifacts/                       # ignored generation outputs and logs
   utils/
     logging.py
     jsonx.py

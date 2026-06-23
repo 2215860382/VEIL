@@ -119,14 +119,6 @@ def main():
     ap.add_argument("--text-first-keyframes", action="store_true",
                     help="Two-stage answerer: LLM (text-only) picks which chunks need visual "
                          "confirmation; VLM gets keyframes only for those chunks")
-    ap.add_argument("--image-timestamps", action="store_true",
-                    help="Prepend a [Frame at Xs — Segment N] text label before each keyframe "
-                         "image in the answerer prompt")
-    ap.add_argument("--no-question-first", action="store_false", dest="question_first",
-                    default=True,
-                    help="Disable question-first prompting (default: on). With question-first, "
-                         "the question + choices appear at the TOP of the answerer prompt "
-                         "before images and evidence, then repeat at the end")
     ap.add_argument("--align-images-to-evidence", action="store_true",
                     help="Reorder keyframes so they follow the rubric-reranked evidence order "
                          "(image i sits alongside evidence segment i by chunk_id)")
@@ -142,6 +134,13 @@ def main():
                          "coarse_to_fine (L3→L1 window filter), "
                          "multi_pool (L1+L2 merged), "
                          "planner_ctx (L3 injected into planner)")
+    ap.add_argument("--legacy-actions-only", action="store_true",
+                    help="Restrict planner to targeted/broadcast only "
+                         "(isolates verifier signal-repair from action-space expansion).")
+    ap.add_argument("--rubric-template",
+                    choices=["legacy", "generated_v2"],
+                    default="generated_v2",
+                    help="Rubric template set loaded by the verifier.")
     args = ap.parse_args()
     global PIPELINE_NAME
     if args.pipeline_name:
@@ -321,12 +320,12 @@ def main():
             dialogue_first=args.dialogue_first,
             asr_alpha=args.asr_alpha,
             text_first_keyframes=args.text_first_keyframes,
-            image_timestamps=args.image_timestamps,
-            question_first=args.question_first,
             align_images_to_evidence=args.align_images_to_evidence,
             use_oracle=args.use_oracle,
             gold_answer=s.answer if args.use_oracle else "",
             multi_layer_mode=args.multi_layer_mode,
+            legacy_actions_only=args.legacy_actions_only,
+            rubric_template=args.rubric_template,
         )
         return run_veil(s.question, s.candidates, bank, embedder, answerer, llm,
                         task_type=s.question_type, **kw), None
