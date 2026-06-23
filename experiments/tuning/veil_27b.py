@@ -134,9 +134,13 @@ def main():
                          "coarse_to_fine (L3→L1 window filter), "
                          "multi_pool (L1+L2 merged), "
                          "planner_ctx (L3 injected into planner)")
-    ap.add_argument("--legacy-actions-only", action="store_true",
+    ap.add_argument("--legacy-actions-only", action="store_true", default=True,
                     help="Restrict planner to targeted/broadcast only "
-                         "(isolates verifier signal-repair from action-space expansion).")
+                         "(default; matches mf_tsqf strategy space).")
+    ap.add_argument("--expanded-actions", dest="legacy_actions_only",
+                    action="store_false",
+                    help="Allow expanded planner actions: asr_match, time_sorted, "
+                         "dense_sample, and loose_verify.")
     ap.add_argument("--rubric-template",
                     choices=["legacy", "generated_v2", "coverage_v3"],
                     default="coverage_v3",

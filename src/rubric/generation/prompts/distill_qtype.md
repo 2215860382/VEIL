@@ -37,10 +37,10 @@ requirements are used by a verifier before stance classification:
 
 # Repair Actions
 
-For each requirement, choose the repair action that best retrieves missing
-evidence:
-`refine_query`, `asr_match`, `time_sorted`, `dense_sample`, `loose_verify`,
-`broadcast`.
+For each requirement, choose one of two repair actions:
+- `refine_query`: focused semantic retrieval for a specific missing fact
+- `broadcast`: uniform sampling over broader unseen video segments for global
+  or timeline-wide missing evidence
 
 # Output Format
 

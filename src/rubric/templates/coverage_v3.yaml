@@ -35,7 +35,7 @@ templates:
         required: true
         weight: 1.0
         modality: multimodal
-        repair_action: dense_sample
+        repair_action: refine_query
       - id: cause_or_motive
         description: "Observe or hear the concrete reason, motive, or consequence connecting the action to the proposed explanation."
         required: true
@@ -47,7 +47,7 @@ templates:
         required: true
         weight: 0.8
         modality: temporal
-        repair_action: time_sorted
+        repair_action: refine_query
 
   action_recognition:
     evidence_requirements:
@@ -62,13 +62,13 @@ templates:
         required: true
         weight: 1.0
         modality: visual
-        repair_action: dense_sample
+        repair_action: refine_query
       - id: action_time_scope
         description: "Confirm the action occurs in the time segment or sequence requested by the question."
         required: true
         weight: 0.8
         modality: temporal
-        repair_action: time_sorted
+        repair_action: refine_query
 
   attribute_perception:
     evidence_requirements:
@@ -83,7 +83,7 @@ templates:
         required: true
         weight: 1.0
         modality: multimodal
-        repair_action: dense_sample
+        repair_action: refine_query
       - id: attribute_context
         description: "Confirm the attribute belongs to the correct entity and requested time or scene."
         required: true
@@ -110,7 +110,7 @@ templates:
         required: true
         weight: 1.0
         modality: visual
-        repair_action: dense_sample
+        repair_action: refine_query
 
   information_synopsis:
     evidence_requirements:
@@ -140,13 +140,13 @@ templates:
         required: true
         weight: 0.9
         modality: visual
-        repair_action: dense_sample
+        repair_action: refine_query
       - id: text_reading
         description: "Read the exact word, number, label, or phrase needed to judge the option."
         required: true
         weight: 1.0
         modality: ocr
-        repair_action: dense_sample
+        repair_action: refine_query
       - id: text_context
         description: "Associate the text with the correct object, speaker, scene, or time."
         required: true
@@ -182,7 +182,7 @@ templates:
         required: true
         weight: 1.0
         modality: visual
-        repair_action: dense_sample
+        repair_action: refine_query
       - id: distinguishing_features
         description: "Observe the visual or spoken features that distinguish the proposed identity from the alternatives."
         required: true
@@ -203,19 +203,19 @@ templates:
         required: true
         weight: 1.0
         modality: visual
-        repair_action: dense_sample
+        repair_action: refine_query
       - id: reference_frame
         description: "Establish the viewpoint or reference entity used for left, right, front, behind, or distance."
         required: true
         weight: 1.0
         modality: visual
-        repair_action: dense_sample
+        repair_action: refine_query
       - id: spatial_relation
         description: "Directly observe the relative position, direction, movement, or containment relation."
         required: true
         weight: 1.0
         modality: visual
-        repair_action: dense_sample
+        repair_action: refine_query
 
   temporal:
     evidence_requirements:
@@ -230,10 +230,10 @@ templates:
         required: true
         weight: 1.0
         modality: temporal
-        repair_action: time_sorted
+        repair_action: refine_query
       - id: temporal_relation
         description: "Establish the requested before, after, first, last, duration, or sequence relation."
         required: true
         weight: 1.0
         modality: temporal
-        repair_action: time_sorted
+        repair_action: refine_query

@@ -584,7 +584,7 @@ def run_veil(
     text_first_keyframes:  bool         = False,
     align_images_to_evidence: bool      = False,
     multi_layer_mode:      str          = "none",
-    legacy_actions_only:   bool         = False,
+    legacy_actions_only:   bool         = True,
     rubric_template:       str          = "coverage_v3",
 ) -> dict:
     """Iter-0 sub-question decomposition + iter ≥1 unified-planner repair.

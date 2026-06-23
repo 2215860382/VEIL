@@ -34,13 +34,10 @@ to verify every option.
 
 # Repair Actions
 
-Choose the best repair action for missing evidence:
-- `refine_query`: issue a more specific semantic retrieval query
-- `asr_match`: locate an exact or paraphrased spoken phrase in ASR
-- `time_sorted`: reorder existing evidence by time to resolve sequence
-- `dense_sample`: inspect more frames from already retrieved chunks
-- `loose_verify`: accept indirect inference only after coverage is complete
-- `broadcast`: sample broadly across the whole video
+Choose one of two repair actions:
+- `refine_query`: issue focused semantic retrieval queries for specific missing facts
+- `broadcast`: uniformly sample broader unseen video segments when the missing
+  evidence requires global or timeline-wide coverage
 
 # Output Format
 

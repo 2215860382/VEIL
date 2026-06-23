@@ -96,6 +96,9 @@ missing fact (e.g. "option A lacks the name of the award presenter").
 Write each query so it would retrieve THAT fact — concrete entity names, event
 descriptions, or time anchors. Do not paraphrase the original question.
 
+If a gap recommends `refine_query`, use `targeted`. If it recommends
+`broadcast`, use `broadcast`.
+
 ## Output format
 Return ONLY a JSON object:
 {
@@ -221,7 +224,7 @@ def _plan_next(
                     if priority is not None:
                         bits.append(f"(priority={priority})")
                     bits.append(f"modality={modality}")
-                    if not legacy_only:
+                    if not legacy_only or action in ("refine_query", "broadcast"):
                         bits.append(f"[recommended action: {action}]")
                     if desc:
                         bits.append(f"- {desc}")
@@ -263,8 +266,10 @@ def _plan_next(
         parts.append(
             heading + "\n" + "\n".join(lines)
         )
-        if actions_seen and not legacy_only:
-            top_action = actions_seen[0]  # weakest criterion's action
+        if actions_seen and (
+            not legacy_only or actions_seen[0] in ("refine_query", "broadcast")
+        ):
+            top_action = actions_seen[0]
             parts.append(
                 f"The top repair item suggests action `{top_action}` — "
                 "strongly prefer the corresponding strategy."
@@ -318,6 +323,8 @@ def _plan_next(
         try:
             d        = _json.loads(m.group())
             strategy = str(d.get("strategy", "targeted")).lower()
+            if strategy == "refine_query":
+                strategy = "targeted"
             if strategy not in valid_strategies:
                 strategy = "targeted"
             queries  = [str(q).strip() for q in (d.get("queries") or []) if str(q).strip()]
