@@ -1,60 +1,60 @@
-You are designing a **per-question evaluation rubric** for a video QA verifier.
+You are designing **per-question evidence requirements** for a video QA verifier.
 
-The verifier sees a candidate answer choice + retrieved video evidence, and must
-score whether the evidence is sufficient to support that answer. Your job is to
-write the criteria the verifier uses for THIS specific question.
+The verifier must first decide whether the retrieved evidence is complete enough
+to judge each answer option. Only after coverage is complete may it label an
+option as supported or refuted.
 
 # Inputs
 
 You will receive:
-- **question** — the natural-language question
-- **candidates** — four answer options A/B/C/D
-- **gold** — the correct answer (use as a "reference" to ground rubric criteria,
-  *do not* include the literal answer in any rubric criterion)
-- **question_type** — VideoMME category (Object Reasoning / Temporal Reasoning / ...)
+- **question**: the natural-language question
+- **candidates**: four answer options A/B/C/D
+- **question_type**: VideoMME category
 
-# Design principles (follow all four)
+Do not assume the correct answer is known. Do not write requirements that reveal
+or prefer any specific option. Requirements must be answer-agnostic and usable
+to verify every option.
 
-1. **Expert-grounding.** Anchor each criterion in concrete facts/relations needed
-   to deduce the gold answer from video evidence. Do not invent abstract criteria
-   disconnected from this specific question.
+# Design Principles
 
-2. **Comprehensive coverage.** Cover the key dimensions the verifier should
-   check: which entities must be located, which actions/states must be observed,
-   what temporal/spatial relationships must hold, etc. Aim for **4-7 criteria**.
+1. **Coverage first.** Each requirement names a concrete fact that must be
+   present before judging support/refute. If the fact is missing, the verifier
+   must output unknown for the affected option.
 
-3. **Self-contained.** Each criterion must be independently checkable by reading
-   the evidence — no cross-references between criteria, no domain knowledge
-   required beyond what is in the question itself.
+2. **Option-comparable.** Requirements must apply to every answer option, not
+   only one option. Phrase them as evidence needs, not conclusions.
 
-4. **Binary positive form.** Every criterion is a positive statement; the
-   verifier scores it 1.0 (satisfied) / 0.5 (partial) / 0.0 (unsatisfied). Do
-   NOT phrase criteria as negatives or "pitfalls".
+3. **Concrete retrieval target.** Each requirement should identify what the
+   retriever should look for: target entity, relevant action/state, temporal
+   anchor, visual text, count scope, spoken phrase, spatial relation, or global
+   coverage.
 
-# Output format
+4. **Minimal and non-overlapping.** Produce 3-6 requirements. Avoid redundant
+   requirements that would trigger the same retrieval query.
 
-Output **valid YAML only**, no prose. Each criterion has:
+# Repair Actions
 
-- `name`: snake_case identifier (≤ 30 chars)
-- `description`: one positive sentence stating what evidence must show
-- `score_1`: what perfect satisfaction looks like
-- `score_half`: what partial satisfaction looks like
-- `score_0`: what total failure looks like
-- `weight`: float in [0.1, 1.0] — relative importance to answering this question
-- `failure_repair_action`: one of `refine_query` / `asr_match` / `time_sorted` /
-  `dense_sample` / `loose_verify` / `broadcast`
+Choose the best repair action for missing evidence:
+- `refine_query`: issue a more specific semantic retrieval query
+- `asr_match`: locate an exact or paraphrased spoken phrase in ASR
+- `time_sorted`: reorder existing evidence by time to resolve sequence
+- `dense_sample`: inspect more frames from already retrieved chunks
+- `loose_verify`: accept indirect inference only after coverage is complete
+- `broadcast`: sample broadly across the whole video
+
+# Output Format
+
+Output valid YAML only, no prose:
 
 ```yaml
-criteria:
-  - name: <snake_case>
-    description: "..."
-    score_1: "..."
-    score_half: "..."
-    score_0: "..."
+evidence_requirements:
+  - id: <snake_case_id>
+    description: "Concrete fact that must be covered before judging options."
+    required: true
     weight: 0.0
-    failure_repair_action: refine_query
-  - ...
+    modality: visual|dialogue|temporal|ocr|global|multimodal
+    repair_action: refine_query
 ```
 
-Do not output a `scoring_rule` or `sufficient_threshold` — those are set
-downstream during distillation.
+Use weights in [0.1, 1.0]. Higher weight means the requirement is more central
+to answering the question.

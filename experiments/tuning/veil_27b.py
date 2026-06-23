@@ -138,8 +138,8 @@ def main():
                     help="Restrict planner to targeted/broadcast only "
                          "(isolates verifier signal-repair from action-space expansion).")
     ap.add_argument("--rubric-template",
-                    choices=["legacy", "generated_v2"],
-                    default="generated_v2",
+                    choices=["legacy", "generated_v2", "coverage_v3"],
+                    default="coverage_v3",
                     help="Rubric template set loaded by the verifier.")
     args = ap.parse_args()
     global PIPELINE_NAME

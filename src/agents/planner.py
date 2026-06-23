@@ -2,9 +2,9 @@
 
 Two-stage planning:
   iter-0: sub-question decomposition (LLM-decomposed or option-grounded).
-  iter≥1: unified planner — given verifier signals (unknown_options / failed rubric
-          criteria / missing_evidence_analysis), pick {targeted (1-4 queries),
-          broadcast (uniform timeline coverage)}.
+  iter≥1: unified planner — given verifier signals (unknown_options /
+          evidence_gaps or failed rubric criteria / missing_evidence_analysis),
+          pick the next repair strategy.
 
 Safety nets on iter≥1 query generation (applied via ``filter_targeted_queries``):
   - Jaccard ≥ ``dedup_thresh`` vs prior queries → drop the query.
@@ -77,8 +77,8 @@ def _option_grounded_subquestions(question: str, candidates: List[str]) -> List[
 # ── Iter ≥1: Unified Planner ─────────────────────────────────────────────────
 
 _PLANNER_LEGACY_SYS = """You are a retrieval strategy planner for a video question-answering system.
-Given the current evidence and what is still missing (verifier-supplied weak rubric
-criteria + per-option diagnoses), choose the next retrieval strategy.
+Given the current evidence and what is still missing, choose the next retrieval
+strategy.
 
 ## Strategies
 
@@ -91,8 +91,8 @@ criteria + per-option diagnoses), choose the next retrieval strategy.
   full duration) or when targeted queries have repeatedly failed.
 
 ## How to write queries
-Read the per-option `diagnosis` lines under each weak criterion. They name the
-EXACT missing fact (e.g. "option A lacks the name of the award presenter").
+Read the evidence gaps or per-option diagnosis lines. They name the EXACT
+missing fact (e.g. "option A lacks the name of the award presenter").
 Write each query so it would retrieve THAT fact — concrete entity names, event
 descriptions, or time anchors. Do not paraphrase the original question.
 
@@ -108,8 +108,7 @@ For broadcast, set queries to []."""
 
 _PLANNER_UNIFIED_SYS = """You are a retrieval strategy planner for a video question-answering system.
 Given the current evidence, what is still missing, and the verifier's diagnostic
-hints (weak rubric criteria with their suggested repair actions), choose the BEST
-next strategy.
+hints, choose the BEST next strategy.
 
 ## Strategies
 
@@ -141,10 +140,10 @@ next strategy.
   but verifier is being too strict about explicit statements.
 
 ## How to pick a strategy
-Look at `failure_repair_action` on the weakest weak_rubric_criteria entries.
-Map each action to the corresponding strategy of the same name. If multiple
-weak criteria suggest conflicting actions, pick the action of the SINGLE
-lowest-scoring criterion. Fall back to `targeted` when no weak criteria.
+Prefer `recommended_action` on the highest-priority evidence gap. If only legacy
+rubric criteria are present, use `failure_repair_action` from the weakest
+criterion. Map each action to the corresponding strategy of the same name. Fall
+back to `targeted` when no diagnostic item is available.
 
 ## Output format
 Return ONLY a JSON object:
@@ -175,7 +174,7 @@ def _plan_next(
     llm,
     plan_history: List[List[str]] = (),
     unknown_options: Optional[List[str]] = None,
-    weak_rubric_criteria: Optional[dict] = None,
+    weak_rubric_criteria: Optional[list] = None,
     prune_satisfied: bool = False,
     legacy_only: bool = False,
 ) -> dict:
@@ -199,15 +198,40 @@ def _plan_next(
     if unknown_options:
         parts.append(f"Current unresolved options: {unknown_options}.")
     if weak_rubric_criteria:
-        # Accept both legacy List[str] and new List[Dict] formats.
+        # Accept coverage evidence gaps, legacy List[str], and legacy List[Dict].
         lines = []
         actions_seen = []
+        has_gap = any(
+            isinstance(item, dict) and "requirement_id" in item
+            for item in weak_rubric_criteria
+        )
         for item in weak_rubric_criteria:
             if isinstance(item, dict):
-                name   = item.get("name", "")
-                score  = item.get("score")
+                if "requirement_id" in item:
+                    req_id = item.get("requirement_id", "")
+                    opt = item.get("option", "")
+                    action = item.get("recommended_action", "refine_query")
+                    desc = item.get("missing_fact", "")
+                    modality = item.get("modality", "multimodal")
+                    priority = item.get("priority")
+                    actions_seen.append(action)
+                    bits = [f"  - {req_id}"]
+                    if opt:
+                        bits.append(f"option={opt}")
+                    if priority is not None:
+                        bits.append(f"(priority={priority})")
+                    bits.append(f"modality={modality}")
+                    if not legacy_only:
+                        bits.append(f"[recommended action: {action}]")
+                    if desc:
+                        bits.append(f"- {desc}")
+                    lines.append(" ".join(bits))
+                    continue
+
+                name = item.get("name", "")
+                score = item.get("score")
                 action = item.get("failure_repair_action", "refine_query")
-                desc   = item.get("description", "")
+                desc = item.get("description", "")
                 failing = item.get("failing_options") or []
                 diagnosis = item.get("diagnosis") or {}
                 actions_seen.append(action)
@@ -231,13 +255,18 @@ def _plan_next(
                             lines.append(f"      · option {opt}: {d.strip()}")
             else:
                 lines.append(f"  - {item}")
+        heading = (
+            "Evidence gaps to repair (highest priority first):"
+            if has_gap
+            else "Weak rubric criteria to repair (weakest first):"
+        )
         parts.append(
-            "Weak rubric criteria to repair (weakest first):\n" + "\n".join(lines)
+            heading + "\n" + "\n".join(lines)
         )
         if actions_seen and not legacy_only:
             top_action = actions_seen[0]  # weakest criterion's action
             parts.append(
-                f"The weakest criterion suggests action `{top_action}` — "
+                f"The top repair item suggests action `{top_action}` — "
                 "strongly prefer the corresponding strategy."
             )
     if prune_satisfied and plan_history:
@@ -308,19 +337,31 @@ def _plan_next(
 
 # ── Verifier → planner repair context ────────────────────────────────────────
 
-def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> Tuple[str, Optional[List[str]]]:
+def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> Tuple[str, Optional[List]]:
     """Build verifier-derived context for the planner."""
     missing = str(verdict.get("missing_evidence_analysis") or "").strip()
 
     if not rubric_judgment:
         return (f"Missing evidence analysis: {missing}" if missing else ""), None
 
+    evidence_gaps = list(verdict.get("evidence_gaps") or [])
     weak_list = list(verdict.get("weak_rubric_criteria") or [])
     unknown = list(verdict.get("unknown_options") or [])
+    repair_items = evidence_gaps or weak_list
 
     parts = []
-    if weak_list:
-        # Render either legacy List[str] or new List[Dict] (with action+desc).
+    if evidence_gaps:
+        brief = []
+        for gap in evidence_gaps:
+            if isinstance(gap, dict):
+                req = str(gap.get("requirement_id", "")).strip()
+                opt = str(gap.get("option", "")).strip()
+                brief.append(f"{req}/{opt}" if opt else req)
+            else:
+                brief.append(str(gap))
+        parts.append("Evidence gaps: " + ", ".join(x for x in brief if x))
+    elif weak_list:
+        # Render either legacy List[str] or legacy List[Dict] (with action+desc).
         names_only = []
         for w in weak_list:
             if isinstance(w, dict):
@@ -332,7 +373,7 @@ def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> Tuple[str, 
         parts.append("Unresolved options: " + ", ".join(unknown))
     if missing:
         parts.append(f"Missing evidence analysis: {missing}")
-    return "\n".join(parts), weak_list or None
+    return "\n".join(parts), repair_items or None
 
 
 # ── Query similarity safety nets ─────────────────────────────────────────────
@@ -390,7 +431,7 @@ class Planner:
         verdict: dict,
         rubric_judgment: bool,
     ) -> Tuple[str, Optional[List[str]]]:
-        """Project a verifier verdict into (missing_description, weak_rubric_criteria)."""
+        """Project a verifier verdict into (missing_description, repair_items)."""
         return _planner_repair_context(verdict, rubric_judgment)
 
     def plan_next(
@@ -407,7 +448,7 @@ class Planner:
     ) -> Tuple[dict, str, Optional[List[str]]]:
         """Pick the next iter plan from the verifier verdict.
 
-        Returns (plan, missing_description, weak_rubric_criteria).
+        Returns (plan, missing_description, repair_items).
 
         legacy_only=True restricts strategies to {targeted, broadcast} —
         used to isolate the verifier signal-repair effect from the planner

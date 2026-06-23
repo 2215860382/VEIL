@@ -585,7 +585,7 @@ def run_veil(
     align_images_to_evidence: bool      = False,
     multi_layer_mode:      str          = "none",
     legacy_actions_only:   bool         = False,
-    rubric_template:       str          = "generated_v2",
+    rubric_template:       str          = "coverage_v3",
 ) -> dict:
     """Iter-0 sub-question decomposition + iter ≥1 unified-planner repair.
 
@@ -906,6 +906,10 @@ def run_veil(
             "verdict":                   last_verdict["label"],
             "option_judgment":           last_verdict.get("option_judgment"),
             "unknown_options":           last_verdict.get("unknown_options"),
+            "coverage":                  last_verdict.get("coverage"),
+            "option_stance":             last_verdict.get("option_stance"),
+            "option_coverage_scores":    last_verdict.get("option_coverage_scores"),
+            "evidence_gaps":             last_verdict.get("evidence_gaps"),
             "option_rubric_scores":      last_verdict.get("option_rubric_scores"),
             "weak_rubric_criteria":      last_verdict.get("weak_rubric_criteria"),
             "missing_evidence_analysis": last_verdict.get("missing_evidence_analysis") or None,
@@ -978,7 +982,11 @@ def run_veil(
 
         verifier_hint_oj = None
         verifier_hint_scores = None
-        if pass_verifier_judgment_to_answerer and last_verdict:
+        verifier_fully_sufficient = (
+            last_verdict.get("label") == "FULLY_SUFFICIENT"
+            and last_verdict.get("option_judgment")
+        )
+        if last_verdict and (pass_verifier_judgment_to_answerer or verifier_fully_sufficient):
             verifier_hint_oj = last_verdict.get("option_judgment")
             verifier_hint_scores = last_verdict.get("option_rubric_scores")
 

@@ -101,6 +101,7 @@ src/
     templates/
       legacy.yaml                    # earlier experiment rubric
       generated_v2.yaml              # current generated rubric
+      coverage_v3.yaml               # coverage-first verifier rubric
     generation/
       generate_instance.py           # per-question rubric generation
       distill.py                      # question-type/general distillation
