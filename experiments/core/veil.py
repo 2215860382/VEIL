@@ -27,71 +27,6 @@ from src.agents.planner import Planner
 from src.agents.verifier import Verifier, get_rubric_dict
 
 
-# ── ASR phrase match (planner strategy: asr_match) ───────────────────────────
-
-def _asr_match_retrieve(
-    queries: List[str],
-    bank: MemoryBank,
-    exclude_ids: Set[int],
-    top_k: int = 6,
-    dialogue_first: bool = False,
-) -> tuple[List[str], List[int], List[List[float]]]:
-    """Substring/word-overlap match against chunk.asr for quoted-phrase questions.
-
-    For each query, score every unseen chunk by:
-      * raw substring (case-insensitive) of the query in chunk.asr  -> score 10
-      * word-overlap ratio  (#shared / #query_words >= 0.5)         -> overlap_ratio
-    Pick the top_k highest-scoring chunks across all queries. The original BGE
-    retrieval has already failed for these (verifier flagged quote_grounding),
-    so we deliberately bypass embedding similarity.
-    """
-    if not queries:
-        return [], [], []
-
-    def _norm(s: str) -> str:
-        return re.sub(r"[^\w\s]", " ", s.lower()).strip()
-
-    scored: list = []
-    for c in bank.chunks:
-        if c.chunk_id in exclude_ids:
-            continue
-        asr = (c.asr or "").strip()
-        if not asr:
-            continue
-        asr_norm = _norm(asr)
-        best = 0.0
-        for q in queries:
-            q_norm = _norm(q)
-            if not q_norm:
-                continue
-            if q_norm in asr_norm:
-                best = max(best, 10.0)
-                continue
-            q_words = set(q_norm.split())
-            if not q_words:
-                continue
-            a_words = set(asr_norm.split())
-            overlap = len(q_words & a_words) / max(1, len(q_words))
-            if overlap >= 0.5:
-                best = max(best, overlap)
-        if best > 0:
-            scored.append((best, c))
-
-    scored.sort(key=lambda x: -x[0])
-    out_texts, out_ids, out_vecs = [], [], []
-    for _, c in scored[:top_k]:
-        parts = [f"[{c.start_time:.0f}s-{c.end_time:.0f}s]", c.memory_text]
-        if (c.asr or "").strip():
-            if dialogue_first:
-                parts.insert(1, f'[DIALOGUE] "{c.asr.strip()}"')
-            else:
-                parts.append(f"Speech: {c.asr}")
-        out_texts.append("\n".join(parts))
-        out_ids.append(c.chunk_id)
-        out_vecs.append(c.v_dynamic or [])
-    return out_texts, out_ids, out_vecs
-
-
 # ── Broadcast (uniform timeline sampling) ────────────────────────────────────
 
 def _broadcast_retrieve(
@@ -582,10 +517,10 @@ def run_veil(
     dialogue_first:        bool         = False,
     asr_alpha:             float        = 0.0,
     text_first_keyframes:  bool         = False,
+    image_timestamps:      bool         = False,
+    question_first:        bool         = True,
     align_images_to_evidence: bool      = False,
     multi_layer_mode:      str          = "none",
-    legacy_actions_only:   bool         = True,
-    rubric_template:       str          = "coverage_v3",
 ) -> dict:
     """Iter-0 sub-question decomposition + iter ≥1 unified-planner repair.
 
@@ -596,7 +531,7 @@ def run_veil(
     """
     verifier = Verifier(llm)
     planner  = Planner(llm)
-    rubric   = get_rubric_dict(question, task_type, rubric_template)
+    rubric   = get_rubric_dict(question, task_type)
 
     vis_query = f"A video frame showing {question} Possible answers: {' or '.join(candidates)}"
 
@@ -649,17 +584,7 @@ def run_veil(
                 question, candidates, all_evidence_texts, verdict_for_planning, plan_history,
                 rubric_judgment=rubric_judgment,
                 prune_satisfied=prune_satisfied,
-                legacy_only=legacy_actions_only,
             )
-            # Defensive coerce: in legacy mode, any leaked exotic strategy
-            # collapses back to targeted with whatever queries the planner
-            # produced (or the original question as a fallback).
-            if legacy_actions_only and next_plan.get("strategy") not in ("targeted", "broadcast"):
-                next_plan = {
-                    "strategy":  "targeted",
-                    "queries":   next_plan.get("queries") or [question],
-                    "reasoning": f"legacy_coerce_from_{next_plan.get('strategy')}",
-                }
             next_plan = planner.filter_targeted_queries(
                 next_plan, plan_history, embedder, all_ev_vecs,
                 dedup_thresh=query_history_dedup_threshold,
@@ -668,87 +593,19 @@ def run_veil(
             plan_history.append(next_plan["queries"])
             current_plan = next_plan
 
-        strategy          = current_plan.get("strategy", "targeted")
-        queries_this_iter = (current_plan["queries"]
-                             if strategy in ("targeted", "asr_match") else [])
+        do_broadcast      = (current_plan["strategy"] == "broadcast")
+        queries_this_iter = current_plan["queries"] if not do_broadcast else []
 
         # ── Retrieve ──────────────────────────────────────────────────────────
         new_texts, new_ids, new_vecs = [], [], []
-        # Per-iter override that propagates to verifier; loose_verify strategy
-        # flips it on for this iter's verifier call.
-        loose_this_iter = loose_verifier
-        # When dense_sample fires, per-chunk keyframe cap is raised for THIS iter.
-        kf_cap_this_iter = per_chunk_keyframe_cap
 
-        if strategy == "broadcast":
+        if do_broadcast:
             new_texts, new_ids, new_vecs = _broadcast_retrieve(
                 bank, seen_ids, n=final_top_k,
                 dialogue_first=dialogue_first,
             )
             iter_query = "[broadcast]"
-
-        elif strategy == "asr_match":
-            new_texts, new_ids, new_vecs = _asr_match_retrieve(
-                queries_this_iter, bank, seen_ids,
-                top_k=final_top_k, dialogue_first=dialogue_first,
-            )
-            iter_query = "[asr_match] " + " | ".join(queries_this_iter)
-
-        elif strategy == "time_sorted":
-            # Reorder accumulated evidence in-place by chunk start_time.
-            # No new retrieval, no new keyframes.
-            if all_chunk_ids:
-                order = sorted(
-                    range(len(all_chunk_ids)),
-                    key=lambda j: float(
-                        getattr(chunk_by_id.get(all_chunk_ids[j], None),
-                                "start_time", 0.0) or 0.0
-                    ),
-                )
-                all_evidence_texts = [all_evidence_texts[j] for j in order]
-                all_chunk_ids      = [all_chunk_ids[j]      for j in order]
-                all_ev_vecs        = [all_ev_vecs[j]        for j in order]
-            iter_query = "[time_sorted]"
-
-        elif strategy == "dense_sample":
-            # Pull MORE keyframes from chunks we already have. Bump per-chunk
-            # cap to 4 and re-load. Existing kf list is regenerated fresh from
-            # current chunk list (so we don't mix old caps with new caps).
-            iter_query = "[dense_sample]"
-            kf_cap_this_iter = max(per_chunk_keyframe_cap, 4)
-            if keyframe_dir is not None and all_chunk_ids:
-                rebuilt_kf:     list = []
-                rebuilt_cids:   list = []
-                rebuilt_ts:     list = []
-                rebuilt_vecs:   list = []
-                for cid in all_chunk_ids:
-                    c = chunk_by_id.get(cid)
-                    if c is None:
-                        continue
-                    paths = keyframe_paths(keyframe_dir, bank.video_id, c.chunk_id,
-                                           cap=kf_cap_this_iter, chunk=c)
-                    added_for_chunk = False
-                    for p in paths:
-                        img = load_keyframe_pil(p)
-                        if img is None:
-                            continue
-                        rebuilt_kf.append(img)
-                        rebuilt_cids.append(cid)
-                        rebuilt_ts.append(float(c.keyframe_ts or c.start_time or 0.0))
-                        added_for_chunk = True
-                    if added_for_chunk:
-                        rebuilt_vecs.append(c.v_visual if c.v_visual else [])
-                all_keyframes    = rebuilt_kf
-                all_kf_chunk_ids = rebuilt_cids
-                all_kf_ts        = rebuilt_ts
-                all_kf_vecs      = rebuilt_vecs
-
-        elif strategy == "loose_verify":
-            # Tell THIS iter's verifier call to accept indirect inference.
-            iter_query = "[loose_verify]"
-            loose_this_iter = True
-
-        else:  # "targeted" (default)
+        else:
             for q in queries_this_iter:
                 vq = vis_query if it == 0 else q
                 if multi_layer_mode == "coarse_to_fine":
@@ -777,20 +634,18 @@ def run_veil(
             iter_query = (" | ".join(queries_this_iter) if len(queries_this_iter) > 1
                           else (queries_this_iter[0] if queries_this_iter else ""))
 
-        # Dedup + append only when a retrieval strategy produced new chunks.
-        if strategy in ("targeted", "broadcast", "asr_match") and new_ids:
-            new_texts, new_ids, new_vecs = _dedup_by_similarity(
-                new_texts, new_ids, new_vecs, all_ev_vecs, evidence_dedup_threshold)
-            seen_ids.update(new_ids)
-            all_evidence_texts.extend(new_texts)
-            all_chunk_ids.extend(new_ids)
-            all_ev_vecs.extend(new_vecs)
+        new_texts, new_ids, new_vecs = _dedup_by_similarity(
+            new_texts, new_ids, new_vecs, all_ev_vecs, evidence_dedup_threshold)
+        seen_ids.update(new_ids)
+        all_evidence_texts.extend(new_texts)
+        all_chunk_ids.extend(new_ids)
+        all_ev_vecs.extend(new_vecs)
 
         # ── Keyframes (visual de-dup against all accumulated) ────────────────
-        # Only run for retrieval strategies that produced new chunks.
-        # dense_sample already rebuilt keyframes above; time_sorted/loose_verify
-        # don't touch the chunk list at all.
-        if keyframe_dir is not None and strategy in ("targeted", "broadcast", "asr_match"):
+        # Cross-chunk dedup decision based on chunk-level v_visual (one vector
+        # per chunk). If chunk is accepted, append up to per_chunk_keyframe_cap
+        # frames from its already-deduped within-chunk frame set.
+        if keyframe_dir is not None:
             for cid in new_ids:
                 c = chunk_by_id.get(cid)
                 if c is None:
@@ -800,7 +655,7 @@ def run_veil(
                     if float(np.max(np.array(all_kf_vecs, dtype=np.float32) @ v)) >= kf_dedup_threshold:
                         continue
                 paths = keyframe_paths(keyframe_dir, bank.video_id, c.chunk_id,
-                                       cap=kf_cap_this_iter, chunk=c)
+                                       cap=per_chunk_keyframe_cap, chunk=c)
                 added = False
                 for p in paths:
                     img = load_keyframe_pil(p)
@@ -831,7 +686,7 @@ def run_veil(
                                   explicit_attribution=explicit_attribution,
                                   verifier_attr=verifier_attr,
                                   verifier_opstatus=verifier_opstatus,
-                                  loose=loose_this_iter)
+                                  loose=loose_verifier)
 
         # ── Oracle check (post-verifier) ──────────────────────────────────────
         # Oracle uses the same evidence/keyframe caps as the final answerer.
@@ -906,10 +761,6 @@ def run_veil(
             "verdict":                   last_verdict["label"],
             "option_judgment":           last_verdict.get("option_judgment"),
             "unknown_options":           last_verdict.get("unknown_options"),
-            "coverage":                  last_verdict.get("coverage"),
-            "option_stance":             last_verdict.get("option_stance"),
-            "option_coverage_scores":    last_verdict.get("option_coverage_scores"),
-            "evidence_gaps":             last_verdict.get("evidence_gaps"),
             "option_rubric_scores":      last_verdict.get("option_rubric_scores"),
             "weak_rubric_criteria":      last_verdict.get("weak_rubric_criteria"),
             "missing_evidence_analysis": last_verdict.get("missing_evidence_analysis") or None,
@@ -982,11 +833,7 @@ def run_veil(
 
         verifier_hint_oj = None
         verifier_hint_scores = None
-        verifier_fully_sufficient = (
-            last_verdict.get("label") == "FULLY_SUFFICIENT"
-            and last_verdict.get("option_judgment")
-        )
-        if last_verdict and (pass_verifier_judgment_to_answerer or verifier_fully_sufficient):
+        if pass_verifier_judgment_to_answerer and last_verdict:
             verifier_hint_oj = last_verdict.get("option_judgment")
             verifier_hint_scores = last_verdict.get("option_rubric_scores")
 
@@ -995,6 +842,8 @@ def run_veil(
                                  keyframe_chunk_ids=kf_chunk_ids_for_ans,
                                  keyframe_ts=kf_ts_for_ans,
                                  evidence_chunk_ids=ev_ids,
+                                 image_timestamps=image_timestamps,
+                                 question_first=question_first,
                                  verifier_option_judgment=verifier_hint_oj,
                                  verifier_option_scores=verifier_hint_scores)
         result["n_keyframes_to_answer"] = len(kf_for_answer)
@@ -1005,5 +854,4 @@ def run_veil(
     result["evidence_chunk_ids"] = ev_ids
     result["evidence_texts"]     = ev_texts
     result["trace_iters"]        = iterations
-    result["rubric_template"]    = rubric_template
     return result

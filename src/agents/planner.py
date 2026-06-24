@@ -2,9 +2,9 @@
 
 Two-stage planning:
   iter-0: sub-question decomposition (LLM-decomposed or option-grounded).
-  iter≥1: unified planner — given verifier signals (unknown_options /
-          evidence_gaps or failed rubric criteria / missing_evidence_analysis),
-          pick the next repair strategy.
+  iter≥1: unified planner — given verifier signals (unknown_options / failed rubric
+          criteria / missing_evidence_analysis), pick {targeted (1-4 queries),
+          broadcast (uniform timeline coverage)}.
 
 Safety nets on iter≥1 query generation (applied via ``filter_targeted_queries``):
   - Jaccard ≥ ``dedup_thresh`` vs prior queries → drop the query.
@@ -76,86 +76,30 @@ def _option_grounded_subquestions(question: str, candidates: List[str]) -> List[
 
 # ── Iter ≥1: Unified Planner ─────────────────────────────────────────────────
 
-_PLANNER_LEGACY_SYS = """You are a retrieval strategy planner for a video question-answering system.
-Given the current evidence and what is still missing, choose the next retrieval
-strategy.
+_PLANNER_UNIFIED_SYS = """You are a retrieval strategy planner for a video question-answering system.
+Given the current evidence and what is still missing, decide the BEST next retrieval strategy.
 
 ## Strategies
 
-**targeted** — Issue 1–4 focused BGE queries to retrieve specific missing evidence.
-  Default. Each query targets a specific failing diagnosis and is distinct
-  from previously tried queries.
+**targeted** — Issue 1–4 focused queries to retrieve specific missing evidence.
+  Each query must be self-contained, target a single retrievable fact,
+  and not repeat queries already tried.
 
-**broadcast** — Sample frames uniformly across the uncovered video timeline (no queries).
-  Use for whole-video coverage (main theme / synopsis, events spread across the
-  full duration) or when targeted queries have repeatedly failed.
-
-## How to write queries
-Read the evidence gaps or per-option diagnosis lines. They name the EXACT
-missing fact (e.g. "option A lacks the name of the award presenter").
-Write each query so it would retrieve THAT fact — concrete entity names, event
-descriptions, or time anchors. Do not paraphrase the original question.
-
-If a gap recommends `refine_query`, use `targeted`. If it recommends
-`broadcast`, use `broadcast`.
+**broadcast** — Sample frames uniformly across the uncovered video timeline (no queries needed).
+  Use when coverage must span the ENTIRE video, including:
+  - Main theme, topic overview, synopsis, or overall narrative of the video
+  - Events spread throughout / across all segments / entire duration
+  - Chronological order, sequence of events, or timeline across the full video
+  - Targeted queries have repeatedly failed to find sufficient evidence
 
 ## Output format
 Return ONLY a JSON object:
 {
   "strategy": "targeted" | "broadcast",
   "queries": ["..."],
-  "reasoning": "<one sentence>"
-}
-For broadcast, set queries to []."""
-
-
-_PLANNER_UNIFIED_SYS = """You are a retrieval strategy planner for a video question-answering system.
-Given the current evidence, what is still missing, and the verifier's diagnostic
-hints, choose the BEST next strategy.
-
-## Strategies
-
-**targeted** — Issue 1–4 focused BGE queries to retrieve specific missing evidence.
-  Default when the verifier signal points to "refine_query". Each query is
-  self-contained and does not repeat what was already tried.
-
-**broadcast** — Sample frames uniformly across the uncovered video timeline (no queries).
-  Use for whole-video coverage: main theme / synopsis, events spread across the
-  full duration, or when targeted queries have repeatedly failed.
-
-**asr_match** — Substring/phrase match against chunk ASR (dialogue) text.
-  Use when the QUESTION quotes or paraphrases a specific spoken phrase
-  (e.g. "When X says '...'") and the verifier flagged `quote_grounding`. Set
-  `queries` to the exact quoted phrase(s) to locate in the ASR.
-
-**time_sorted** — Reorder the already-retrieved evidence by chunk start_time
-  (no new retrieval). Use when the verifier flagged `chronological_anchor` or
-  `temporal_consistency` weak — evidence content is there but order is wrong.
-
-**dense_sample** — Pull additional keyframes from chunks already in evidence.
-  Use when the verifier flagged `temporal_alignment`, `counting_visual`,
-  `visual_observability`, `action_visibility`, or `transition_process_coverage` —
-  the right chunk is found but its 1-frame sample is too sparse for the question.
-
-**loose_verify** — Tell the next verifier pass to accept indirect / inferred
-  evidence (no new retrieval). Use when the verifier flagged
-  `implicit_causal` / `causal_link_completeness` — evidence supports inference
-  but verifier is being too strict about explicit statements.
-
-## How to pick a strategy
-Prefer `recommended_action` on the highest-priority evidence gap. If only legacy
-rubric criteria are present, use `failure_repair_action` from the weakest
-criterion. Map each action to the corresponding strategy of the same name. Fall
-back to `targeted` when no diagnostic item is available.
-
-## Output format
-Return ONLY a JSON object:
-{
-  "strategy": "targeted" | "broadcast" | "asr_match" | "time_sorted" | "dense_sample" | "loose_verify",
-  "queries": ["..."],
   "reasoning": "<one sentence explaining the choice>"
 }
-For broadcast / time_sorted / dense_sample / loose_verify, set queries to []."""
+For broadcast, set queries to []."""
 
 
 def _extract_covered_times(evidence_texts: List[str]) -> str:
@@ -177,17 +121,12 @@ def _plan_next(
     llm,
     plan_history: List[List[str]] = (),
     unknown_options: Optional[List[str]] = None,
-    weak_rubric_criteria: Optional[list] = None,
+    weak_rubric_criteria: Optional[dict] = None,
     prune_satisfied: bool = False,
-    legacy_only: bool = False,
 ) -> dict:
     """Unified planner for iter ≥1: pick {targeted (n queries), broadcast}.
 
     Returns ``{"strategy": "targeted"|"broadcast", "queries": [...], "reasoning": "..."}``.
-
-    legacy_only=True restricts the strategy space to {targeted, broadcast} and
-    suppresses ``failure_repair_action`` hints in the prompt. Used to isolate the
-    "signal repair" effect from the action-space expansion in ablation runs.
     """
     unknown_set = set(unknown_options or [])
     opts_lines = []
@@ -201,79 +140,11 @@ def _plan_next(
     if unknown_options:
         parts.append(f"Current unresolved options: {unknown_options}.")
     if weak_rubric_criteria:
-        # Accept coverage evidence gaps, legacy List[str], and legacy List[Dict].
-        lines = []
-        actions_seen = []
-        has_gap = any(
-            isinstance(item, dict) and "requirement_id" in item
-            for item in weak_rubric_criteria
-        )
-        for item in weak_rubric_criteria:
-            if isinstance(item, dict):
-                if "requirement_id" in item:
-                    req_id = item.get("requirement_id", "")
-                    opt = item.get("option", "")
-                    action = item.get("recommended_action", "refine_query")
-                    desc = item.get("missing_fact", "")
-                    modality = item.get("modality", "multimodal")
-                    priority = item.get("priority")
-                    actions_seen.append(action)
-                    bits = [f"  - {req_id}"]
-                    if opt:
-                        bits.append(f"option={opt}")
-                    if priority is not None:
-                        bits.append(f"(priority={priority})")
-                    bits.append(f"modality={modality}")
-                    if not legacy_only or action in ("refine_query", "broadcast"):
-                        bits.append(f"[recommended action: {action}]")
-                    if desc:
-                        bits.append(f"- {desc}")
-                    lines.append(" ".join(bits))
-                    continue
-
-                name = item.get("name", "")
-                score = item.get("score")
-                action = item.get("failure_repair_action", "refine_query")
-                desc = item.get("description", "")
-                failing = item.get("failing_options") or []
-                diagnosis = item.get("diagnosis") or {}
-                actions_seen.append(action)
-                bits = [f"  - {name}"]
-                if score is not None:
-                    bits.append(f"(score={score})")
-                if not legacy_only:
-                    bits.append(f"[suggested action: {action}]")
-                if failing:
-                    bits.append(f"failing on options {failing}")
-                if desc:
-                    bits.append(f"— {desc}")
-                lines.append(" ".join(bits))
-                # Per-option diagnosis: the verifier's concrete reason this
-                # criterion fails for each failing option. Use these to write
-                # targeted queries instead of paraphrasing the question.
-                if isinstance(diagnosis, dict):
-                    for opt in failing or sorted(diagnosis.keys()):
-                        d = diagnosis.get(opt)
-                        if isinstance(d, str) and d.strip():
-                            lines.append(f"      · option {opt}: {d.strip()}")
-            else:
-                lines.append(f"  - {item}")
-        heading = (
-            "Evidence gaps to repair (highest priority first):"
-            if has_gap
-            else "Weak rubric criteria to repair (weakest first):"
-        )
+        lines = [f"  - {name}" for name in weak_rubric_criteria]
         parts.append(
-            heading + "\n" + "\n".join(lines)
+            "Weak rubric criteria to repair:\n" + "\n".join(lines) +
+            "\nGenerate queries that directly address these criteria."
         )
-        if actions_seen and (
-            not legacy_only or actions_seen[0] in ("refine_query", "broadcast")
-        ):
-            top_action = actions_seen[0]
-            parts.append(
-                f"The top repair item suggests action `{top_action}` — "
-                "strongly prefer the corresponding strategy."
-            )
     if prune_satisfied and plan_history:
         parts.append(
             "NOTE: Review the previously tried queries against the CURRENT evidence. "
@@ -303,33 +174,20 @@ def _plan_next(
 
     parts.append("Output the retrieval strategy JSON now.")
 
-    sys_prompt = _PLANNER_LEGACY_SYS if legacy_only else _PLANNER_UNIFIED_SYS
     messages = [
-        {"role": "system", "content": sys_prompt},
+        {"role": "system", "content": _PLANNER_UNIFIED_SYS},
         {"role": "user",   "content": "\n\n".join(parts)},
     ]
-    raw = llm.chat(messages, max_new_tokens=240, enable_thinking=False)
+    raw = llm.chat(messages, max_new_tokens=200, enable_thinking=False)
     m = re.search(r'\{.*\}', raw, re.DOTALL)
-    if legacy_only:
-        valid_strategies = {"targeted", "broadcast"}
-        needs_queries    = {"targeted"}
-    else:
-        valid_strategies = {
-            "targeted", "broadcast", "asr_match", "time_sorted",
-            "dense_sample", "loose_verify",
-        }
-        needs_queries = {"targeted", "asr_match"}
     if m:
         try:
             d        = _json.loads(m.group())
             strategy = str(d.get("strategy", "targeted")).lower()
-            if strategy == "refine_query":
-                strategy = "targeted"
-            if strategy not in valid_strategies:
+            if strategy not in ("targeted", "broadcast"):
                 strategy = "targeted"
             queries  = [str(q).strip() for q in (d.get("queries") or []) if str(q).strip()]
-            if strategy in needs_queries and not queries:
-                # asr_match / targeted without queries is useless; degrade to targeted+question
+            if strategy != "broadcast" and not queries:
                 strategy = "targeted"
                 queries  = [question]
             return {
@@ -344,43 +202,24 @@ def _plan_next(
 
 # ── Verifier → planner repair context ────────────────────────────────────────
 
-def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> Tuple[str, Optional[List]]:
+def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> Tuple[str, Optional[List[str]]]:
     """Build verifier-derived context for the planner."""
     missing = str(verdict.get("missing_evidence_analysis") or "").strip()
 
     if not rubric_judgment:
         return (f"Missing evidence analysis: {missing}" if missing else ""), None
 
-    evidence_gaps = list(verdict.get("evidence_gaps") or [])
-    weak_list = list(verdict.get("weak_rubric_criteria") or [])
+    weak_list: List[str] = list(verdict.get("weak_rubric_criteria") or [])
     unknown = list(verdict.get("unknown_options") or [])
-    repair_items = evidence_gaps or weak_list
 
     parts = []
-    if evidence_gaps:
-        brief = []
-        for gap in evidence_gaps:
-            if isinstance(gap, dict):
-                req = str(gap.get("requirement_id", "")).strip()
-                opt = str(gap.get("option", "")).strip()
-                brief.append(f"{req}/{opt}" if opt else req)
-            else:
-                brief.append(str(gap))
-        parts.append("Evidence gaps: " + ", ".join(x for x in brief if x))
-    elif weak_list:
-        # Render either legacy List[str] or legacy List[Dict] (with action+desc).
-        names_only = []
-        for w in weak_list:
-            if isinstance(w, dict):
-                names_only.append(str(w.get("name", "")))
-            else:
-                names_only.append(str(w))
-        parts.append("Weak rubric criteria: " + ", ".join(names_only))
+    if weak_list:
+        parts.append("Weak rubric criteria: " + ", ".join(weak_list))
     if unknown:
         parts.append("Unresolved options: " + ", ".join(unknown))
     if missing:
         parts.append(f"Missing evidence analysis: {missing}")
-    return "\n".join(parts), repair_items or None
+    return "\n".join(parts), weak_list or None
 
 
 # ── Query similarity safety nets ─────────────────────────────────────────────
@@ -438,7 +277,7 @@ class Planner:
         verdict: dict,
         rubric_judgment: bool,
     ) -> Tuple[str, Optional[List[str]]]:
-        """Project a verifier verdict into (missing_description, repair_items)."""
+        """Project a verifier verdict into (missing_description, weak_rubric_criteria)."""
         return _planner_repair_context(verdict, rubric_judgment)
 
     def plan_next(
@@ -451,15 +290,10 @@ class Planner:
         *,
         rubric_judgment: bool = True,
         prune_satisfied: bool = False,
-        legacy_only: bool = False,
     ) -> Tuple[dict, str, Optional[List[str]]]:
         """Pick the next iter plan from the verifier verdict.
 
-        Returns (plan, missing_description, repair_items).
-
-        legacy_only=True restricts strategies to {targeted, broadcast} —
-        used to isolate the verifier signal-repair effect from the planner
-        action-space expansion in ablation runs.
+        Returns (plan, missing_description, weak_rubric_criteria).
         """
         m_desc, weak = _planner_repair_context(verdict, rubric_judgment)
 
@@ -469,7 +303,6 @@ class Planner:
             unknown_options=unk_opts,
             weak_rubric_criteria=weak if rubric_judgment else None,
             prune_satisfied=prune_satisfied,
-            legacy_only=legacy_only,
         )
         return plan, m_desc, weak
 
@@ -487,10 +320,6 @@ class Planner:
 
         Falls back to broadcast if all targeted queries are dropped.
         """
-        # Only `targeted` goes through Jaccard+drift filters. `asr_match`
-        # uses exact phrases (dedup would over-match), and the other three
-        # (broadcast / time_sorted / dense_sample / loose_verify) carry no
-        # queries.
         if plan["strategy"] != "targeted":
             return plan
 

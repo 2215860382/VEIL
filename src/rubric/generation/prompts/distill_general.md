@@ -1,50 +1,53 @@
-You are distilling a **cross-question-type general evidence-requirement rubric**
-from already-distilled question-type requirement blocks.
+You are distilling a **cross-question-type general rubric** from already-
+distilled question-type rubrics.
 
 # Inputs
 
-You will receive requirement blocks labeled by `question_type`. Each block has
-3-6 evidence requirements.
+You will receive rubric blocks, each labeled with a `question_type`. Each
+block contains 3-6 binary positive criteria with description / score_1 /
+score_half / score_0 / weight / failure_repair_action.
 
-# Task
+# Your task
 
-Produce a general rubric containing evidence requirements that should run for
-every VideoMME question before type-specific requirements.
+Produce a **general rubric (6-12 criteria)** that captures every evaluation
+dimension appearing across most question types — the verifier's "always
+applies" checklist that runs regardless of `question_type`. Err on the side of
+including more dimensions when they qualify, not fewer.
 
-The verifier uses this rubric with coverage-first semantics:
-- incomplete required evidence -> option stance is unknown
-- complete required evidence -> option can be judged support or refute
+Selection rules:
 
-# Selection Rules
+1. **Cross-type frequency.** A criterion belongs in `general` only if its
+   concept appears in a majority of the input question-type rubrics. Things
+   like *evidence coverage*, *entity consistency*, *evidence specificity*
+   typically qualify; *exact quote grounding* or *fine-grained counting* do
+   not. Concepts that *recur but use different names* across types should be
+   merged and counted together — don't drop a dimension just because each
+   qtype labeled it slightly differently.
 
-1. **Cross-type frequency.** Include a requirement only when its concept appears
-   across many question types. Target grounding and evidence specificity usually
-   qualify; exact quote grounding or fine-grained counting usually does not.
+2. **Type-neutral phrasing.** Strip type-specific language. Phrase criteria
+   so they apply uniformly to any VideoMME question.
 
-2. **Type-neutral phrasing.** Phrase each requirement so it applies uniformly to
-   any question and any option.
+3. **No overlap with type rubrics.** Criteria that show up here will run *in
+   addition* to the type-specific rubric, so they must capture dimensions
+   the type-specific ones don't.
 
-3. **No overlap with type-specific requirements.** General requirements should
-   cover universal prerequisites. Leave specialized needs to qtype templates.
+4. **Binary positive form.** Score 1 / 0.5 / 0.
 
-4. **Compact.** Output 1-4 general requirements. Too many general requirements
-   will make the verifier overly strict.
+# Output format
 
-# Output Format
-
-Output valid YAML only, no prose:
+Output **valid YAML only**, no prose:
 
 ```yaml
 general:
-  evidence_requirements:
-    - id: <snake_case_id>
-      description: "Concrete universal fact that must be covered before judging options."
-      required: true
+  rubric_criteria:
+    - name: <snake_case>
+      description: "..."
+      score_1: "..."
+      score_half: "..."
+      score_0: "..."
       weight: 0.0
-      modality: visual|dialogue|temporal|ocr|global|multimodal
-      repair_action: refine_query
-  decision_policy:
-    support_confidence_threshold: 0.80
-    refute_confidence_threshold: 0.70
-    require_all_options_resolved: true
+      failure_repair_action: refine_query
+    - ...
+  scoring_rule: average
+  sufficient_threshold: 0.75
 ```

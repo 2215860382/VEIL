@@ -2,8 +2,7 @@
 
 Reads questions from one of the result jsonls (any of them — they share Q/gold).
 For each question, calls Opus 4.7 (via Anthropic proxy) and Qwen3.5-27B (via
-local vLLM at 127.0.0.1:8003), saves raw responses + parsed YAML. Gold answers
-are not shown to the rubric generator unless --include-gold is set.
+local vLLM at 127.0.0.1:8003), saves raw responses + parsed YAML.
 
 Output:
   src/rubric/artifacts/instances/instance_opus.jsonl    — one row per question
@@ -55,16 +54,14 @@ def load_questions() -> list[dict]:
     return rows
 
 
-def format_user_msg(q: dict, include_gold: bool = False) -> str:
+def format_user_msg(q: dict) -> str:
     opts = '\n'.join(f'  ({chr(ord("A")+i)}) {c}' for i, c in enumerate(q['candidates']))
-    msg = (
+    return (
         f"question_type: {q['question_type']}\n\n"
         f"question: {q['question']}\n\n"
-        f"candidates:\n{opts}"
+        f"candidates:\n{opts}\n\n"
+        f"gold answer (verbatim text of the correct option): {q['gold']}"
     )
-    if include_gold:
-        msg += f"\n\ngold answer (debug only): {q['gold']}"
-    return msg
 
 
 # ── Opus 4.7 via Anthropic proxy ──────────────────────────────────────────
@@ -119,8 +116,7 @@ def extract_yaml(raw: str) -> str:
 # ── Main run loop ─────────────────────────────────────────────────────────
 
 def run_model(model_name: str, questions: list[dict], system_prompt: str,
-              resume: bool, workers: int, include_gold: bool,
-              qwen_urls: list[str] | None = None):
+              resume: bool, workers: int, qwen_urls: list[str] | None = None):
     out_path = OUT_DIR / f'instance_{model_name}.jsonl'
     done_idx = set()
     if resume and out_path.exists():
@@ -168,7 +164,7 @@ def run_model(model_name: str, questions: list[dict], system_prompt: str,
     t0 = time.time()
 
     def process(q):
-        user_msg = format_user_msg(q, include_gold=include_gold)
+        user_msg = format_user_msg(q)
         try:
             raw = caller(user_msg)
             rubric_yaml = extract_yaml(raw)
@@ -211,8 +207,6 @@ def main():
                     help='Parallel workers. Opus proxy: try 8. Qwen local: 4.')
     ap.add_argument('--qwen-urls', type=str, default=QWEN_URLS_DEFAULT,
                     help='Comma-separated Qwen vLLM chat-completions URLs; round-robin across them.')
-    ap.add_argument('--include-gold', action='store_true',
-                    help='Debug only: include the gold answer in the generation prompt.')
     args = ap.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -228,7 +222,7 @@ def main():
     for m in targets:
         print(f'\n=== {m} ===')
         run_model(m, questions, system_prompt, args.resume, args.workers,
-                  include_gold=args.include_gold, qwen_urls=qwen_urls)
+                  qwen_urls=qwen_urls)
 
 
 if __name__ == '__main__':

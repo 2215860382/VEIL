@@ -14,7 +14,7 @@ Output:
   src/rubric/artifacts/distilled/qtype_{qkey}.raw.txt + .yaml
   src/rubric/artifacts/distilled/general.raw.txt + .yaml
   src/rubric/artifacts/distilled/rubric_templates_v2.yaml
-  src/rubric/templates/generated_v2.yaml                     (runtime template)
+  src/rubric/rubric_templates.yaml                           (runtime template)
 
 Usage:
   python -m src.rubric.generation.distill [--sample-per-qtype 40] [--qwen-urls URL1,URL2,...] [--dry-run]
@@ -34,7 +34,7 @@ RUBRIC_DIR = GENERATION_DIR.parent
 INSTANCE_DIR = RUBRIC_DIR / 'artifacts/instances'
 OUT_DIR = RUBRIC_DIR / 'artifacts/distilled'
 PROMPT_DIR = GENERATION_DIR / 'prompts'
-RUNTIME_TEMPLATE = RUBRIC_DIR / 'templates/generated_v2.yaml'
+RUNTIME_TEMPLATE = RUBRIC_DIR / 'rubric_templates.yaml'
 
 QWEN_MODEL = 'Qwen3.5-27B'
 QWEN_URLS_DEFAULT = (
@@ -62,7 +62,7 @@ QTYPE_KEYS = {
 
 
 def load_instance_rubrics() -> dict[str, list[dict]]:
-    """Return qtype -> list of {model, sample_idx, question, rubric_yaml}."""
+    """Return qtype → list of {model, sample_idx, question, gold, rubric_yaml}."""
     by_qtype: dict[str, list[dict]] = defaultdict(list)
     for model in ['opus', 'qwen']:
         p = INSTANCE_DIR / f'instance_{model}.jsonl'
@@ -77,6 +77,7 @@ def load_instance_rubrics() -> dict[str, list[dict]]:
                 'model':       model,
                 'sample_idx':  r['sample_idx'],
                 'question':    r['question'],
+                'gold':        r['gold'],
                 'rubric_yaml': r['rubric_yaml'],
             })
     return by_qtype
@@ -89,12 +90,13 @@ def format_qtype_user_msg(qtype: str, items: list[dict]) -> str:
     for i, it in enumerate(items, 1):
         parts.append(f'\n--- instance {i} (model={it["model"]}, sample_idx={it["sample_idx"]}) ---')
         parts.append(f'question: {it["question"]}')
+        parts.append(f'gold: {it["gold"]}')
         parts.append(f'rubric_yaml:\n{it["rubric_yaml"]}')
     return '\n'.join(parts)
 
 
 def format_general_user_msg(qtype_yamls: dict[str, str]) -> str:
-    parts = ['You have question-type requirement rubrics below. Produce the general rubric.\n']
+    parts = ['You have 11 question-type rubrics below. Produce the general rubric.\n']
     for qtype, yaml_str in qtype_yamls.items():
         parts.append(f'\n--- question_type: {qtype} ---\n{yaml_str}')
     return '\n'.join(parts)

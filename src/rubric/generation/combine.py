@@ -7,7 +7,7 @@ from pathlib import Path
 GENERATION_DIR = Path(__file__).resolve().parent
 RUBRIC_DIR = GENERATION_DIR.parent
 OUT_DIR = RUBRIC_DIR / 'artifacts/distilled'
-RUNTIME_TEMPLATE = RUBRIC_DIR / 'templates/generated_v2.yaml'
+RUNTIME_TEMPLATE = RUBRIC_DIR / 'rubric_templates.yaml'
 
 QTYPE_KEYS = {
     "Action Reasoning":      "action_reasoning",

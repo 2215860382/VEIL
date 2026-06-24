@@ -87,6 +87,8 @@ class Answerer:
         keyframe_chunk_ids=(),
         keyframe_ts: Sequence[float] = (),
         evidence_chunk_ids=(),
+        image_timestamps: bool = False,
+        question_first: bool = False,
         max_evidence_chars: int = 80000,
         focused_texts: List[str] = (),
         verifier_option_judgment: dict | None = None,
@@ -119,27 +121,52 @@ class Answerer:
         # chunk_id → 1-based segment index (for image labels)
         seg_idx_for_cid = {int(cid): i + 1 for i, cid in enumerate(evidence_chunk_ids)}
 
-        content: list = [{
-            "type": "text",
-            "text": _QF_HEADER.format(
+        # ── Default path: no flags → original chat_with_frames behaviour ─────
+        if not image_timestamps and not question_first:
+            prompt = _PROMPT.format(
+                n=n_seg, evidence=evidence, hint=hint,
                 question=question, choices=choices,
-                n_kf=len(frames), n_seg=n_seg,
-            ),
-        }]
-        for img, ts, cid in zip(frames, ts_list, cid_list):
-            label = _image_label(ts, seg_idx_for_cid.get(int(cid)))
-            content.append({"type": "text", "text": label})
-            content.append(_img_block(img))
-        content.append({
-            "type": "text",
-            "text": _QF_TAIL.format(
-                hint=hint, evidence=evidence,
-                question=question, choices=choices,
-            ),
-        })
-        raw = self.model.chat_with_content(
-            content, max_new_tokens=16, enable_thinking=False
-        )
+            )
+            raw = self.model.chat_with_frames(
+                frames, prompt, max_new_tokens=16, enable_thinking=False
+            )
+        else:
+            content: list = []
+            if question_first:
+                content.append({
+                    "type": "text",
+                    "text": _QF_HEADER.format(
+                        question=question, choices=choices,
+                        n_kf=len(frames), n_seg=n_seg,
+                    ),
+                })
+            # Images, optionally each preceded by a [Frame at Xs — Segment N] label.
+            if image_timestamps:
+                for img, ts, cid in zip(frames, ts_list, cid_list):
+                    label = _image_label(ts, seg_idx_for_cid.get(int(cid)))
+                    content.append({"type": "text", "text": label})
+                    content.append(_img_block(img))
+            else:
+                for img in frames:
+                    content.append(_img_block(img))
+            # Evidence + question/answer instructions.
+            if question_first:
+                content.append({
+                    "type": "text",
+                    "text": _QF_TAIL.format(
+                        hint=hint, evidence=evidence,
+                        question=question, choices=choices,
+                    ),
+                })
+            else:
+                prompt = _PROMPT.format(
+                    n=n_seg, evidence=evidence, hint=hint,
+                    question=question, choices=choices,
+                )
+                content.append({"type": "text", "text": prompt})
+            raw = self.model.chat_with_content(
+                content, max_new_tokens=16, enable_thinking=False
+            )
 
         m = re.search(r"\b([A-D])\b", raw)
         letter = m.group(1) if m else ""

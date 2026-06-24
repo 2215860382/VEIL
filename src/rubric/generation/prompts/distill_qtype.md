@@ -1,61 +1,65 @@
-You are distilling a **question-type-level evidence-requirement rubric** from
-many per-question requirement blocks generated independently for individual
-VideoMME questions of the same type.
+You are distilling a **question-type-level rubric** from many per-question
+rubrics that were generated independently for individual questions of the same
+VideoMME question type.
 
 # Inputs
 
 You will receive:
-- **question_type**: the VideoMME category
-- A list of per-question blocks. Each block contains the original question and
-  evidence requirements generated for that question.
+- **question_type** — the VideoMME category (e.g. "Object Reasoning")
+- A list of per-question rubric blocks. Each block contains the original
+  question (briefly), the gold answer choice, and the criteria one or two
+  LLM rubric-generators produced for that question.
 
-# Task
+# Your task
 
-Produce reusable evidence requirements for this question type. These
-requirements are used by a verifier before stance classification:
+Produce a **reusable rubric for this question type** — a small set of criteria
+that:
 
-- If any required requirement is not covered for an option, that option's stance
-  must be unknown.
-- Only when all required requirements are covered may the verifier decide
-  support or refute.
+1. **Generalize across questions of this type.** Drop overly specific entities
+   ("the man with platinum hair"); abstract them ("the question's referenced
+   protagonist"). Keep what is recurring and structural.
 
-# Selection Rules
+2. **Are high-frequency across the inputs.** If a criterion concept appears in
+   most per-question rubrics (visual grounding, temporal ordering, entity
+   identity, action evidence, etc.), include it. If it only appears once, drop.
 
-1. **Generalize across questions of this type.** Drop one-off entities and keep
-   recurring structural evidence needs such as target grounding, action
-   observation, temporal anchors, text reading, count scope, or relation
-   evidence.
+3. **Are non-redundant.** Merge near-duplicates into a single criterion.
 
-2. **Non-redundant.** Merge near-duplicates into one requirement. Do not create
-   multiple requirements that would trigger the same retrieval query.
+4. **Keep binary positive form.** Score 1 / 0.5 / 0 — same format as the inputs.
 
-3. **Coverage-oriented.** Requirements must describe missing facts to retrieve,
-   not scoring criteria or answer conclusions.
+5. **Output 3-6 criteria.** Fewer than 3 means the type is under-covered; more
+   than 6 likely means you didn't merge aggressively enough.
 
-4. **Output 3-6 requirements.** Fewer than 3 is usually under-covered; more than
-   6 is usually too fragmented.
+# `failure_repair_action`
 
-# Repair Actions
+For each criterion, pick the action that most often appeared in the input
+rubrics for that concept. The fixed set is:
+`refine_query`, `asr_match`, `time_sorted`, `dense_sample`, `loose_verify`,
+`broadcast`.
 
-For each requirement, choose one of two repair actions:
-- `refine_query`: focused semantic retrieval for a specific missing fact
-- `broadcast`: uniform sampling over broader unseen video segments for global
-  or timeline-wide missing evidence
+# Weight
 
-# Output Format
+Set `weight` based on how universal and central the criterion is for this
+type. Range [0.1, 1.0].
 
-Output valid YAML only, no prose:
+# Output format
+
+Output **valid YAML only**, no prose:
 
 ```yaml
 <qtype_key>:
-  evidence_requirements:
-    - id: <snake_case_id>
-      description: "Concrete fact that must be covered before judging options."
-      required: true
+  rubric_criteria:
+    - name: <snake_case>
+      description: "..."
+      score_1: "..."
+      score_half: "..."
+      score_0: "..."
       weight: 0.0
-      modality: visual|dialogue|temporal|ocr|global|multimodal
-      repair_action: refine_query
+      failure_repair_action: refine_query
+    - ...
+  scoring_rule: average
+  sufficient_threshold: 0.75
 ```
 
-Use a snake_case `<qtype_key>` derived from the question type, e.g.
-`object_reasoning`, `temporal_reasoning`, `counting_problem`.
+Use a snake_case `<qtype_key>` derived from the question type (e.g.
+`object_reasoning`, `temporal_reasoning`, `counting_problem`).

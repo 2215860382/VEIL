@@ -26,8 +26,8 @@ python3 -m src.rubric.generation.distill --sample-per-qtype 40 \
 ec=$?
 echo "[$(date)] 02b exit code=$ec"
 
-if [ $ec -eq 0 ] && [ -f "src/rubric/templates/generated_v2.yaml" ]; then
-  echo "[$(date)] SUCCESS — generated rubric ready at src/rubric/templates/generated_v2.yaml"
+if [ $ec -eq 0 ] && [ -f "src/rubric/rubric_templates.yaml" ]; then
+  echo "[$(date)] SUCCESS — generated rubric ready at src/rubric/rubric_templates.yaml"
 else
   echo "[$(date)] FAILED — see $LOG_OUT/distill_${TS}.log"
 fi

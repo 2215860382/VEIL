@@ -15,7 +15,7 @@ GENERATION_DIR = Path(__file__).resolve().parent
 RUBRIC_DIR = GENERATION_DIR.parent
 OUT_DIR = RUBRIC_DIR / 'artifacts/distilled'
 PROMPT_DIR = GENERATION_DIR / 'prompts'
-RUNTIME_TEMPLATE = RUBRIC_DIR / 'templates/generated_v2.yaml'
+RUNTIME_TEMPLATE = RUBRIC_DIR / 'rubric_templates.yaml'
 
 QWEN_MODEL = 'Qwen3.5-27B'
 QWEN_URLS_DEFAULT = (
