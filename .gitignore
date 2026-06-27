@@ -57,3 +57,4 @@ outputs/results/videomme/tuning/val_*
 outputs/results/videomme/tuning/test_*
 outputs/results/videomme/tuning/dev_*
 outputs/results/videomme/tuning/r2_merged_900*
+outputs/results/videomme/tuning/meta/
