@@ -13,6 +13,7 @@ from pathlib import Path
 
 def iter_records(paths: list[Path]):
     for path in paths:
+        file_pipeline = path.stem
         with path.open() as f:
             for line in f:
                 line = line.strip()
@@ -22,7 +23,11 @@ def iter_records(paths: list[Path]):
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if rec.get("record_type"):
+                    file_pipeline = str(rec.get("pipeline") or file_pipeline)
+                    continue
                 rec["_source"] = str(path)
+                rec["_pipeline"] = str(rec.get("pipeline") or file_pipeline)
                 yield rec
 
 
@@ -34,7 +39,7 @@ def unique_evidence_count(rec: dict) -> int:
 def summarize(paths: list[Path]) -> dict:
     grouped: dict[str, list[dict]] = defaultdict(list)
     for rec in iter_records(paths):
-        grouped[str(rec.get("pipeline", ""))].append(rec)
+        grouped[str(rec.get("_pipeline", ""))].append(rec)
 
     out = {}
     for pipeline, records in sorted(grouped.items()):

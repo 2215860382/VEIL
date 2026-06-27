@@ -502,9 +502,11 @@ def run_veil(
     rubric_judgment:       bool         = True,
     single_query_iter0:    bool         = False,
     ignore_verifier_signal:    bool     = False,
+    use_weak_rubric_criteria: bool      = True,
     force_option_subquestions: bool     = False,
     verifier_attr:         bool         = False,
     verifier_opstatus:     bool         = False,
+    sufficient_threshold_delta: float   = 0.0,
     rubric_rerank:         bool         = False,
     explicit_attribution:  bool         = False,
     prune_distractors:     bool         = False,
@@ -584,6 +586,7 @@ def run_veil(
                 question, candidates, all_evidence_texts, verdict_for_planning, plan_history,
                 rubric_judgment=rubric_judgment,
                 prune_satisfied=prune_satisfied,
+                use_weak_rubric_criteria=use_weak_rubric_criteria,
             )
             next_plan = planner.filter_targeted_queries(
                 next_plan, plan_history, embedder, all_ev_vecs,
@@ -686,6 +689,7 @@ def run_veil(
                                   explicit_attribution=explicit_attribution,
                                   verifier_attr=verifier_attr,
                                   verifier_opstatus=verifier_opstatus,
+                                  sufficient_threshold_delta=sufficient_threshold_delta,
                                   loose=loose_verifier)
 
         # ── Oracle check (post-verifier) ──────────────────────────────────────
@@ -717,7 +721,7 @@ def run_veil(
                 f"{'==' if oracle_pred == gold_letter else '!='} gold={gold_letter}"
             )
             if oracle_pred == gold_letter:
-                last_verdict["label"] = "FULLY_SUFFICIENT"
+                last_verdict["label"] = "SUFFICIENT"
                 last_verdict["missing_evidence_analysis"] = None
                 last_verdict["unknown_options"] = []
                 if oracle_no_second_rerank:
@@ -772,7 +776,7 @@ def run_veil(
             "n_evidence_to_verifier":    len(ev_for_verifier),
         })
 
-        if last_verdict["label"] in ("sufficient", "FULLY_SUFFICIENT", "ANSWER_SUFFICIENT"):
+        if last_verdict["label"] in ("sufficient", "SUFFICIENT", "FULLY_SUFFICIENT", "ANSWER_SUFFICIENT"):
             break
 
     # ── Answer ───────────────────────────────────────────────────────────────

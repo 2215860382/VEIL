@@ -132,19 +132,11 @@ def _plan_next(
     opts_lines = []
     for i, c in enumerate(candidates):
         letter = chr(ord('A')+i)
-        tag = " [UNKNOWN]" if letter in unknown_set else ""
+        tag = " [UNRESOLVED]" if letter in unknown_set else ""
         opts_lines.append(f"  ({letter}) {c}{tag}")
     opts = "\n".join(opts_lines)
 
     parts = [f"Question: {question}", f"Options:\n{opts}"]
-    if unknown_options:
-        parts.append(f"Current unresolved options: {unknown_options}.")
-    if weak_rubric_criteria:
-        lines = [f"  - {name}" for name in weak_rubric_criteria]
-        parts.append(
-            "Weak rubric criteria to repair:\n" + "\n".join(lines) +
-            "\nGenerate queries that directly address these criteria."
-        )
     if prune_satisfied and plan_history:
         parts.append(
             "NOTE: Review the previously tried queries against the CURRENT evidence. "
@@ -166,11 +158,13 @@ def _plan_next(
         covered = _extract_covered_times(evidence_texts)
         if covered:
             parts.append(f"Evidence covers video segments: {covered}")
-        ev_sample = "\n".join(f"  [E{i+1}] {t[:200]}" for i, t in enumerate(evidence_texts[:5]))
-        parts.append(f"Current evidence (sample):\n{ev_sample}")
 
     if missing_analysis:
-        parts.append(f"Still missing: {missing_analysis}")
+        parts.append(
+            "Missing fact to retrieve:\n"
+            f"{missing_analysis}\n"
+            "Generate queries for the concrete visual/dialogue evidence needed to resolve this fact."
+        )
 
     parts.append("Output the retrieval strategy JSON now.")
 
@@ -209,17 +203,17 @@ def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> Tuple[str, 
     if not rubric_judgment:
         return (f"Missing evidence analysis: {missing}" if missing else ""), None
 
-    weak_list: List[str] = list(verdict.get("weak_rubric_criteria") or [])
     unknown = list(verdict.get("unknown_options") or [])
 
-    parts = []
-    if weak_list:
-        parts.append("Weak rubric criteria: " + ", ".join(weak_list))
-    if unknown:
-        parts.append("Unresolved options: " + ", ".join(unknown))
     if missing:
-        parts.append(f"Missing evidence analysis: {missing}")
-    return "\n".join(parts), weak_list or None
+        return missing, None
+    if unknown:
+        return (
+            "Retrieve concrete evidence that can confirm or rule out the options marked "
+            "[UNRESOLVED].",
+            None,
+        )
+    return "", None
 
 
 # ── Query similarity safety nets ─────────────────────────────────────────────
@@ -290,12 +284,15 @@ class Planner:
         *,
         rubric_judgment: bool = True,
         prune_satisfied: bool = False,
+        use_weak_rubric_criteria: bool = True,
     ) -> Tuple[dict, str, Optional[List[str]]]:
         """Pick the next iter plan from the verifier verdict.
 
         Returns (plan, missing_description, weak_rubric_criteria).
         """
         m_desc, weak = _planner_repair_context(verdict, rubric_judgment)
+        if not use_weak_rubric_criteria:
+            weak = None
 
         unk_opts = verdict.get("unknown_options") if rubric_judgment else None
         plan = _plan_next(

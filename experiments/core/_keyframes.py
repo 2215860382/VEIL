@@ -18,7 +18,7 @@ def load_keyframe_pil(path: str):
     return None
 
 
-DEFAULT_KEYFRAME_SUBDIR = "keyframes_origin"
+DEFAULT_KEYFRAME_SUBDIR = "keyframes_resized"
 LEGACY_KEYFRAME_SUBDIR  = "frames"
 
 
