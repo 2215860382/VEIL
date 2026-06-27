@@ -95,8 +95,8 @@ class Answerer:
         verifier_option_scores: dict | None = None,
     ) -> dict:
         all_texts = list(focused_texts) + list(evidence_texts)
-        if all_texts and max_evidence_chars:
-            per = max_evidence_chars // len(all_texts)
+        if all_texts and max_evidence_chars and sum(len(t) for t in all_texts) > max_evidence_chars:
+            per = max(1, max_evidence_chars // len(all_texts))
             focused_texts  = [t[:per] for t in focused_texts]
             evidence_texts = [t[:per] for t in evidence_texts]
 

@@ -1,0 +1,802 @@
+# Auto-generated evidence-sufficiency rubric.
+# Criteria evaluate whether evidence can verify or exclude options, not answer correctness.
+
+general:
+  rubric_criteria:
+  - name: evidence_coverage
+    description: Evidence covers the key event, time window, state change, comparison target, or causal chain needed to verify or exclude each option.
+    score_1: All evidence needed to verify or exclude the option is covered.
+    score_half: Relevant evidence is present, but a key event, time window, state, comparison, or causal link is missing.
+    score_0: The evidence does not cover the facts needed to judge the option.
+    weight: 1.0
+    failure_repair_action: dense_sample
+  - name: evidence_specificity
+    description: Evidence explicitly grounds the relevant person, object, action, scene, speaker, text, or spatial relation instead of only giving a generic related scene.
+    score_1: The required entities, actions, attributes, or relations are unambiguously grounded.
+    score_half: The evidence is relevant but leaves an entity, action, attribute, or relation ambiguous.
+    score_0: The evidence is generic or concerns a different entity, action, attribute, or relation.
+    weight: 1.0
+    failure_repair_action: refine_query
+  - name: evidence_consistency
+    description: Evidence is internally consistent and contains enough contrary evidence to exclude options that conflict with the video.
+    score_1: The evidence consistently establishes or rules out the option without unresolved conflict.
+    score_half: The evidence points in one direction but leaves a conflict or distractor unresolved.
+    score_0: The evidence conflicts internally or cannot establish or rule out the option.
+    weight: 1.0
+    failure_repair_action: refine_query
+  scoring_rule: average
+  sufficient_threshold: 0.8
+type_aliases:
+  Action Reasoning: action_reasoning
+  Action Recognition: action_recognition
+  Attribute Perception: attribute_perception
+  Counting Problem: counting_problem
+  Information Synopsis: information_synopsis
+  OCR Problems: ocr_problems
+  Object Reasoning: object_reasoning
+  Object Recognition: object_recognition
+  Spatial Perception: spatial_perception
+  Spatial Reasoning: spatial_reasoning
+  Temporal Perception: temporal_perception
+  Temporal Reasoning: temporal_reasoning
+templates:
+  action_reasoning:
+    rubric_criteria:
+    - name: explicit_negation_and_absence
+      description: Evidence must explicitly state the absence of a claimed action, object, or artifact, or explicitly contrast the observed reality with the option's claim (e.g., 'holding a baby instead of a thread'), rather than merely describing the replacement or the scene generally.
+      score_1: Evidence contains a direct negation or explicit contrast that definitively excludes the option (e.g., 'X is NOT present', 'Y replaced X').
+      score_half: Evidence describes the actual state or replacement object but lacks an explicit negation of the option's claim, leaving ambiguity about whether the option's claim also occurred.
+      score_0: Evidence only describes the scene or confirms the replacement without addressing the specific claim of the option, making exclusion impossible.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 3:weak_vs_great:3:weak:iter0->3:great:final
+      - 35:good_vs_great:35:good:iter1->35:great:iter2
+      - 708:weak_vs_good:708:weak:iter0->708:good:iter1
+    - name: causal_mechanism_explicitness
+      description: Evidence must explicitly describe the physical, logical, or procedural mechanism linking a specific action to its outcome (e.g., 'action X generates force Y', 'consecutive hits reset score'), rather than merely listing the action and outcome in sequence.
+      score_1: Evidence explicitly states the mechanism connecting the protagonist's action to the target's reaction or the final outcome, allowing definitive exclusion of alternative mechanisms.
+      score_half: Evidence shows the action and outcome in temporal proximity but implies rather than states the causal link, leaving the reasoning inferred.
+      score_0: Evidence lists the action and outcome separately without establishing a direct causal connection or explaining the underlying mechanic.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 286:good_vs_great:286:good:iter1->286:great:iter2
+      - 436:good_vs_great:436:good:iter1->436:great:iter2
+      - 633:weak_vs_good:633:weak:iter0->633:good:iter1
+    - name: intent_and_context_disambiguation
+      description: Evidence must provide contextual cues (visual reactions, genre logic, or explicit dialogue) to distinguish between ambiguous actions (e.g., playful teasing vs. genuine hostility, magic trick vs. concept) and rule out alternative motivations.
+      score_1: Evidence explicitly identifies the intent or genre context (e.g., 'cartoon logic', 'playful reaction') that reframes the action, allowing definitive exclusion of distractors.
+      score_half: Evidence shows the action and context separately but lacks an explicit synthesis clarifying the intent or nature of the interaction.
+      score_0: Evidence describes the action literally without contextual cues, leaving the intent ambiguous or misinterpreting the genre.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 289:good_vs_great:289:good:iter1->289:great:iter2
+      - 834:weak_vs_great:834:weak:iter0->834:great:final
+      - 301:weak_vs_good:301:weak:iter0->301:good:iter1
+    - name: temporal_sequence_fidelity
+      description: Evidence must explicitly capture the chronological order of distinct interaction phases or events to distinguish between options describing immediate rejection, delayed abandonment, or specific ordinal positions (e.g., 'first' vs 'last').
+      score_1: Evidence explicitly contains the dialogue or action for the initial state AND the subsequent state, establishing the sequence and ruling out options with incorrect timing.
+      score_half: Evidence contains the final state and implies a prior interaction, but lacks the explicit text/action of the initial state or the specific ordinal label.
+      score_0: Evidence only shows the final state or describes events in isolation without establishing a sequence, making it impossible to verify ordinal qualifiers.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 550:weak_vs_good:550:weak:iter0->550:good:iter1
+      - 638:weak_vs_good:638:weak:iter0->638:good:iter1
+      - 315:weak_vs_good:315:weak:iter0->315:good:iter1
+    - name: comparative_feature_isolation
+      description: Evidence must explicitly describe the presence or absence of a specific feature in the target segment AND confirm its status in the comparison segments to verify uniqueness, state changes, or strategic differentiation.
+      score_1: Evidence explicitly states the feature exists in the target segment and is absent/different in the comparison segments, or explicitly tracks an entity's state change (T1 vs T2).
+      score_half: Evidence describes the feature in the target segment but is ambiguous or silent about its presence in the comparison segments.
+      score_0: Evidence describes the feature in the target segment but provides no information about the comparison segments, or describes different entities without establishing a change.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 638:weak_vs_good:638:weak:iter0->638:good:iter1
+      - 649:weak_vs_good:649:weak:iter0->649:great:final
+      - 411:good_vs_great:411:good:iter1->411:great:iter2
+    - name: cross_segment_causal_linking
+      description: Evidence must explicitly connect a general phenomenon, rule, or prior event discovered in one segment to a specific character's action in a different segment to establish the causal reason for that action.
+      score_1: Evidence explicitly links the general concept or prior event (Segment A) to the specific actor's behavior (Segment B) through a clear narrative or visual bridge.
+      score_half: Evidence contains both the concept/event and the character's action in separate segments but lacks an explicit narrative or logical bridge connecting them.
+      score_0: Evidence mentions the concept or the action in isolation without linking them, or links the action to an incorrect cause.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 769:good_vs_great:769:good:iter1->769:great:iter2
+      - 787:good_vs_great:787:good:iter1->787:great:iter2
+      - 555:good_vs_great:555:good:iter1->555:great:iter2
+    - name: entity_and_source_attribution
+      description: Evidence must explicitly attribute specific quantitative values, conditions, or claims to the correct named entity (person, team, organization) and distinguish between official statements and external commentary.
+      score_1: Evidence explicitly links the specific value/outcome/claim to the correct entity and source, clearly separating official positions from critics or third parties.
+      score_half: Evidence mentions the value and the entity separately but lacks a direct explicit link in the same context, or fails to clearly demarcate which claims belong to the target entity.
+      score_0: Evidence attributes values to the wrong entity, conflates general risks with specific diagnoses, or mixes official statements with external opinions.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 335:good_vs_great:335:good:iter1->335:great:iter2
+      - 355:good_vs_great:355:good:iter1->355:great:iter2
+      - 428:weak_vs_good:428:weak:iter0->428:good:iter1
+  action_recognition:
+    rubric_criteria:
+    - name: temporal_window_alignment
+      description: Evidence must explicitly contain observations from the specific time window, ordinal position, or frequency requested to verify actions occurring only in that segment, distinguishing between general occurrences and the specific queried instance.
+      score_1: Evidence explicitly maps the target action to the specific time segment, ordinal count, or phase (e.g., 'third act', 'final battle') with direct visual or textual confirmation, allowing unique identification.
+      score_half: Evidence identifies the action type but leaves the specific timing, order, or frequency ambiguous, inferred, or only partially grounded near the requested window.
+      score_0: Evidence describes actions without temporal grounding, covers only segments outside the requested window, or fails to distinguish the target instance from similar events at other times.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 39:weak_vs_great:39:weak:iter0->39:great:final
+      - 254:weak_vs_great:254:weak:iter0->254:great:final
+      - 448:weak_vs_good:448:weak:iter0->448:good:iter1
+      - 636:weak_vs_great:636:weak:iter0->636:great:final
+    - name: causal_mechanism_specificity
+      description: Evidence must explicitly identify the physical mechanism, causal agent, or specific interaction (e.g., point of contact, material, trigger) that defines the action, distinguishing between visually similar outcomes or accidental vs. intentional causes.
+      score_1: Evidence clearly shows or states the specific mechanism (e.g., 'hits a ramp', 'dragging by tail', 'remote script') that uniquely verifies the action verb and excludes alternatives.
+      score_half: Evidence describes the resulting motion or state change but lacks the explicit causal mechanism or agent, leaving ambiguity between similar action verbs or causes.
+      score_0: Evidence only describes the result, setup, or actor presence without the specific interaction or mechanism required to distinguish options.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 168:good_vs_great:168:good:iter1->168:great:iter2
+      - 283:good_vs_great:283:good:iter1->283:great:iter2
+      - 517:weak_vs_good:517:weak:iter0->517:good:iter1
+      - 596:weak_vs_good:596:weak:iter0->596:good:iter1
+    - name: actor_state_and_role_disambiguation
+      description: Evidence must explicitly distinguish the physical state, posture, or specific reaction of the target actor, and identify the specific actor role (performer vs. spectator) to exclude options requiring conflicting states or attributing actions to the wrong group.
+      score_1: Evidence explicitly states the actor's posture, state, or specific reaction (e.g., 'sitting', 'abnormal', 'performer') and distinguishes the actor role, allowing direct exclusion of conflicting options.
+      score_half: Evidence implies the state through context or describes a generic reaction without the specific detail needed to distinguish between similar options or actor roles.
+      score_0: Evidence describes actions or triggers without clarifying posture, state, or specific reaction, or fails to distinguish who is acting, leaving ambiguity between conflicting options.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 39:weak_vs_great:39:weak:iter0->39:great:final
+      - 296:weak_vs_good:296:weak:iter0->296:good:iter1
+      - 647:good_vs_great:647:good:iter1->647:great:iter2
+      - 648:weak_vs_great:648:weak:iter0->648:great:final
+    - name: apparatus_and_context_disambiguation
+      description: Evidence must explicitly distinguish between visually similar apparatuses, objects, or contexts using specific visual or textual markers to definitively exclude distractor options that rely on generic or similar descriptions.
+      score_1: Evidence explicitly describes the specific apparatus, object variant, or setting (e.g., 'vertical poles', 'fire batons', 'stage with judges') in a way that is mutually exclusive with the distractor.
+      score_half: Evidence describes the action or setting but uses ambiguous terms that could apply to both the video content and the distractor option.
+      score_0: Evidence fails to describe the apparatus or setting, or describes it in a way that does not rule out the distractor, leaving the option unverifiable.
+      failure_repair_action: refine_query
+      source_pair_examples:
+      - 636:weak_vs_great:636:weak:iter0->636:great:final
+      - 639:weak_vs_good:639:weak:iter0->639:good:iter1
+      - 648:weak_vs_great:648:weak:iter0->648:great:final
+      - 654:weak_vs_good:654:weak:iter0->654:good:iter1
+    - name: explicit_enumeration_and_state_grounding
+      description: Evidence must contain explicit enumeration (spoken or text) of specific items, categories, UI states, or confirmations of absence to verify inclusion/exclusion, rather than relying on visual similarity or generic process descriptions.
+      score_1: Evidence explicitly lists, names, or describes the specific option terms (e.g., 'Virtual Fighter', 'no headphones', 'icon turns grey') or confirms the exact state transition/absence.
+      score_half: Evidence visually depicts the category or process but does not explicitly name it, confirm the final state, or address the presence/absence of the queried item.
+      score_0: Evidence relies solely on visual similarity or describes the process without any textual/spoken confirmation of specific names, states, or explicit absence.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 254:weak_vs_great:254:weak:iter0->254:great:final
+      - 405:good_vs_great:405:good:iter1->405:great:iter2
+      - 754:weak_vs_good:754:weak:iter0->754:good:iter1
+      - 835:weak_vs_great:835:weak:iter0->835:great:final
+    - name: temporal_sequence_and_completion_integrity
+      description: Evidence must provide the full temporal sequence of the target action (initiation, execution, conclusion) and explicitly ground the chronological order relative to reference events to verify completion status or 'immediately after' constraints.
+      score_1: Evidence describes the complete action sequence from start to finish and explicitly links the timing to reference events, allowing verification of completion and temporal constraints.
+      score_half: Evidence describes the start or middle of the action but is truncated at the critical moment of completion, or implies the sequence without explicit temporal markers.
+      score_0: Evidence is missing the action entirely, is severely truncated, or fails to establish the chronological order, making completion status and timing unverifiable.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 652:good_vs_great:652:good:iter1->652:great:iter2
+      - 755:weak_vs_good:755:weak:iter0->755:good:iter1
+      - 842:weak_vs_good:842:weak:iter0->842:good:iter1
+    - name: causal_and_narrative_linkage
+      description: Evidence must explicitly connect distinct events, states, or actions through causal or narrative logic to distinguish between options that list similar events but lack the correct logical or causal bridge.
+      score_1: Evidence explicitly states the causal link or narrative bridge between events/states (e.g., 'submission failed causing fight'), allowing verification of options requiring specific logical connections.
+      score_half: Evidence mentions the relevant events or states in proximity but lacks the explicit connecting phrase or logical bridge to confirm the causal relationship.
+      score_0: Evidence lists events or states as separate, unconnected facts, making it impossible to verify options that depend on a specific causal or narrative sequence.
+      failure_repair_action: refine_query
+      source_pair_examples:
+      - 835:weak_vs_great:835:weak:iter0->835:great:final
+      - 895:weak_vs_great:895:weak:iter0->895:great:final
+      - 762:good_vs_great:762:good:iter1->762:great:iter2
+  attribute_perception:
+    rubric_criteria:
+    - name: temporal_sequence_and_state_isolation
+      description: Evidence must explicitly establish the chronological order of events and isolate the specific time window for the target attribute, distinguishing it from historical distractors or pre/post-event states to verify or exclude options.
+      score_1: Evidence explicitly anchors the target attribute to the correct time window (e.g., 'before burning', 'second attempt') and excludes irrelevant historical interactions or other temporal states involving the same entities.
+      score_half: Evidence mentions the correct time window or multiple events but lacks explicit ordering or clear temporal separation, risking false inference from distractors.
+      score_0: Evidence fails to distinguish time windows or attempt order, mixing events from different eras or stages, leading to potential false attribution of the target attribute.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 2:good_vs_great:2:good:iter1->2:great:iter2
+      - 5:weak_vs_great:5:weak:iter0->5:great:final
+      - 55:weak_vs_good:55:weak:iter0->55:good:iter1
+    - name: explicit_attribute_definition_and_contrast
+      description: Evidence must explicitly define the specific qualities, material composition, or magnitude of the target attribute and provide direct verbal or visual contrast to definitively exclude all alternative material or descriptive claims in the options.
+      score_1: Evidence explicitly names the correct material/attribute or provides visual/narrative proof that excludes all incorrect options (e.g., 'is lead' vs 'gold/silver', 'very large' vs 'large').
+      score_half: Evidence negates one option or describes the attribute generally but fails to explicitly confirm the actual value or exclude other plausible alternatives mentioned in the options.
+      score_0: Evidence provides no specific information about the attribute's composition, definition, or relative magnitude, or only offers generic descriptions.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 20:weak_vs_great:20:weak:iter0->20:great:final
+      - 172:weak_vs_great:172:weak:iter0->172:great:final
+      - 43:weak_vs_great:43:weak:iter0->43:great:final
+    - name: causal_link_and_intent_explicitness
+      description: Evidence must explicitly state the causal relationship, mechanism, or intent connecting a specific state/action to an outcome or attribute, rather than merely listing facts in proximity or relying on implicit inference.
+      score_1: Evidence explicitly states the causal link (e.g., 'punished for divisions', 'slow tempo violates Beethoven's intent') or mechanism connecting the observed process to the target attribute change.
+      score_half: Evidence mentions the state/action and the outcome in close proximity but lacks an explicit connecting verb, phrase, or logical bridge.
+      score_0: Evidence mentions the state, action, or outcome in isolation without establishing the required causal or intentional relationship.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 25:weak_vs_great:25:weak:iter0->25:great:final
+      - 41:weak_vs_great:41:weak:iter0->41:great:final
+      - 169:weak_vs_good:169:weak:iter0->169:good:iter1
+    - name: contextual_scope_and_negation
+      description: Evidence must explicitly demonstrate the full scope of relevant interactions to prove the absence of distractors or provide explicit negation statements to rule out specific attributes for relevant items.
+      score_1: Evidence explicitly shows alternative interactions to confirm the target is unique, or contains direct negation statements (e.g., 'not gold', 'not spicy') that definitively rule out distractor attributes.
+      score_half: Evidence shows the target interaction clearly but lacks explicit evidence of other interactions to rule out distractors, or describes attributes as 'mild' without direct negation.
+      score_0: Evidence only shows the target interaction or describes items neutrally without addressing the presence or absence of distractor attributes, making exclusion impossible.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 825:weak_vs_great:825:weak:iter0->825:great:final
+      - 704:weak_vs_good:704:weak:iter0->704:good:iter1
+      - 735:weak_vs_great:735:weak:iter0->735:great:final
+    - name: entity_grounding_and_spatial_relation
+      description: Evidence must explicitly ground the relevant person, object, action, scene, speaker, text, or spatial relation instead of only giving a generic related scene, ensuring the attribute is tied to the correct entity.
+      score_1: Evidence explicitly identifies the specific entity and its spatial context (e.g., 'the red cup on the left table') and links the attribute directly to it, excluding similar entities in the scene.
+      score_half: Evidence identifies the general scene or object type but lacks specific spatial or identity markers to distinguish the target from similar distractors.
+      score_0: Evidence provides only generic scene descriptions or fails to link the attribute to a specific, identifiable entity, leading to ambiguity.
+      failure_repair_action: refine_query
+      source_pair_examples:
+      - 101:weak_vs_good:101:weak:iter0->101:good:iter1
+      - 203:weak_vs_great:203:weak:iter0->203:great:final
+    - name: multi-modal_corroboration
+      description: Evidence must integrate visual cues with ASR/caption data to confirm the attribute, ensuring that visual appearance aligns with spoken or textual claims to rule out hallucinations or misinterpretations.
+      score_1: Evidence combines explicit visual confirmation (e.g., color, texture) with matching ASR/caption text to definitively verify the attribute and exclude conflicting modalities.
+      score_half: Evidence relies on only one modality (visual or text) or shows a partial mismatch that requires assumption to resolve.
+      score_0: Evidence relies on a single modality that is ambiguous or contradicts the other available modality without resolution.
+      failure_repair_action: cross_modal_check
+      source_pair_examples:
+      - 305:weak_vs_great:305:weak:iter0->305:great:final
+      - 412:weak_vs_good:412:weak:iter0->412:good:iter1
+    - name: exclusionary_completeness
+      description: Evidence must provide sufficient negative proof to rule out all incorrect options, ensuring that the absence of an attribute is as clearly demonstrated as its presence.
+      score_1: Evidence explicitly demonstrates why every incorrect option is false (e.g., 'the object is not blue, it is green; it is not metal, it is plastic'), leaving no room for doubt.
+      score_half: Evidence confirms the correct option but only implicitly or partially excludes one or more distractors, leaving some ambiguity.
+      score_0: Evidence confirms the correct option but provides no information regarding the incorrect options, making it impossible to verify their falsity.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 506:weak_vs_great:506:weak:iter0->506:great:final
+      - 618:weak_vs_good:618:weak:iter0->618:good:iter1
+  counting_problem:
+    rubric_criteria:
+    - name: entity_enumeration_completeness
+      description: Evidence must explicitly identify and distinguish every distinct entity or event satisfying the counting condition across the entire video, ensuring no valid instances are omitted and no duplicates are counted.
+      score_1: Evidence lists and verifies every distinct entity, allowing the exact count to be determined and all options to be excluded.
+      score_half: Evidence identifies some but not all distinct entities, or fails to distinguish between unique entities and repeated appearances, leaving the total count ambiguous.
+      score_0: Evidence identifies only a subset of entities, uses generic collective terms, or fails to distinguish distinct individuals, making the count unverifiable.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 17:weak_vs_good:17:weak:iter0->17:great:final
+      - 337:weak_vs_good:337:weak:iter0->337:great:final
+      - 480:good_vs_great:480:good:iter1->480:great:iter2
+    - name: temporal_exhaustiveness
+      description: Evidence must cover the entire relevant time window or provide a definitive summary confirming the total count, ensuring no instances are missed in unshown segments or gaps between sampled clips.
+      score_1: Evidence covers the full duration, explicitly confirms zero occurrences in gaps, or provides a definitive summary statement confirming the total count is final.
+      score_half: Evidence covers most of the duration but leaves significant gaps where the target entity could appear, or lists instances without confirming the list is exhaustive.
+      score_0: Evidence provides only isolated snapshots or a partial sequence with no indication of whether more instances exist in the unshown timeline.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 91:weak_vs_good:91:weak:iter0->91:good:iter1
+      - 243:weak_vs_good:243:weak:iter0->243:great:final
+      - 896:good_vs_great:896:good:iter1->896:great:iter2
+    - name: entity_distinction_and_function
+      description: Evidence must explicitly distinguish between visually similar items, different stages of the same item, or non-target objects by providing unique visual descriptors, functional confirmations, or clear temporal boundaries.
+      score_1: Evidence clearly distinguishes all counted items as unique entities via unique descriptors, functional links (e.g., ASR confirmation), or clear transition markers, and excludes distractors.
+      score_half: Evidence suggests distinct items but lacks explicit confirmation of uniqueness for at least one pair, or fails to functionally link an object to the target category.
+      score_0: Evidence fails to distinguish between items, treats multiple segments as a single unit, or misidentifies objects due to lack of functional or visual differentiation.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 236:weak_vs_good:236:weak:iter0->236:great:final
+      - 269:weak_vs_good:269:weak:iter0->269:great:final
+      - 514:weak_vs_great:514:weak:iter0->514:great:final
+    - name: event_boundary_and_completion
+      description: Evidence must explicitly confirm the successful completion or distinct resolution of each counted event and clearly delineate separate instances from continuous actions, incomplete segments, or non-target repetitions.
+      score_1: Evidence clearly describes the start and end (or resolution) of every distinct event, explicitly excludes incomplete/truncated segments, and distinguishes unique events from generic repetitions.
+      score_half: Evidence shows the process of events but leaves the final resolution ambiguous, or fails to clearly separate distinct events from continuous sequences.
+      score_0: Evidence only shows setup, partial processes, or conflates multiple distinct events into a single continuous action, preventing an accurate count.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 573:weak_vs_good:573:weak:iter0->573:good:iter1
+      - 588:weak_vs_good:588:weak:iter0->588:good:iter1
+      - 781:good_vs_great:781:good:iter1->781:great:iter2
+    - name: comparative_exclusion_evidence
+      description: Evidence must provide sufficient data points (metrics, counts, or status) for all candidate entities or options to definitively exclude those that do not meet the counting criteria.
+      score_1: Evidence lists specific metrics or status for every candidate entity, allowing the exclusion of all options with counts higher or lower than the verified instances.
+      score_half: Evidence lists metrics for the target option but misses data for one or more competing options, leaving ambiguity about whether the count could be higher or lower.
+      score_0: Evidence only identifies positive instances without providing data for other candidates, making it impossible to exclude options claiming different counts.
+      failure_repair_action: broadcast
+      source_pair_examples:
+      - 260:weak_vs_great:260:weak:iter0->260:great:final
+      - 401:good_vs_great:401:good:iter1->401:great:iter2
+      - 480:good_vs_great:480:good:iter1->480:great:iter2
+    - name: explicit_count_grounding
+      description: Evidence must contain explicit linguistic or visual confirmation of the total count (e.g., summary graphics, narrator stating 'X items', or a complete labeled list) rather than relying solely on the verifier to infer the total from a sequence of partial observations.
+      score_1: Evidence explicitly states the total count or provides a visual summary that directly verifies the correct option and excludes all others.
+      score_half: Evidence implies the count through a sequence of events or partial lists but lacks an explicit statement or graphic confirming the final accumulated total.
+      score_0: Evidence shows individual instances or game states but fails to provide any explicit total count, summary, or enumeration mechanism to distinguish between options.
+      failure_repair_action: broadcast
+      source_pair_examples:
+      - 522:weak_vs_great:522:weak:iter0->522:great:final
+      - 609:weak_vs_great:609:weak:iter0->609:great:final
+      - 892:good_vs_great:892:good:iter1->892:great:iter2
+    - name: composite_technique_disambiguation
+      description: Evidence explicitly clarifies whether a combined label or complex action (e.g., 'bullion + lazy daisy') represents a single unit or multiple distinct units for the purpose of the count.
+      score_1: Evidence explicitly states whether a combined technique counts as one or multiple items in the total.
+      score_half: Evidence shows the combined technique but does not explicitly state how it contributes to the count, requiring inference.
+      score_0: Evidence mentions a combined technique without any clarification on its contribution to the total count.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 892:good_vs_great:892:good:iter1->892:great:iter2
+  information_synopsis:
+    rubric_criteria:
+    - name: narrative_scope_and_intent_definition
+      description: Evidence must explicitly define the video's primary narrative scope (e.g., priority debate vs. technical comparison) and functional intent (e.g., instruction vs. demonstration) using concrete markers like titles, dates, framing questions, or explicit purpose statements to distinguish the main topic from plausible distractors.
+      score_1: Evidence includes specific markers (dates, counts, framing, titles, explicit intent statements) that definitively establish the video's scope and purpose, allowing the exclusion of options describing different scopes or intents.
+      score_half: Evidence mentions conflicting claims or general topics but lacks specific investigative markers or explicit intent confirmation to fully distinguish the scope from a generic biography, technical review, or broader overview.
+      score_0: Evidence only lists entities or generic facts without defining the relationship, scope, or intent, making it impossible to distinguish between competing main ideas.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 0:weak_vs_good:0:weak:iter0->0:good:iter1
+      - 24:good_vs_great:24:good:iter1->24:great:iter2
+      - 222:good_vs_great:222:good:iter1->222:great:iter2
+      - 579:good_vs_great:579:good:iter1->579:great:iter2
+    - name: narrative_arc_and_resolution_completeness
+      description: Evidence must explicitly link distinct phases of a subject's history (e.g., formation, peak, decline) or a problem-solution structure into a single coherent lifecycle, including the final resolution or outcome, to verify 'rise and fall' or 'central conflict' synopses rather than presenting isolated events.
+      score_1: Evidence clearly connects the subject's phases or problem/resolution as a unified story arc, explicitly confirming the trajectory and final outcome required by the option.
+      score_half: Evidence contains segments of the arc (e.g., both rise and fall) but lacks explicit narrative connection or thematic framing linking them as a single lifecycle, or introduces a problem without the resolution.
+      score_0: Evidence only covers one phase or presents phases as disjointed facts without a unifying narrative, preventing verification of the complete arc or final state.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 9:good_vs_great:9:good:iter1->9:great:iter2
+      - 252:good_vs_great:252:good:iter1->252:great:iter2
+      - 433:weak_vs_good:433:weak:iter0->433:good:iter1
+      - 737:weak_vs_good:737:weak:iter0->737:good:iter1
+    - name: thematic_synthesis_and_hierarchy
+      description: Evidence must explicitly state the unifying theme, thesis, or causal link that connects disparate examples into a single main idea, and distinguish the primary thematic focus from secondary examples or supporting details.
+      score_1: Evidence explicitly articulates the unifying theme or causal mechanism that synthesizes all presented examples into the option's main idea, clearly separating the dominant theme from secondary details.
+      score_half: Evidence presents multiple relevant examples or facts but lacks an explicit statement connecting them into a unified thesis, or mentions the dominant theme without clarifying the hierarchy against sub-topics.
+      score_0: Evidence lists examples or facts without any indication of a unifying theme, causal relationship, or strategic application, making it impossible to distinguish the main idea from a list of topics.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 36:good_vs_great:36:good:iter1->36:great:iter2
+      - 261:good_vs_great:261:good:iter1->261:great:iter2
+      - 340:good_vs_great:340:good:iter1->340:great:iter2
+      - 839:good_vs_great:839:good:iter1->839:great:iter2
+    - name: causal_mechanism_and_attribution_precision
+      description: Evidence must explicitly articulate the specific mechanism, instrument, or logical bridge linking a cause to its effect, and attribute actions or states to the correct entities to exclude options that rely on absolute qualifiers, misattributed facts, or reversed causal directions.
+      score_1: Evidence explicitly states the causal link (e.g., "X caused Y") and contains specific entity attribution or benchmark data that logically excludes the option's absolute claim or misaligned qualifier.
+      score_half: Evidence mentions the cause and effect in close proximity but the explicit causal connector is implied, or contains the general topic but lacks the specific contrasting qualifier or attribution needed to definitively exclude the option.
+      score_0: Evidence mentions the cause and effect separately without establishing a logical relationship, or is generic and fails to link attributes to the correct entity, making it impossible to distinguish between the video's claim and the option's claim.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 105:good_vs_great:105:good:iter1->105:great:iter2
+      - 101:good_vs_great:101:good:iter1->101:great:iter2
+      - 343:weak_vs_great:343:weak:iter0->343:great:final
+      - 775:weak_vs_great:775:weak:iter0->775:great:final
+    - name: entity_grounding_and_mechanic_disambiguation
+      description: Evidence must provide concrete identifiers (specific names, unique locations, distinct visual markers) and resolve semantic or mechanical ambiguities (e.g., 'puck' vs. 'ball') to definitively distinguish between similar options rather than relying on generic descriptions.
+      score_1: Evidence explicitly names specific entities or displays unique identifiers that appear in the correct option and are absent in distractors, and contains multiple consistent descriptions of the defining mechanic to override contradictory mentions.
+      score_half: Evidence provides generic roles or ambiguous descriptions that require inference to exclude similar options, or mentions the defining attribute but is contradicted by other segments, leaving the specific variant ambiguous.
+      score_0: Evidence lacks specific identifiers or contains hallucinated/incorrect entity names, or relies solely on contradictory/ambiguous descriptions, failing to distinguish between the correct entity/mechanic and the distractor's category.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 183:weak_vs_great:183:weak:iter0->183:great:final
+      - 531:weak_vs_great:531:weak:iter0->531:great:final
+      - 665:weak_vs_great:665:weak:iter0->665:great:final
+      - 898:weak_vs_good:898:weak:iter0->898:great:final
+    - name: scope_boundary_and_enumerative_completeness
+      description: Evidence must synthesize multiple distinct milestone markers, temporal boundaries, or structural labels to define the video's total scope, and explicitly enumerate all mentioned items to logically exclude 'not mentioned' options or those with incorrect counts.
+      score_1: Evidence explicitly contains multiple milestones, definitive start/end points, or specific structural labels that mathematically or logically exclude options with conflicting scope definitions, and lists all mentioned items allowing definitive exclusion by process of elimination.
+      score_half: Evidence contains one milestone or implies scope through a sequence but lacks the second necessary data point, or covers most mentioned items but leaves ambiguity about the full scope or total count.
+      score_0: Evidence only shows generic events without milestone markers or scope-defining text, or only confirms the presence of some options but fails to establish the full scope of mentioned items.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 465:weak_vs_good:465:weak:iter0->465:good:iter1
+      - 343:weak_vs_great:343:weak:iter0->343:great:final
+      - 605:weak_vs_great:605:weak:iter0->605:great:final
+      - 539:weak_vs_great:539:weak:iter0->539:great:final
+    - name: negative_factor_and_counter_evidence_disambiguation
+      description: Evidence must provide sufficient positive confirmation of a factor's existence to exclude it from a 'NOT' question, or provide explicit negation and specific counter-examples that directly contradict the premise of plausible distractors to definitively exclude them.
+      score_1: Evidence clearly confirms a factor is a success driver (to exclude it from 'NOT' options) or explicitly negates it, and contains a specific counter-example or statement that makes the distractor logically impossible.
+      score_half: Evidence suggests a factor might be relevant but lacks definitive confirmation or negation, or implies a trend but lacks a direct contradiction that rules out the distractor's focus.
+      score_0: Evidence is silent on the factor or ambiguous, making it impossible to determine if the option is a 'NOT' factor, or lacks any specific counter-evidence to exclude the distractor.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 104:weak_vs_great:104:weak:iter0->104:great:final
+      - 433:weak_vs_good:433:weak:iter0->433:good:iter1
+      - 109:good_vs_great:109:good:iter1->109:great:iter2
+      - 441:good_vs_great:441:good:iter1->441:great:iter2
+  ocr_problems:
+    rubric_criteria:
+    - name: visual_text_grounding
+      description: Evidence explicitly confirms the presence of specific text strings (names, titles, dates, numbers) visible on screen via OCR to verify entities, rather than relying solely on ASR transcription which may contain errors or omissions.
+      score_1: Evidence explicitly describes the text visible on the screen (e.g., 'text labels E.P. Joslin and F.G. Benedict appear on the slide') matching the option, independent of ASR.
+      score_half: Evidence mentions the visual presence of the entity (e.g., 'portraits of Joslin') but relies on ASR for the specific spelling or full name, or describes the text vaguely without quoting it.
+      score_0: Evidence relies entirely on ASR to identify the entity without confirming the text is visually present on the screen, or fails to mention the visual text entirely.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 68:good_vs_great:68:good:iter1->68:great:iter2
+    - name: temporal_event_alignment
+      description: Evidence must explicitly link a specific OCR-extracted value (score, counter, metric) or state to the exact temporal moment of the target event (e.g., 'halftime', 'meeting teammate', 'final score'), rather than listing values found elsewhere in the video or at different times.
+      score_1: Evidence explicitly states the value displayed on screen at the exact moment the target event occurs or concludes, often co-occurring with a specific event label (e.g., 'HALFTIME' text).
+      score_half: Evidence provides the value and the event separately but does not explicitly confirm they happen simultaneously or in the same continuous shot, requiring inference.
+      score_0: Evidence lists values from the video but fails to associate any specific value with the target event timestamp, or provides values from unrelated times.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 714:weak_vs_good:714:weak:iter0->714:good:iter1
+      - 874:weak_vs_good:874:weak:iter0->874:good:iter1
+      - 324:weak_vs_great:324:weak:iter0->324:great:final
+    - name: negative_entity_verification
+      description: Evidence explicitly confirms the absence of a specific entity, term, or concept required to exclude an option, rather than just providing evidence for a related but distinct concept or failing to mention the term.
+      score_1: Evidence explicitly states the specific term is absent or clearly distinguishes the described concept from the option's specific term, allowing definitive exclusion.
+      score_half: Evidence describes a related concept (e.g., 'matter') but does not explicitly confirm the absence of the specific option term (e.g., 'dark matter'), leaving exclusion ambiguous.
+      score_0: Evidence is missing or only provides generic context that could support the option, failing to exclude it.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 141:good_vs_great:141:good:iter1->141:great:iter2
+      - 148:weak_vs_great:148:weak:iter0->148:great:final
+    - name: ordinal_sequence_attribution
+      description: Evidence explicitly links a specific metric value (height, score, count) to its correct sequential index (round number, attempt order) or specific entity (team, athlete) to verify ordinal options and distinguish between similar events.
+      score_1: Evidence provides a clear mapping between the metric value and its specific round/attempt index or entity attribution (e.g., 'first attempt at 5.60m for Duplantis'), allowing verification of ordinal options.
+      score_half: Evidence lists metrics and mentions round numbers or entities separately but does not explicitly link the specific metric to the specific round/entity, requiring inference.
+      score_0: Evidence lists metrics without any temporal, sequential, or entity context, making it impossible to distinguish between 'first', 'second', or specific teams.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 494:weak_vs_good:494:weak:iter0->494:great:final
+      - 504:weak_vs_great:504:weak:iter0->504:great:final
+      - 719:weak_vs_good:719:weak:iter0->719:good:iter1
+  object_reasoning:
+    rubric_criteria:
+    - name: causal_mechanism_and_chain_explicitness
+      description: Evidence must explicitly name the specific intermediate mechanism, physical agent, or multi-step causal loop linking an event to an outcome, rather than describing only the static state, generic context, or isolated variables.
+      score_1: Evidence explicitly states the specific mechanism (e.g., 'T4-to-T3 conversion', 'microbes causing agitation') or traces the full causal sequence (e.g., 'Spending -> Income -> Credit'), definitively ruling out distractors that conflate result with cause or propose alternative mechanisms.
+      score_half: Evidence mentions the event and outcome or uses generic terms (e.g., 'biological pathway', 'outside forces') consistent with the option but lacks the specific intermediate link or fails to connect the logic between cause and effect.
+      score_0: Evidence describes only the static state, the final outcome, or isolated variables without explaining the transmission mechanism, making verification of the causal claim impossible.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 37:weak_vs_great:37:weak:iter0->37:great:final
+      - 75:weak_vs_great:75:weak:iter0->75:great:final
+      - 115:weak_vs_great:115:weak:iter0->115:great:final
+      - 152:good_vs_great:152:good:iter1->152:great:iter2
+      - 472:weak_vs_good:472:weak:iter0->472:good:iter1
+    - name: comparative_aggregation_and_scope_completeness
+      description: Evidence must explicitly state the aggregation method (e.g., 'combined', 'sum') for superlative claims and identify/describe ALL entities listed in the options to enable valid exclusion or verification of 'most distinct' or 'different' options.
+      score_1: Evidence explicitly states the target exceeds the sum/combined total of alternatives (e.g., 'more than X, Y, and Z combined') and explicitly identifies/describes every option entity, enabling a complete comparison and definitive exclusion of distractors.
+      score_half: Evidence lists alternatives and the target in a comparative context but lacks the explicit 'combined' qualifier, or identifies most options but misses one or describes them ambiguously, leaving the logical exclusion or superlative ranking ambiguous.
+      score_0: Evidence mentions the target and alternatives separately without a clear comparative relationship, or fails to identify one or more options entirely, making comparative reasoning or superlative verification impossible.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 6:weak_vs_great:6:weak:iter0->6:great:final
+      - 255:weak_vs_great:255:weak:iter0->255:great:final
+      - 426:weak_vs_good:426:weak:iter0->426:great:final
+      - 457:weak_vs_great:457:weak:iter0->457:great:final
+    - name: semantic_scope_and_terminology_disambiguation
+      description: Evidence must explicitly distinguish between semantically similar concepts, scales, or scopes (e.g., 'treatment protocol' vs. 'biological process') and use the exact terminology found in options to definitively exclude distractors relying on vague associations.
+      score_1: Evidence explicitly defines the term, scale, or scope (e.g., distinguishing 'Synthroid' treatment from natural conversion) and uses the exact option terminology to rule out distractors, providing a complete causal chain that logically excludes unmentioned factors.
+      score_half: Evidence mentions the relevant concepts but lacks the specific context or qualifiers needed to rule out a plausible distractor, or names a related concept without the specific terminology required to distinguish between similar options.
+      score_0: Evidence mentions terms vaguely, conflates distinct concepts, or provides only generic context without linking to the specific causal terms in the options, allowing a distractor based on semantic similarity to remain plausible.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 75:weak_vs_great:75:weak:iter0->75:great:final
+      - 80:weak_vs_good:80:weak:iter0->80:good:iter1
+      - 461:weak_vs_good:461:weak:iter0->461:good:iter1
+      - 747:weak_vs_great:747:weak:iter0->747:great:final
+    - name: temporal_sequence_and_case_isolation
+      description: Evidence must explicitly map events to specific time windows, ordinal sequences, or distinct cases to verify progression, resolution, or temporal constraints, preventing conflation of similar entities across segments.
+      score_1: Evidence clearly separates the target case from other similar cases using explicit temporal markers or case identifiers, maps ordinal references to specific timeline events, and covers critical phases (start, middle, end) to verify progression and resolution.
+      score_half: Evidence mentions the target case but lacks clear separation from other similar cases, identifies events without explicit confirmation of their relative order, or covers only partial phases leaving the middle progression ambiguous.
+      score_0: Evidence conflates multiple cases, fails to establish chronological order, or describes events in isolation without temporal context, making it impossible to verify ordinal claims or rule out intermediate state changes.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 164:weak_vs_great:164:weak:iter0->164:great:final
+      - 452:weak_vs_great:452:weak:iter0->452:great:final
+      - 486:weak_vs_good:486:weak:iter0->486:good:iter1
+      - 756:weak_vs_good:756:weak:iter0->756:great:final
+    - name: discriminative_attribute_and_entity_grounding
+      description: Evidence must explicitly ground specific visual attributes (text, colors, logos), functional roles, or identity markers to entities to distinguish between similar distractors and verify 'both', 'only', or identity-based options.
+      score_1: Evidence explicitly transcribes or describes specific visual features (e.g., 'red N logo', 'right hand holds cue') and binds them to proper nouns (via ASR/OCR), distinguishing all candidate entities or states using unique attributes present in the options.
+      score_half: Evidence mentions the entity or object but describes only partial attributes, relies on general context, or identifies entities generally without the explicit binding (name-to-face) or granular detail needed for definitive verification.
+      score_0: Evidence fails to describe specific visual attributes, contains contradictory bindings, or describes the scene generically without naming entities, making it impossible to distinguish between entities or verify specific functional roles.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 263:weak_vs_great:263:weak:iter0->263:great:final
+      - 482:weak_vs_great:482:weak:iter0->482:great:final
+      - 600:good_vs_great
+      - 870:weak_vs_great:870:weak:iter0->870:great:final
+    - name: counter_premise_refutation_and_negative_exclusion
+      description: Evidence must explicitly address and refute the specific false premise (e.g., financial status, motive) embedded in a distractor or state negative outcomes/incompatibility to definitively rule out plausible but incorrect options.
+      score_1: Evidence explicitly states the true condition (e.g., 'wealthy', 'toxic') that directly contradicts the option's false premise, or explicitly names a specific counter-example to exclude universal claims ('All', 'Every').
+      score_half: Evidence implies the true condition through context but does not explicitly state the contradictory fact, or implies the existence of a counter-example without explicit comparison to other categories, leaving the false premise partially plausible.
+      score_0: Evidence only confirms the observable fact without addressing the specific reason or condition proposed in the option, or describes the group generically without comparing attributes to exclude other options.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 37:weak_vs_great:37:weak:iter0->37:great:final
+      - 113:good_vs_great:113:good:iter1->113:great:iter2
+      - 150:weak_vs_great:150:weak:iter0->150:great:final
+      - 658:weak_vs_great:658:weak:iter0->658:great:final
+    - name: quantitative_magnitude_and_action_specificity
+      description: Evidence must explicitly quantify counts, scores, or temporal frequencies and distinguish specific physical actions from generic movement to verify magnitude claims and exclude options relying on vague or incorrect numbers.
+      score_1: Evidence explicitly states the total count, scoreline, frequency, or exact gap (e.g., '5-1', 'one lap down') and describes the specific physical action (e.g., 'leaps through') for all relevant segments, allowing definitive verification of magnitude claims.
+      score_half: Evidence shows multiple instances or a gap but lacks explicit quantification or frequency markers to distinguish between specific magnitude options, or describes dynamic movement without the specific action type or numerical count.
+      score_0: Evidence shows only isolated instances or mentions a gap without quantitative data, or is generic and missing the object entirely, making it impossible to verify magnitude claims or exclude numerical distractors.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 16:weak_vs_great:16:weak:iter0->16:great:final
+      - 467:weak_vs_great:467:weak:iter0->467:great:final
+      - 655:good_vs_great:655:good:iter1->655:great:iter2
+      - 509:weak_vs_great:509:weak:iter0->509:great:final
+  object_recognition:
+    rubric_criteria:
+    - name: entity_attribute_explicitness
+      description: Evidence must explicitly state the specific proper noun, visual attribute, or distinguishing feature required to uniquely identify the target object among similar distractors, rather than relying on generic categories or implied context.
+      score_1: Evidence explicitly names the specific entity or describes the unique visual attribute matching the option text, allowing definitive verification or exclusion.
+      score_half: Evidence describes the entity's category or general attributes but omits the specific proper noun or distinguishing feature, leaving ambiguity.
+      score_0: Evidence is irrelevant, fails to mention the entity, or only provides generic descriptions that could apply to multiple candidates.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 50:weak_vs_great:50:weak:iter0->50:great:final
+      - 134:weak_vs_good:134:weak:iter0->134:good:iter1
+      - 74:weak_vs_great:74:weak:iter0->74:great:final
+    - name: attribute_visual_disambiguation
+      description: Evidence must visually distinguish between different types of attributes (e.g., primary value vs. modifier, specific color vs. similar color) or explicitly contrast observed details with option details to definitively exclude distractors that are visually similar.
+      score_1: Evidence clearly shows the visual distinction between the target attribute and other attributes, or explicitly contrasts observed details with option details to prove mismatch.
+      score_half: Evidence mentions the distinction in narration but lacks clear visual grounding, or mentions observed details without explicitly linking them to the exclusion of the option's specific detail.
+      score_0: Evidence fails to distinguish between different attributes or is generic, leading to potential confusion between the target value and modifiers or similar distractors.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 882:weak_vs_great:882:weak:iter0->882:great:final
+      - 731:weak_vs_good:731:weak:iter0->731:good:iter1
+      - 861:good_vs_great:861:good:iter1->861:great:iter2
+    - name: quantitative_aggregation_and_comparison
+      description: Evidence explicitly aggregates the frequency of occurrences for each option value to enable a comparative 'fewest', 'most', or superlative determination across the video timeline.
+      score_1: Evidence provides a clear count or frequency for every option value, allowing a definitive comparison to identify the minimum/maximum or global ranking.
+      score_half: Evidence provides counts for some but not all option values, or provides a relative comparison without explicit counts, leaving ambiguity.
+      score_0: Evidence lists instances of objects/actions but fails to aggregate them into counts or frequencies, making comparison impossible.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 416:good_vs_great:416:good:iter1->416:great:iter2
+      - 500:weak_vs_great:500:weak:iter0->500:great:final
+      - 682:weak_vs_great:682:weak:iter0->682:great:final
+    - name: negative_option_elimination_completeness
+      description: For exclusion questions, evidence must explicitly verify the presence of all distractor options to allow the correct answer to be identified via elimination; missing evidence for even one distractor prevents the exclusion of that distractor.
+      score_1: Evidence explicitly confirms the presence of all distractor options, allowing the remaining option to be definitively identified as the one not used or excluded.
+      score_half: Evidence confirms the presence of some distractors but leaves at least one distractor unverified, creating ambiguity about which item is actually the target.
+      score_0: Evidence fails to confirm the presence of multiple distractors, making it impossible to determine which option is the correct answer via elimination.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 586:weak_vs_great:586:weak:iter0->586:great:final
+      - 884:weak_vs_good:884:weak:iter0->884:great:final
+    - name: object_completeness_and_token_verification
+      description: Evidence explicitly lists or visually confirms ALL objects present in the target set (e.g., starting hand, inventory), including standard game-specific tokens or non-drawn items, to verify or exclude options regarding specific object types.
+      score_1: Evidence explicitly lists or shows all objects in the target set, including any standard tokens, allowing definitive verification or exclusion of options about specific object types.
+      score_half: Evidence shows the target set but omits mention of standard tokens or is ambiguous about the total count, leaving options about specific tokens unverifiable.
+      score_0: Evidence fails to show the target set selection screen or lists only a subset of objects without acknowledging the full composition.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 412:weak_vs_good:412:weak:iter0->412:good:iter1
+    - name: superlative_and_scope_grounding
+      description: Evidence must explicitly link superlative claims to specific entities via direct dialogue/text, or define the video's temporal/topical scope to definitively exclude options that are future topics or outside the exclusive focus.
+      score_1: Evidence contains explicit dialogue/text confirming the superlative attribute or explicit markers that define the scope and exclude out-of-scope options.
+      score_half: Evidence shows a ranked list or implies a future topic but lacks explicit narrative confirmation or boundary markers to rule out alternatives.
+      score_0: Evidence only shows the entity or topic without ranking confirmation or scope definition, leaving the superlative claim or topic status ambiguous.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 319:weak_vs_great:319:weak:iter0->319:great:final
+      - 137:weak_vs_great:137:weak:iter0->137:great:final
+      - 133:good_vs_great:133:good:iter1->133:great:iter2
+    - name: causal_mechanism_explicitness
+      description: Evidence must explicitly articulate the logical mechanism, intermediate step, or direct causal link connecting an event or object to a specific outcome, rather than merely listing the event and outcome in proximity.
+      score_1: Evidence explicitly states or visually depicts the intermediate causal mechanism or direct link connecting the entity to the outcome.
+      score_half: Evidence mentions the event and the outcome in close proximity but lacks the explicit connecting logic, mechanism, or causal connector.
+      score_0: Evidence mentions the event and outcome separately without any logical connection, making it impossible to distinguish between correlation and causation or to exclude swapped distractors.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 13:weak_vs_good:13:weak:iter0->13:great:final
+      - 76:good_vs_great:76:good:iter1->76:great:iter2
+      - 338:good_vs_great:338:good:iter1->338:great:iter2
+  spatial_perception:
+    rubric_criteria:
+    - name: relative_spatial_orientation
+      description: Evidence explicitly describes the facing direction or relative position (e.g., left, right, front, back) of one subject with respect to another, rather than just identifying their presence in the same scene.
+      score_1: Evidence explicitly states the relative facing direction (e.g., 'facing left of', 'sitting to the right of') or provides a clear visual description allowing unambiguous deduction of the relative orientation.
+      score_half: Evidence describes the positions of both subjects relative to a common reference (e.g., camera, desk) but does not explicitly state the relationship between them, requiring inference that may be ambiguous.
+      score_0: Evidence identifies the subjects and the scene but provides no information regarding their relative positions or facing directions.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 250:good_vs_great:250:good:iter1->250:great:iter2
+    - name: spatial_quadrant_verification
+      description: Evidence explicitly identifies the specific quadrant (e.g., lower left, upper right) or precise relative position of the target object within the frame, rather than just general presence in the scene.
+      score_1: Evidence explicitly states the target object is in the specific quadrant/position required by the question (e.g., 'green model in lower left').
+      score_half: Evidence describes the object's general location in the scene (e.g., 'on the stairs', 'in the background') but lacks the specific quadrant or precise frame-relative position needed to confirm the option.
+      score_0: Evidence mentions the object's presence in the scene but provides no spatial details, or the spatial details are ambiguous.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 740:weak_vs_good:740:weak:iter0->740:good:iter1
+    - name: spatial_exclusion_sufficiency
+      description: Evidence contains sufficient negative spatial constraints to definitively exclude incorrect options, distinguishing between 'not seen' and 'confirmed absent'.
+      score_1: Evidence explicitly confirms the absence of a target in a specific required location or orientation, or provides a complete spatial map that logically excludes the option.
+      score_half: Evidence notes the target is not visible in the current frame but lacks confirmation that it is absent from the relevant spatial context or time window.
+      score_0: Evidence fails to address the spatial location of the target, leaving the option's validity unknown.
+      failure_repair_action: refine_query
+      source_pair_examples: []
+    - name: multi_object_spatial_relation
+      description: Evidence establishes the spatial relationship between multiple objects simultaneously to verify complex comparative options.
+      score_1: Evidence explicitly links the positions of all relevant objects in a single coherent description (e.g., 'A is left of B, which is above C').
+      score_half: Evidence describes objects individually or in pairs but fails to establish the complete relational chain required to verify the option.
+      score_0: Evidence identifies objects but provides no relational data between them.
+      failure_repair_action: dense_sample
+      source_pair_examples: []
+    - name: temporal_spatial_consistency
+      description: Evidence maintains consistent spatial descriptions across the relevant time window, ensuring state changes or movements are accurately captured.
+      score_1: Evidence tracks the object's position across the time window, confirming stability or explicitly describing the movement trajectory.
+      score_half: Evidence provides a snapshot at one time point but lacks confirmation of spatial state at other critical moments in the window.
+      score_0: Evidence provides conflicting spatial descriptions at different timestamps or ignores temporal context entirely.
+      failure_repair_action: refine_query
+      source_pair_examples: []
+  spatial_reasoning:
+    rubric_criteria:
+    - name: landmark_uniqueness
+      description: Evidence must explicitly identify unique, non-generic architectural landmarks (e.g., specific obelisks, domes, named squares) that distinguish the location from other cities with similar generic features.
+      score_1: Evidence explicitly names or visually confirms unique landmarks that only exist in the target location, allowing definitive exclusion of all other options.
+      score_half: Evidence identifies generic features (e.g., 'stone stairs', 'European square') or partial landmarks that suggest a region but do not uniquely identify the specific city/country.
+      score_0: Evidence only describes generic settings (e.g., 'outdoor', 'stairs', 'plaza') without any unique identifying features.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 739:weak_vs_great:739:weak:iter0->739:great:final
+    - name: event_contextual_anchor
+      description: Evidence must link the spatial setting to a specific named event, brand, or title that provides external knowledge constraints on the location (e.g., a fashion show title known to be held in a specific country).
+      score_1: Evidence explicitly displays a title or brand (e.g., 'VALENTINO The Beginning') that uniquely constrains the location to a specific country/city.
+      score_half: Evidence mentions a brand or event type but lacks the specific title or visual confirmation linking it to the location.
+      score_0: Evidence describes the event (e.g., 'fashion show') without any specific naming or branding that aids location identification.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 739:weak_vs_great:739:weak:iter0->739:great:final
+    - name: source_entity_identification
+      description: Evidence must explicitly identify the primary source entity (e.g., movie title, book name, specific case name) mentioned in the video to disambiguate between options that share similar generic plot elements or spatial settings.
+      score_1: Evidence explicitly names or visually displays the title of the source work, allowing unique mapping of plot-specific entities to the correct option.
+      score_half: Evidence implies the source work through strong contextual clues (e.g., actor names, specific plot points) but lacks the explicit title confirmation.
+      score_0: Evidence only describes generic scenes or character actions without identifying the source work, making it impossible to distinguish between options with similar themes.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 199:weak_vs_great:199:weak:iter0->199:great:final
+    - name: spatial_causal_linkage
+      description: Evidence explicitly links specific spatial details (e.g., object location, victim position, scene layout) to the verification of an option via on-screen text or direct statement, rather than implying the link through separate facts.
+      score_1: Evidence contains a direct statement or graphic explicitly stating the spatial relationship required to verify the option (e.g., 'located in [Specific Place]').
+      score_half: Evidence states the spatial context and the event separately, but does not explicitly link them in a conditional or definitive statement.
+      score_0: Evidence mentions the location or the event in isolation without establishing the spatial relationship required to verify the specific option.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 185:weak_vs_great:185:weak:iter0->185:great:final
+    - name: evidence_coverage
+      description: Evidence covers the key event, time window, state change, comparison target, or causal chain needed to verify or exclude each option.
+      score_1: Evidence provides a complete chain covering all necessary temporal and spatial constraints to definitively verify the correct option and exclude all distractors.
+      score_half: Evidence covers the primary event or location but misses a critical temporal window, comparison target, or state change needed to fully exclude a specific distractor.
+      score_0: Evidence is fragmented, missing the core event or location entirely, or fails to address the specific constraints of the question options.
+      failure_repair_action: refine_query
+      source_pair_examples: []
+    - name: evidence_specificity
+      description: Evidence explicitly grounds the relevant person, object, action, scene, speaker, text, or spatial relation instead of only giving a generic related scene.
+      score_1: Evidence pinpoints exact entities (e.g., 'the red car on the left', 'Speaker A at 00:12') and their precise spatial relations required for the answer.
+      score_half: Evidence identifies the general scene or object type but lacks the specific attributes or precise spatial positioning needed to distinguish between similar options.
+      score_0: Evidence relies on vague descriptions (e.g., 'a car', 'someone') or generic scene summaries that could apply to multiple options.
+      failure_repair_action: refine_query
+      source_pair_examples: []
+    - name: evidence_consistency
+      description: Evidence is internally consistent and contains enough contrary evidence to exclude options that conflict with the video.
+      score_1: Evidence presents a coherent narrative where all spatial and temporal details align, explicitly contradicting the premises of incorrect options.
+      score_half: Evidence is mostly consistent but contains minor ambiguities or lacks explicit contradictory details to rule out a plausible distractor.
+      score_0: Evidence contains internal contradictions (e.g., conflicting timestamps or locations) or fails to provide any information that contradicts incorrect options.
+      failure_repair_action: refine_query
+      source_pair_examples: []
+  temporal_perception:
+    rubric_criteria:
+    - name: comparative_volume_evidence
+      description: Evidence must provide sufficient distinct segments, time durations, or variant counts for ALL competing options to enable a quantitative or qualitative comparison of 'most space' or 'primary focus'.
+      score_1: Evidence includes sufficient segments/duration for all top contenders to definitively rank them by volume/focus.
+      score_half: Evidence covers the top contender well but lacks sufficient segments for the runner-up to confirm the ranking.
+      score_0: Evidence only covers one option or lacks enough segments to compare the relative 'space' devoted to options.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 259:weak_vs_great:259:weak:iter0->259:great:final
+    - name: temporal_state_sequence
+      description: Evidence must explicitly establish the chronological order of states (e.g., score, lead status) across multiple time points to pinpoint the exact interval where a state change (e.g., overtake, comeback) occurred.
+      score_1: 'Evidence provides a clear chronological sequence of states (Time A: State X, Time B: State Y) that definitively bounds the event.'
+      score_half: Evidence provides multiple time points but the chronological order is ambiguous or the state change is not clearly bounded by the provided points.
+      score_0: Evidence provides isolated time points without establishing a sequence, or fails to show the state change across the timeline.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 425:good_vs_great:425:good:iter1->425:great:iter2
+    - name: temporal_narrative_coherence
+      description: Evidence must explicitly link the initial state and final state within the same specific event context (e.g., same match, same day) to verify 'comeback' or 'defeat' options, rather than presenting disjointed clips from different events.
+      score_1: Evidence explicitly identifies the specific event and provides a continuous or logically linked narrative from the initial deficit to the final outcome.
+      score_half: Evidence shows the initial deficit and the final outcome but lacks the explicit event identifier or the logical link between them (e.g., clips from different matches mixed).
+      score_0: Evidence shows isolated states without confirming they belong to the same match or event.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 470:weak_vs_great:470:weak:iter0->470:great:final
+    - name: temporal_event_linkage
+      description: Evidence must explicitly link a specific event (e.g., mishap, action) to a specific temporal marker (day of week, time of day) either within the same clip or through unambiguous visual/ASR continuity across clips.
+      score_1: The specific event is explicitly labeled with the required temporal marker, or the link is unambiguous via visual continuity (e.g., same outfit, scene setup) to a labeled segment.
+      score_half: The event is described, and a temporal marker exists in a nearby segment, but the link is ambiguous (e.g., different outfits, no explicit 'yesterday/today' reference).
+      score_0: The event is identified, but no temporal marker is present in the event's clip, and no clear continuity links it to a labeled segment.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 691:weak_vs_good:691:weak:iter0->691:good:iter1
+  temporal_reasoning:
+    rubric_criteria:
+    - name: temporal_anchor_precision
+      description: Evidence must provide explicit, unambiguous temporal markers (timestamps, ordinal numbers, or sequential narrative cues like 'first/then') for every event listed in the options to definitively establish absolute or relative order, rather than relying on generic presence or vague relative terms.
+      score_1: Evidence contains explicit, unambiguous temporal anchors for all events in the option sequence, allowing a definitive chronological reconstruction and immediate exclusion of incorrect permutations.
+      score_half: Evidence provides temporal markers for some events but leaves the relative order of at least two events ambiguous or relies on vague narrative cues requiring manual sorting.
+      score_0: Evidence lists events present in the video but lacks any explicit temporal markers or logical connectors to determine their sequence, making verification impossible.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 501:good_vs_great:501:good:iter1->501:great:iter2
+      - 507:good_vs_great:507:good:iter1->507:great:iter2
+      - 729:weak_vs_great:729:weak:iter0->729:great:final
+      - 877:weak_vs_good:877:weak:iter0->877:great:final
+    - name: sequence_completeness_via_exclusion
+      description: Evidence must explicitly confirm the presence and order of events in the correct option AND provide negative evidence (explicit confirmation of absence) for events listed in incorrect options to fully exclude distractors.
+      score_1: Evidence confirms the order of all events in the correct option and explicitly states the absence of events listed in distractors within the relevant temporal scope, or provides context making the distractor impossible.
+      score_half: Evidence confirms the order of present events but fails to explicitly confirm the absence of distractor events, relying on implicit absence or generic scenes that do not match specific distractor characteristics.
+      score_0: Evidence fails to establish the order of events or ignores events listed in options without comment, leaving distractors unverifiable and preventing true/false/unknown determination.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 501:good_vs_great:501:good:iter1->501:great:iter2
+      - 570:weak_vs_great:570:weak:iter0->570:great:final
+      - 535:good_vs_great:535:good:iter1->535:great:iter2
+      - 791:good_vs_great:791:good:iter1->791:great:iter2
+    - name: event_boundary_and_disambiguation
+      description: Evidence must clearly distinguish the start/end of specific actions or separate thematically similar topics (e.g., definition vs. strategy, creation vs. release) to prevent misattribution of timestamps or conflation of distinct steps.
+      score_1: Evidence clearly delineates the transition into and out of each specific action or explicitly differentiates similar topics using unique visual cues, title text, or specific content examples, confirming the specific introduction point.
+      score_half: Evidence describes the action or topic but lacks clear transition markers or specific differentiating details, risking confusion between adjacent movements or similar sections.
+      score_0: Evidence describes a generic movement, conflates distinct milestones (e.g., creation and release), or treats similar topics as a single block, failing to confirm the specific introduction point or order.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 214:weak_vs_great:214:weak:iter0->214:great:final
+      - 220:weak_vs_good:220:weak:iter0->220:great:final
+      - 238:weak_vs_great:238:weak:iter0->238:great:final
+      - 597:weak_vs_great:597:weak:iter0->597:great:final
+    - name: narrative_segmentation_clarity
+      description: Evidence must clearly delineate distinct narrative segments for each event, preventing the conflation of topics that occur at different times, and explicitly link events via narrative cues (e.g., 'after X', 'next') or visual continuity.
+      score_1: Evidence clearly separates events into distinct segments with clear transition markers and explicit narrative/visual links that order all events in the option, distinguishing brief mentions from substantive discussions.
+      score_half: Evidence separates events but transition markers are weak, ambiguous, or missing for at least one pair, requiring inference to determine the sequence or failing to weigh main segments over intro mentions.
+      score_0: Evidence mixes events from different time periods into a single description or lists events in isolation without temporal connectors, making the order unverifiable.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 749:weak_vs_good:749:weak:iter0->749:great:final
+      - 778:weak_vs_great:778:weak:iter0->778:great:final
+      - 791:good_vs_great:791:good:iter1->791:great:iter2
+      - 77:weak_vs_great:77:weak:iter0->77:great:final
+    - name: state_transition_continuity
+      description: Evidence must explicitly demonstrate the chronological progression of distinct actions or state changes (e.g., State A -> Action -> State B) to verify prerequisite relationships, rather than listing isolated actions or final states.
+      score_1: Evidence explicitly shows the transition between steps or the object's state before and after specific actions, establishing a continuous logical chain that validates the causal/temporal link.
+      score_half: Evidence shows the actions and final state but the intermediate state transition is implied or missing, making the strict order ambiguous or relying on inference.
+      score_0: Evidence lists actions in isolation without showing state changes or temporal linkage, presenting them as disjointed events that cannot verify the sequence.
+      failure_repair_action: time_sorted
+      source_pair_examples:
+      - 660:weak_vs_great:660:weak:iter0->660:great:final
+      - 701:weak_vs_great:701:weak:iter0->701:great:final
+      - 597:weak_vs_great:597:weak:iter0->597:great:final
+      - 10:weak_vs_good:10:weak:iter0->10:good:iter1
+    - name: ordinal_boundary_verification
+      description: Evidence must confirm the existence and content of segments immediately following (or preceding) a target item to validate its specific ordinal position (e.g., 'second to last', '4th step') and exclude options based on rank.
+      score_1: Evidence explicitly describes the content of all segments following the target item up to the end of the video, or provides a complete list of the final N segments to confirm the specific rank and exclude rank-based distractors.
+      score_half: Evidence describes some but not all segments following the target, or implies the end without listing the specific intervening items, leaving the exact ordinal position ambiguous.
+      score_0: Evidence stops at the target item or describes segments before it, with no information on what follows, making it impossible to verify the rank or exclude options based on position.
+      failure_repair_action: dense_sample
+      source_pair_examples:
+      - 371:good_vs_great:371:good:iter1->371:great:iter2
+      - 385:weak_vs_good:385:weak:iter0->385:great:final
+      - 389:weak_vs_good:389:weak:iter0->389:good:iter1
+    - name: schedule_context_disambiguation
+      description: Evidence must explicitly anchor events to specific calendar days or time windows and distinguish between 'standard' routines and 'current/updated' schedules to resolve ambiguity in multi-day or recurring event questions.
+      score_1: Evidence explicitly ties all events to the correct day/time window and clarifies any deviations from standard routines (e.g., 'starting this week', 'new day'), allowing definitive exclusion of schedule-based distractors.
+      score_half: Evidence ties most events to days but leaves one key event ambiguous, or fails to clarify if a routine is the standard or the current week's variation.
+      score_0: Evidence presents events without day attribution or relies on outdated/standard routines, making it impossible to distinguish between options differing by day or schedule change.
+      failure_repair_action: asr_match
+      source_pair_examples:
+      - 772:weak_vs_great:772:weak:iter0->772:great:final
+      - 774:good_vs_great:774:good:iter1->774:great:iter2
+      - 848:weak_vs_great:848:weak:iter0->848:great:final

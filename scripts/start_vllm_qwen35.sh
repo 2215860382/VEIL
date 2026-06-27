@@ -14,7 +14,7 @@ CUDA_VISIBLE_DEVICES=$GPU_ID nohup /home2/ycj/miniconda3/envs/veil/bin/python -m
     --host 127.0.0.1 \
     --port $PORT \
     --dtype bfloat16 \
-    --max-model-len 32768 \
+    --max-model-len 49152 \
     --gpu-memory-utilization 0.85 \
     --max-num-seqs 128 \
     --enable-prefix-caching \

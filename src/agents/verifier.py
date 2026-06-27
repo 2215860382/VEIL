@@ -6,7 +6,7 @@ Rubric-guided judgment:
   3. Rubric criteria      – explicit 0 / 0.5 / 1 per criterion; aggregated to a score.
   4. Label and gaps       – label follows the rubric threshold; gaps drive the next query.
 
-Rubric lives in ``src/rubric/rubric_templates.yaml`` (structured YAML, pluggable per task_type).
+Default rubric lives in ``outputs/rubric/direct_answer_generated_v2.yaml``.
 Currently all questions use ``templates.default``; extend ``type_aliases`` / ``keyword_rules``
 in the yaml to route different types to different templates without code changes.
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import statistics
 from functools import lru_cache
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -43,7 +44,15 @@ def _inject_images(message: dict, pil_images) -> dict:
 
 @lru_cache(maxsize=1)
 def _rubric_config() -> Tuple[Dict, Dict, Dict[str, str], List[Tuple[List[str], str]]]:
-    path = Path(__file__).resolve().parents[1] / "rubric" / "rubric_templates.yaml"
+    override = os.environ.get("VEIL_RUBRIC_PATH")
+    path = (
+        Path(override).expanduser()
+        if override
+        else Path(__file__).resolve().parents[2]
+        / "outputs"
+        / "rubric"
+        / "direct_answer_generated_v2.yaml"
+    )
     if not path.is_file():
         raise FileNotFoundError(f"VEIL rubric templates missing: {path}")
     with path.open(encoding="utf-8") as f:
@@ -51,7 +60,7 @@ def _rubric_config() -> Tuple[Dict, Dict, Dict[str, str], List[Tuple[List[str], 
 
     general: Dict = data.get("general") or {}
     if not general.get("rubric_criteria"):
-        raise ValueError("rubric_templates.yaml must define general.rubric_criteria")
+        raise ValueError(f"{path} must define general.rubric_criteria")
 
     templates: Dict = {}
     for k, v in (data.get("templates") or {}).items():
@@ -411,6 +420,7 @@ class Verifier:
         verifier_attr: bool = False,
         verifier_opstatus: bool = False,
         margin_threshold: float = 0.20,
+        sufficient_threshold_delta: float = 0.0,
         loose: bool = False,
     ) -> Dict:
         """Judge evidence sufficiency with rubric-guided per-option scoring.
@@ -418,7 +428,7 @@ class Verifier:
         rubric_judgment=True (default):
             LLM scores each rubric criterion per option; Python computes
             option_scores, option_status, label, and weak_rubric_criteria.
-            label: "FULLY_SUFFICIENT" | "ANSWER_SUFFICIENT" | "INSUFFICIENT"
+            label: "SUFFICIENT" | "INSUFFICIENT"
 
         rubric_judgment=False:
             Legacy no-rubric path; label: "sufficient" | "insufficient"
@@ -528,7 +538,10 @@ class Verifier:
         # ── Parse LLM option_judgment, then enforce threshold ──────────────────
         # rubric_score measures evidence sufficiency to judge an option (not support direction).
         # Python overrides to "unknown" when rubric_score < sufficient_threshold.
-        sufficient_threshold = rubric_dict.get("sufficient_threshold", 0.75)
+        sufficient_threshold = min(
+            1.0,
+            float(rubric_dict.get("sufficient_threshold", 0.75)) + float(sufficient_threshold_delta),
+        )
         raw_judgment = parsed.get("option_judgment") or {}
         llm_judgment: Dict[str, str] = {}
         if isinstance(raw_judgment, dict):
@@ -545,6 +558,8 @@ class Verifier:
             if rscore is None or rscore < sufficient_threshold:
                 option_judgment[opt] = "unknown"
             else:
+                # Threshold only gates whether evidence is sufficient to make a
+                # judgment; the LLM may still leave the option unresolved.
                 option_judgment[opt] = llm_judgment.get(opt, "unknown")
 
         # ── Compute label ──────────────────────────────────────────────────────
@@ -553,15 +568,7 @@ class Verifier:
         false_opts  = [k for k, v in option_judgment.items() if v == "false"]
         unknown_opts = [k for k, v in option_judgment.items() if v == "unknown"]
 
-        if len(true_opts) == 1 and len(false_opts) == n_opts - 1:
-            label = "FULLY_SUFFICIENT"
-        elif len(true_opts) == 1 and unknown_opts:
-            true_score       = option_rubric_scores[true_opts[0]]
-            max_unknown_score = max(option_rubric_scores.get(u, 0.0) for u in unknown_opts)
-            margin = true_score - max_unknown_score
-            label = "ANSWER_SUFFICIENT" if margin >= margin_threshold else "INSUFFICIENT"
-        else:
-            label = "INSUFFICIENT"
+        label = "SUFFICIENT" if len(true_opts) == 1 and len(false_opts) == n_opts - 1 else "INSUFFICIENT"
 
         # ── Weak rubric criteria (from unknown options only) ───────────────────
         weak_rubric_criteria: List[str] = []
