@@ -6,7 +6,7 @@
 set -uo pipefail
 cd /home2/ycj/Project/VEIL
 PY=/home2/ycj/miniconda3/envs/veil/bin/python
-DEV=outputs/results/videomme/full900/dev_r2_merged.jsonl
+DEV=outputs/results/videomme/tuning/dev_r2_merged.jsonl
 
 echo "[wait] dev-720 r2_merged ..."
 for _ in $(seq 1 600); do
@@ -27,9 +27,9 @@ def load(f):
     return o
 # stitch r2_merged over the full 900
 r2={}
-for f in ["outputs/results/videomme/full900/dev_r2_merged.jsonl",
-          "outputs/results/videomme/val_compare/val_round2_merged.jsonl",
-          "outputs/results/videomme/test_compare/test_r2_merged.jsonl"]:
+for f in ["outputs/results/videomme/tuning/dev_r2_merged.jsonl",
+          "outputs/results/videomme/tuning/val_round2_merged.jsonl",
+          "outputs/results/videomme/tuning/test_r2_merged.jsonl"]:
     r2.update(load(f))
 tsqf=load("outputs/results/videomme/tuning/mf_tsqf.jsonl")
 orc=load("outputs/results/videomme/tuning/mf_qf_oracle.jsonl")

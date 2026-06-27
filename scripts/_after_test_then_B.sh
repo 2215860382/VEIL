@@ -7,7 +7,7 @@ set -uo pipefail
 cd /home2/ycj/Project/VEIL
 PY=/home2/ycj/miniconda3/envs/veil/bin/python
 D=outputs/results/intermediate_goods/overnight_20260627_full720
-TDIR=outputs/results/videomme/test_compare
+TDIR=outputs/results/videomme/tuning
 export PYTHONPATH=.
 
 echo "[wait] test-compare (v2/r2_merged/r2_weighted) to reach 90 rows each ..."
@@ -35,9 +35,9 @@ def load(f):
         o[int(r["sample_idx"])]=r
     return o
 runs={
- "v2":"outputs/results/videomme/test_compare/test_v2.jsonl",
- "r2_merged":"outputs/results/videomme/test_compare/test_r2_merged.jsonl",
- "r2_weighted":"outputs/results/videomme/test_compare/test_r2_weighted.jsonl",
+ "v2":"outputs/results/videomme/tuning/test_v2.jsonl",
+ "r2_merged":"outputs/results/videomme/tuning/test_r2_merged.jsonl",
+ "r2_weighted":"outputs/results/videomme/tuning/test_r2_weighted.jsonl",
  "tsqf":"outputs/results/videomme/tuning/mf_tsqf.jsonl",
 }
 for k,f in runs.items():
@@ -56,7 +56,7 @@ VEIL_RUBRIC_PATH="$D/round2_merged_runtime.yaml" "$PY" experiments/tuning/veil_2
   --llm-api-url http://127.0.0.1:8003,http://127.0.0.1:8004 \
   --answer-keyframe-k 64 --pipeline-name val_r2_merged_kf64 \
   --sample-indices-file "$D/splits/val_indices.txt" --workers 24 \
-  --out outputs/results/videomme/val_compare/val_r2_merged_kf64.jsonl
+  --out outputs/results/videomme/tuning/val_r2_merged_kf64.jsonl
 
 echo "==================== B RESULT: keyframe k=32 vs k=64 on val-90 ===================="
 $PY - <<'PYEOF'
@@ -70,8 +70,8 @@ def load(f):
         if r.get("record_type"): continue
         o[int(r["sample_idx"])]=r
     return o
-k32=load("outputs/results/videomme/val_compare/val_round2_merged.jsonl")
-k64=load("outputs/results/videomme/val_compare/val_r2_merged_kf64.jsonl")
+k32=load("outputs/results/videomme/tuning/val_round2_merged.jsonl")
+k64=load("outputs/results/videomme/tuning/val_r2_merged_kf64.jsonl")
 for name,d in [("r2_merged k=32",k32),("r2_merged k=64",k64)]:
     ids=[i for i in val if i in d]; c=sum(1 for i in ids if d[i].get("correct"))
     print(f"  {name:<18}: {c}/{len(ids)} = {c/len(ids)*100:.1f}%")

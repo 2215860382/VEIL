@@ -50,7 +50,10 @@ outputs/logs/
 # intentionally TRACKED — it holds the final runtime rubrics used by the verifier.
 outputs/debug/
 outputs/results/intermediate_goods/
-outputs/results/videomme/val_compare/
-outputs/results/videomme/test_compare/
-outputs/results/videomme/full900/
+# Rubric eval results live in tuning/ (flat). Keep tracked baselines (mf_qf*,
+# mf_tsqf), ignore the bulk rubric-comparison runs.
 outputs/results/videomme/tuning/mf_rubric_*.jsonl
+outputs/results/videomme/tuning/val_*
+outputs/results/videomme/tuning/test_*
+outputs/results/videomme/tuning/dev_*
+outputs/results/videomme/tuning/r2_merged_900*

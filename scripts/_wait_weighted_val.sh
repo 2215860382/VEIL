@@ -2,7 +2,7 @@
 set -uo pipefail
 cd /home2/ycj/Project/VEIL
 PY=/home2/ycj/miniconda3/envs/veil/bin/python
-F=outputs/results/videomme/val_compare/val_round2_weighted.jsonl
+F=outputs/results/videomme/tuning/val_round2_weighted.jsonl
 for _ in $(seq 1 240); do
   n=$(grep -c '"sample_idx"' "$F" 2>/dev/null || echo 0)
   [ "$n" -ge 90 ] && break
@@ -21,10 +21,10 @@ def load(f):
         o[int(r["sample_idx"])]=r
     return o
 runs={n:load(f) for n,f in [
- ("v2","outputs/results/videomme/val_compare/val_v2.jsonl"),
- ("round1","outputs/results/videomme/val_compare/val_round1.jsonl"),
- ("r2_merged","outputs/results/videomme/val_compare/val_round2_merged.jsonl"),
- ("r2_weighted","outputs/results/videomme/val_compare/val_round2_weighted.jsonl"),
+ ("v2","outputs/results/videomme/tuning/val_v2.jsonl"),
+ ("round1","outputs/results/videomme/tuning/val_round1.jsonl"),
+ ("r2_merged","outputs/results/videomme/tuning/val_round2_merged.jsonl"),
+ ("r2_weighted","outputs/results/videomme/tuning/val_round2_weighted.jsonl"),
  ("tsqf","outputs/results/videomme/tuning/mf_tsqf.jsonl"),
 ]}
 ref=runs["v2"]; qt={i:ref[i]["question_type"] for i in val if i in ref}
