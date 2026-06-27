@@ -212,7 +212,9 @@ def main():
     out_path = Path(args.out) if args.out else \
                default_out_dir / "veil_27b.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path = out_path.with_suffix(".meta.json")
+    # Keep run metadata in a meta/ subfolder next to the results (less clutter).
+    meta_path = out_path.parent / "meta" / (out_path.stem + ".meta.json")
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
 
     repo_root = Path(__file__).resolve().parents[2]
     config_path = Path(args.config)

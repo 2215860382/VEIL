@@ -53,8 +53,5 @@ outputs/results/intermediate_goods/
 # Rubric eval results live in tuning/ (flat). Keep tracked baselines (mf_qf*,
 # mf_tsqf), ignore the bulk rubric-comparison runs.
 outputs/results/videomme/tuning/mf_rubric_*.jsonl
-outputs/results/videomme/tuning/val_*
-outputs/results/videomme/tuning/test_*
-outputs/results/videomme/tuning/dev_*
 outputs/results/videomme/tuning/r2_merged_900*
-outputs/results/videomme/tuning/meta/
+outputs/results/videomme/tuning/split_runs/
