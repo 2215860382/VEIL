@@ -19,7 +19,6 @@ _PROMPT = (
     "You are answering a multiple-choice question about a long video.\n"
     "Below are {n} relevant video segments retrieved from the video.\n\n"
     "{evidence}\n\n"
-    "{hint}"
     "Question: {question}\n"
     "Choices: {choices}\n"
     "Answer with a single letter (A/B/C/D) only, no explanation:"
@@ -34,29 +33,11 @@ _QF_HEADER = (
 )
 
 _QF_TAIL = (
-    "{hint}"
     "{evidence}\n\n"
     "Question: {question}\n"
     "Choices: {choices}\n"
     "Answer with a single letter (A/B/C/D) only, no explanation:"
 )
-
-
-def _format_verifier_hint(option_judgment: dict, option_scores: dict | None = None) -> str:
-    """Format verifier's per-option judgement as a prior for the answerer."""
-    if not option_judgment:
-        return ""
-    parts = []
-    for letter, verdict in option_judgment.items():
-        score_str = ""
-        if option_scores and letter in option_scores:
-            score_str = f" (score {option_scores[letter]:.2f})"
-        parts.append(f"  ({letter}) {verdict}{score_str}")
-    return (
-        "A separate verifier judged each option using rubric criteria. Use this as a strong prior:\n"
-        + "\n".join(parts)
-        + "\n\n"
-    )
 
 
 def _img_block(img) -> dict:
@@ -91,8 +72,6 @@ class Answerer:
         question_first: bool = False,
         max_evidence_chars: int = 80000,
         focused_texts: List[str] = (),
-        verifier_option_judgment: dict | None = None,
-        verifier_option_scores: dict | None = None,
     ) -> dict:
         all_texts = list(focused_texts) + list(evidence_texts)
         if all_texts and max_evidence_chars and sum(len(t) for t in all_texts) > max_evidence_chars:
@@ -102,7 +81,6 @@ class Answerer:
 
         evidence = _format_evidence(list(focused_texts) + list(evidence_texts))
         choices  = _format_options(candidates)
-        hint     = _format_verifier_hint(verifier_option_judgment or {}, verifier_option_scores)
         n_seg    = len(focused_texts) + len(evidence_texts)
 
         # Filter to non-null frames, aligning ts and cid lists by position.
@@ -124,7 +102,7 @@ class Answerer:
         # ── Default path: no flags → original chat_with_frames behaviour ─────
         if not image_timestamps and not question_first:
             prompt = _PROMPT.format(
-                n=n_seg, evidence=evidence, hint=hint,
+                n=n_seg, evidence=evidence,
                 question=question, choices=choices,
             )
             raw = self.model.chat_with_frames(
@@ -154,13 +132,13 @@ class Answerer:
                 content.append({
                     "type": "text",
                     "text": _QF_TAIL.format(
-                        hint=hint, evidence=evidence,
+                        evidence=evidence,
                         question=question, choices=choices,
                     ),
                 })
             else:
                 prompt = _PROMPT.format(
-                    n=n_seg, evidence=evidence, hint=hint,
+                    n=n_seg, evidence=evidence,
                     question=question, choices=choices,
                 )
                 content.append({"type": "text", "text": prompt})

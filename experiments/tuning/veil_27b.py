@@ -151,8 +151,6 @@ def main():
                          "instead of LLM-decomposing into per-option sub-queries")
     ap.add_argument("--ignore-verifier-signal", action="store_true",
                     help="For iter >= 1 planning, ignore verifier feedback and plan only from question/evidence/history")
-    ap.add_argument("--pass-verifier-judgment", action="store_true",
-                    help="Pass verifier's last option_judgment+scores into the final answerer prompt")
     ap.add_argument("--loose-verifier", action="store_true",
                     help="Use VERIFIER_SYS_LOOSE that accepts indirect/synthesized evidence")
     ap.add_argument("--verifier-two-pass", action="store_true",
@@ -252,7 +250,6 @@ def main():
         "embed_api_url": args.embed_api_url,
         "question_first": args.question_first,
         "single_query_iter0": args.single_query_iter0,
-        "pass_verifier_judgment": args.pass_verifier_judgment,
         "sufficient_threshold_delta": args.sufficient_threshold_delta,
         "multi_layer_mode": args.multi_layer_mode,
     }
@@ -439,7 +436,6 @@ def main():
             per_chunk_keyframe_cap=args.per_chunk_keyframe_cap,
             single_query_iter0=args.single_query_iter0,
             ignore_verifier_signal=args.ignore_verifier_signal,
-            pass_verifier_judgment_to_answerer=args.pass_verifier_judgment,
             loose_verifier=args.loose_verifier,
             verifier_two_pass=args.verifier_two_pass,
             sufficient_threshold_delta=args.sufficient_threshold_delta,

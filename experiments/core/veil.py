@@ -601,7 +601,6 @@ def run_veil(
     gold_answer:           str          = "",
     oracle_no_second_rerank: bool       = False,
     per_chunk_keyframe_cap: int         = 1,
-    pass_verifier_judgment_to_answerer: bool = False,
     loose_verifier:        bool         = False,
     verifier_two_pass:     bool         = False,
     dialogue_first:        bool         = False,
@@ -894,12 +893,6 @@ def run_veil(
             kf_chunk_ids_for_ans = kf_chunk_ids_for_ans[:answer_keyframe_cap]
             kf_ts_for_ans        = kf_ts_for_ans[:answer_keyframe_cap]
 
-        verifier_hint_oj = None
-        verifier_hint_scores = None
-        if pass_verifier_judgment_to_answerer and last_verdict:
-            verifier_hint_oj = last_verdict.get("option_judgment")
-            verifier_hint_scores = last_verdict.get("option_rubric_scores")
-
         # ── Online layer: if still insufficient after all iterations, go back to
         # the raw video frames (frames_raw) for the relevant chunks and re-examine
         # them with a question-aware VLM pass; prepend the fresh text as evidence.
@@ -921,9 +914,7 @@ def run_veil(
                                  keyframe_ts=kf_ts_for_ans,
                                  evidence_chunk_ids=ev_ids,
                                  image_timestamps=image_timestamps,
-                                 question_first=question_first,
-                                 verifier_option_judgment=verifier_hint_oj,
-                                 verifier_option_scores=verifier_hint_scores)
+                                 question_first=question_first)
         result["n_keyframes_to_answer"] = len(kf_for_answer)
         result["n_evidence_to_answer"]  = len(ev_texts)
         result["online_used"]           = online_used
