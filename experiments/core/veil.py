@@ -608,6 +608,9 @@ def run_veil(
     image_timestamps:      bool         = False,
     question_first:        bool         = True,
     align_images_to_evidence: bool      = False,
+    conditional_vision:    bool         = False,
+    label_layers:          bool         = False,
+    time_sort_evidence:    bool         = False,
     multi_layer_mode:      str          = "none",
     online_layer:          bool         = False,
 ) -> dict:
@@ -757,7 +760,9 @@ def run_veil(
         else:
             ev_for_verifier = all_evidence_texts
 
-        kf_for_verifier = all_keyframes
+        # Conditional vision: verifier judges TEXT sufficiency only (no frames), so
+        # "insufficient" means text can't answer → escalate to images at the final answer.
+        kf_for_verifier = [] if conditional_vision else all_keyframes
         if answer_keyframe_cap is not None and len(kf_for_verifier) > answer_keyframe_cap:
             kf_for_verifier = kf_for_verifier[:answer_keyframe_cap]
 
@@ -852,6 +857,29 @@ def run_veil(
             order    = _rerank_by_rubric(question, candidates, ev_texts, rubric, llm)
             ev_texts = [ev_texts[i] for i in order]
             ev_ids   = [ev_ids[i]   for i in order]
+
+        # Time-sort evidence so the model reads the video in chronological order
+        # instead of retrieval-score order.
+        if time_sort_evidence and ev_ids:
+            def _ts(cid):
+                c = chunk_by_id.get(cid)
+                return c.start_time if c is not None else 1e18  # online (-999) → tail
+            order    = sorted(range(len(ev_ids)), key=lambda j: _ts(ev_ids[j]))
+            ev_texts = [ev_texts[j] for j in order]
+            ev_ids   = [ev_ids[j]   for j in order]
+
+        # Layer labels: tell the model each chunk's granularity (L1 detail … L3 overview).
+        if label_layers:
+            lab = {1: "L1 detail", 2: "L2 mid", 3: "L3 overview", 4: "L4 global"}
+            ev_texts = [
+                (f"[{lab.get(getattr(chunk_by_id.get(cid), 'layer', 1), 'L?')}] {t}"
+                 if chunk_by_id.get(cid) is not None else t)
+                for t, cid in zip(ev_texts, ev_ids)
+            ]
+
+        # Conditional vision: only escalate to keyframes when text was insufficient.
+        if conditional_vision and _verdict_sufficient(last_verdict):
+            all_keyframes = []
 
         kf_for_answer        = all_keyframes
         kf_chunk_ids_for_ans = all_kf_chunk_ids

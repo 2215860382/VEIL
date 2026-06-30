@@ -167,6 +167,12 @@ def main():
                          "image in the answerer prompt")
     ap.add_argument("--kf-dedup-threshold", type=float, default=None,
                     help="Override visual keyframe dedup cosine threshold (1.0 = no dedup, keep all)")
+    ap.add_argument("--conditional-vision", action="store_true",
+                    help="Text-only verifier+answer; escalate to keyframes ONLY when text judged insufficient")
+    ap.add_argument("--label-layers", action="store_true",
+                    help="Prefix each evidence chunk with its pyramid layer (L1 detail .. L3 overview)")
+    ap.add_argument("--time-sort-evidence", action="store_true",
+                    help="Order evidence chunks chronologically instead of by retrieval score")
     ap.add_argument("--hires-keyframes", action="store_true",
                     help="Feed full-res keyframes_origin (1280x720) instead of keyframes_resized")
     ap.add_argument("--no-question-first", action="store_false", dest="question_first",
@@ -450,6 +456,9 @@ def main():
             image_timestamps=args.image_timestamps,
             question_first=args.question_first,
             align_images_to_evidence=args.align_images_to_evidence,
+            conditional_vision=args.conditional_vision,
+            label_layers=args.label_layers,
+            time_sort_evidence=args.time_sort_evidence,
             use_oracle=args.use_oracle,
             gold_answer=s.answer if args.use_oracle else "",
             multi_layer_mode=args.multi_layer_mode,
