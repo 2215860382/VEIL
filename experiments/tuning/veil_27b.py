@@ -165,6 +165,10 @@ def main():
     ap.add_argument("--image-timestamps", action="store_true",
                     help="Prepend a [Frame at Xs — Segment N] text label before each keyframe "
                          "image in the answerer prompt")
+    ap.add_argument("--kf-dedup-threshold", type=float, default=None,
+                    help="Override visual keyframe dedup cosine threshold (1.0 = no dedup, keep all)")
+    ap.add_argument("--hires-keyframes", action="store_true",
+                    help="Feed full-res keyframes_origin (1280x720) instead of keyframes_resized")
     ap.add_argument("--no-question-first", action="store_false", dest="question_first",
                     default=True,
                     help="Disable question-first prompting (default: on). With question-first, "
@@ -204,6 +208,10 @@ def main():
     ev_dedup        = float(_vl.get("evidence_dedup_threshold", 0.9))
     q_ev_dedup      = float(_vl.get("query_evidence_dedup_threshold", 0.9))
     kf_dedup_thresh = float(_vl.get("kf_dedup_threshold", 0.9))
+    if args.kf_dedup_threshold is not None:
+        kf_dedup_thresh = args.kf_dedup_threshold
+    if args.hires_keyframes:
+        os.environ["VEIL_HIRES_KEYFRAMES"] = "1"
 
     memory_dir = Path(args.memory_dir) if args.memory_dir else \
                  out_root / "memory" / f"{bench}_L_27B"

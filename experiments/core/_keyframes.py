@@ -1,6 +1,7 @@
 """Shared keyframe loading and visual deduplication helpers."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -96,6 +97,11 @@ def keyframe_paths(keyframe_dir, video_id: str, chunk_id: int, cap: int = 3,
     if chunk is not None:
         kp = getattr(chunk, "keyframe_path", "") or ""
         if kp:
+            # --hires-keyframes: swap the resized frame for its full-res origin twin.
+            if os.environ.get("VEIL_HIRES_KEYFRAMES") == "1":
+                hp = kp.replace("keyframes_resized", "keyframes_origin")
+                if os.path.isfile(hp):
+                    kp = hp
             kp_path = Path(kp)
             if kp_path.is_absolute() and kp_path.is_file():
                 return [str(kp_path)]
