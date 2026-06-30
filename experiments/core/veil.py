@@ -595,12 +595,8 @@ def run_veil(
     rubric_judgment:       bool         = True,
     single_query_iter0:    bool         = False,
     ignore_verifier_signal:    bool     = False,
-    verifier_attr:         bool         = False,
-    verifier_opstatus:     bool         = False,
     sufficient_threshold_delta: float   = 0.0,
     rubric_rerank:         bool         = False,
-    explicit_attribution:  bool         = False,
-    prune_distractors:     bool         = False,
     use_oracle:            bool         = False,
     gold_answer:           str          = "",
     oracle_no_second_rerank: bool       = False,
@@ -645,11 +641,6 @@ def run_veil(
     # (L2 chunks have no frames, so they'll naturally produce no keyframes)
     if multi_layer_mode == "multi_pool":
         chunk_by_id.update({c.chunk_id: c for c in bank.l2_chunks})
-
-    # Pruning distractors requires distractor_ids from the verifier.
-    # verifier_opstatus already outputs distractor_ids; only fall back to explicit_attribution otherwise.
-    if prune_distractors and not explicit_attribution and not verifier_opstatus:
-        explicit_attribution = True
 
     # ── Iter-0 plan: sub-question decomposition ──────────────────────────────
     if single_query_iter0:
@@ -774,10 +765,6 @@ def run_veil(
 
         last_verdict = verifier.verify(question, candidates, ev_for_verifier, rubric,
                                   keyframe_images=kf_for_verifier,
-                                  rubric_judgment=rubric_judgment,
-                                  explicit_attribution=explicit_attribution,
-                                  verifier_attr=verifier_attr,
-                                  verifier_opstatus=verifier_opstatus,
                                   sufficient_threshold_delta=sufficient_threshold_delta,
                                   loose=loose_verifier,
                                   two_pass=verifier_two_pass)
@@ -829,23 +816,6 @@ def run_veil(
                     for i in range(len(candidates))
                 }
                 last_verdict["unknown_options"] = [gold_letter]
-
-        # ── Prune distractors flagged by the verifier ────────────────────────
-        if prune_distractors:
-            dist_set = {i - 1 for i in (last_verdict.get("distractor_ids") or [])
-                        if 1 <= i <= len(all_evidence_texts)}
-            if dist_set:
-                keep = [i for i in range(len(all_evidence_texts)) if i not in dist_set]
-                all_evidence_texts = [all_evidence_texts[i] for i in keep]
-                all_chunk_ids      = [all_chunk_ids[i]      for i in keep]
-                all_ev_vecs        = [all_ev_vecs[i]        for i in keep]
-                if all_keyframes:
-                    keep_cids = set(all_chunk_ids)
-                    kf_keep = [j for j, cid in enumerate(all_kf_chunk_ids) if cid in keep_cids]
-                    all_keyframes    = [all_keyframes[j]    for j in kf_keep]
-                    all_kf_vecs      = [all_kf_vecs[j]      for j in kf_keep]
-                    all_kf_chunk_ids = [all_kf_chunk_ids[j] for j in kf_keep]
-                    all_kf_ts        = [all_kf_ts[j]        for j in kf_keep]
 
         # ── Trace ────────────────────────────────────────────────────────────
         iterations.append({
