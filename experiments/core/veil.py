@@ -895,12 +895,20 @@ def run_veil(
         # the raw video frames (frames_raw) for the relevant chunks and re-examine
         # them with a question-aware VLM pass; prepend the fresh text as evidence.
         online_used = False
-        if online_layer and keyframe_dir is not None and last_verdict \
-                and not _verdict_sufficient(last_verdict):
+        if online_layer and last_verdict and not _verdict_sufficient(last_verdict):
+            # frames_raw lives in the SOURCE multiframe dir, not the text bank dir.
+            # Recover its root from a chunk's absolute keyframe_path (…/videomme_
+            # multiframe/{vid}/keyframes_resized/x.jpg → …/videomme_multiframe).
+            frames_root = keyframe_dir
+            for _c in chunk_by_id.values():
+                kp = getattr(_c, "keyframe_path", "") or ""
+                if kp:
+                    frames_root = os.path.dirname(os.path.dirname(os.path.dirname(kp)))
+                    break
             extra = _online_recaption(
                 question, candidates,
                 last_verdict.get("missing_evidence_analysis") or "",
-                ev_ids, bank.video_id, keyframe_dir, answerer.model)
+                ev_ids, bank.video_id, frames_root, answerer.model)
             if extra:
                 ev_texts = [extra] + list(ev_texts)
                 ev_ids   = [-999] + list(ev_ids)
