@@ -601,7 +601,6 @@ def run_veil(
     gold_answer:           str          = "",
     oracle_no_second_rerank: bool       = False,
     per_chunk_keyframe_cap: int         = 1,
-    loose_verifier:        bool         = False,
     verifier_two_pass:     bool         = False,
     dialogue_first:        bool         = False,
     asr_alpha:             float        = 0.0,
@@ -765,7 +764,6 @@ def run_veil(
         last_verdict = verifier.verify(question, candidates, ev_for_verifier, rubric,
                                   keyframe_images=kf_for_verifier,
                                   sufficient_threshold_delta=sufficient_threshold_delta,
-                                  loose=loose_verifier,
                                   two_pass=verifier_two_pass)
 
         # ── Oracle check (post-verifier) ──────────────────────────────────────

@@ -176,54 +176,6 @@ Return ONLY this JSON (use actual criterion names from the Rubric):
   "missing_evidence_analysis": "..."
 }"""
 
-# Looser variant — explicitly allows synthesizing indirect / partial evidence
-# instead of requiring verbatim restatement of the option.
-VERIFIER_SYS_LOOSE = """\
-You evaluate whether retrieved video evidence is sufficient to judge each answer option.
-Output ONE strict JSON object — no prose, no markdown fences.
-
-## CRITICAL — How to read evidence
-Video memory is a high-level summary; it almost never restates an answer option verbatim.
-Treat evidence as INDIRECT and use these rules:
-  * If multiple evidence pieces together IMPLY an option (e.g. mentioning prices,
-    discussing $10 / $4000 → "price is a factor"), treat that as sufficient to JUDGE.
-  * If the speaker quotes a motive in dialogue (Speech / asr), that quote counts
-    as an explicit statement even if paraphrased.
-  * Visual descriptions (objects, actions, locations) count as judgable evidence
-    for perception / counting / spatial / temporal-order claims.
-  * Only return "unknown" when the evidence is genuinely off-topic, NOT just because
-    it lacks word-for-word phrasing of the option.
-
-## Step 1 — Per-Option Evidence Sufficiency Scoring
-For each option, score each rubric criterion:
-  1.0 = the cumulative evidence ALLOWS a judgment (confirm OR rule out)
-        — including via reasonable inference from indirect evidence.
-  0.5 = some relevant signal but truly ambiguous.
-  0.0 = no usable signal at all for this criterion.
-
-## Step 2 — Option Judgment
-  true    : evidence (direct or by reasonable inference) establishes the option is correct
-  false   : evidence establishes the option is incorrect or contradicts it
-  unknown : evidence is genuinely silent on this option
-
-Prefer true/false over unknown whenever the evidence permits a reasonable inference.
-
-## Step 3 — Missing Evidence Analysis
-If any option is "unknown", write ONE actionable sentence naming the specific
-fact still needed. Leave empty if no option is unknown.
-
-Return ONLY this JSON:
-{
-  "option_criteria_scores": {
-    "A": {"<criterion>": 0.0, ...},
-    "B": {"<criterion>": 0.0, ...}
-  },
-  "option_judgment": {
-    "A": "true|false|unknown",
-    "B": "true|false|unknown"
-  },
-  "missing_evidence_analysis": "..."
-}"""
 
 
 # ── Two-pass rubric verifier (--verifier-two-pass) ───────────────────────────
@@ -447,7 +399,6 @@ class Verifier:
         rubric: str | dict,
         keyframe_images=(),
         sufficient_threshold_delta: float = 0.0,
-        loose: bool = False,
         two_pass: bool = False,
     ) -> Dict:
         """Judge evidence sufficiency with rubric-guided per-option scoring.
@@ -482,9 +433,8 @@ class Verifier:
             f"Rubric:\n{rubric_section}", f"Evidence Chain:\n{ev}",
             "Return the JSON now.",
         ])
-        sys_for_rubric = VERIFIER_SYS_LOOSE if loose else VERIFIER_SYS
         # Prompt-iteration override (no source edit needed); empty/unset → default.
-        sys_for_rubric = os.environ.get("VEIL_VERIFIER_SYS", "").strip() or sys_for_rubric
+        sys_for_rubric = os.environ.get("VEIL_VERIFIER_SYS", "").strip() or VERIFIER_SYS
         messages = [
             {"role": "system", "content": sys_for_rubric},
             {"role": "user",   "content": user},

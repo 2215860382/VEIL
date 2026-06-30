@@ -151,8 +151,6 @@ def main():
                          "instead of LLM-decomposing into per-option sub-queries")
     ap.add_argument("--ignore-verifier-signal", action="store_true",
                     help="For iter >= 1 planning, ignore verifier feedback and plan only from question/evidence/history")
-    ap.add_argument("--loose-verifier", action="store_true",
-                    help="Use VERIFIER_SYS_LOOSE that accepts indirect/synthesized evidence")
     ap.add_argument("--verifier-two-pass", action="store_true",
                     help="Two-pass verifier: pass1 scores sufficiency only, pass2 judges true/false conditioned on the per-option threshold result")
     ap.add_argument("--sufficient-threshold-delta", type=float, default=0.0,
@@ -436,7 +434,6 @@ def main():
             per_chunk_keyframe_cap=args.per_chunk_keyframe_cap,
             single_query_iter0=args.single_query_iter0,
             ignore_verifier_signal=args.ignore_verifier_signal,
-            loose_verifier=args.loose_verifier,
             verifier_two_pass=args.verifier_two_pass,
             sufficient_threshold_delta=args.sufficient_threshold_delta,
             dialogue_first=args.dialogue_first,
