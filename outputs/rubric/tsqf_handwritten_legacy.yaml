@@ -1,17 +1,18 @@
 # VEIL Verifier rubric templates.
 #
-# Structure:
-#   general   – 5 criteria applied to EVERY question (G1-G5)
-#   templates – type-specific criteria; combined with general at runtime
+# Each criterion carries `failure_repair_action`: when verifier flags this
+# criterion as weak, planner uses the action to choose the next retrieval
+# strategy (see planner.py and experiments/core/veil.py for handlers).
 #
-# Final criteria = general.rubric_criteria + templates.<type>.rubric_criteria
-# Scoring rule and threshold come from the matched type template;
-# general's own rule/threshold apply when no type matches.
-#
-# type_aliases: exact question_type string → template key
-# keyword_rules: question text keywords → template key (checked after type_aliases)
+# Available actions:
+#   refine_query   — generate new BGE sub-queries (default, current behaviour)
+#   asr_match      — substring match in chunk.asr (for quoted-phrase questions)
+#   time_sorted    — reorder accumulated evidence by chunk start_time
+#   dense_sample   — expand keyframes from already-retrieved chunks
+#   loose_verify   — next verifier pass uses VERIFIER_SYS_LOOSE
+#   broadcast      — uniform timeline sampling
 
-# ── General rubric (G1-G5, every question) ───────────────────────────────────
+# ── General rubric (every question) ──────────────────────────────────────────
 general:
   rubric_criteria:
     - name: evidence_coverage
@@ -19,30 +20,35 @@ general:
       score_1:    "Key facts are substantially and completely covered"
       score_half: "Partial coverage of key facts; important information still missing"
       score_0:    "Only background or loosely related segments; facts needed for judgment are absent"
+      failure_repair_action: refine_query
 
     - name: evidence_consistency
       description: "Evidence chain is internally consistent with no conflicting descriptions"
       score_1:    "Evidence is internally consistent"
       score_half: "Minor uncertainty or vague expression; no clear contradiction"
       score_0:    "Evidence contains conflicting descriptions of key facts"
+      failure_repair_action: refine_query
 
     - name: entity_consistency
       description: "Persons, objects, locations, and event subjects are consistently identified across evidence"
       score_1:    "Key entities are consistent and traceable across evidence chunks"
       score_half: "Entities are largely consistent but with some ambiguity or unclear references"
       score_0:    "Entities are confused; cannot confirm whether they refer to the same object"
+      failure_repair_action: refine_query
 
     - name: evidence_specificity
       description: "Evidence is sufficiently specific rather than only general descriptions"
       score_1:    "Evidence includes explicit actions, objects, time, location, or state information"
       score_half: "Evidence has some specific information but remains coarse"
       score_0:    "Evidence is too general to support precise judgment"
+      failure_repair_action: refine_query
 
     - name: noise_resistance
       description: "Evidence is not dominated by irrelevant, surface-relevant, or misleading content"
       score_1:    "Evidence focuses on key facts with no obvious distraction"
       score_half: "Some irrelevant information present but does not seriously affect judgment"
       score_0:    "Evidence is primarily surface-relevant or distracting content"
+      failure_repair_action: refine_query
 
   scoring_rule: average
   sufficient_threshold: 0.75
@@ -60,7 +66,11 @@ type_aliases:
   "Spatial Perception":   spatial
   "Spatial Reasoning":    spatial
 
+# keyword_rules override type_aliases when the question text matches.
+# `quote_grounded` and other action-specific routes go first so they win.
 keyword_rules:
+  - keywords: [" says ", " said ", " says,", " said,", "\" says", "\" said", "quote", "states ", "stated "]
+    qtype: quote_grounded
   - keywords: ["why", "how did", "cause", "reason", "result", "led to", "because", "due to"]
     qtype: causal
   - keywords: ["when", "before", "after", "first", "last", "then", "order", "sequence", "which happens", "followed by"]
@@ -69,14 +79,36 @@ keyword_rules:
     qtype: state_transition
   - keywords: ["where", "location", "position", "left of", "right of", "next to", "behind", "in front of", "entered", "spatial"]
     qtype: spatial
-  - keywords: ["what color", "how many", "how does it look", "shape", "appearance", "color", "what text", "what does it say", "what is written"]
+  - keywords: ["how many", "count", "number of"]
+    qtype: counting
+  - keywords: ["what color", "how does it look", "shape", "appearance", "color", "what text", "what does it say", "what is written"]
     qtype: visual_detail
   - keywords: ["what happened", "what did", "what is doing", "what action", "what event"]
     qtype: action
 
 templates:
 
-  # ── Temporal / Order (T1-T2) ─────────────────────────────────────────────────
+  # ── Quote-grounded (question quotes a specific phrase from dialogue) ────────
+  quote_grounded:
+    rubric_criteria:
+      - name: quote_grounding
+        description: "Question quotes a specific phrase (e.g. 'X says ...'); evidence must contain that ASR phrase verbatim or near-verbatim"
+        score_1:    "The exact quoted phrase appears in evidence ASR/dialogue"
+        score_half: "A paraphrase of the quoted phrase is present in evidence"
+        score_0:    "The quoted phrase is not located in any evidence ASR"
+        failure_repair_action: asr_match
+
+      - name: contextual_completeness
+        description: "Evidence includes the surrounding context of the quoted phrase needed to infer intent"
+        score_1:    "Surrounding dialogue / scene context is present"
+        score_half: "Some surrounding context but motivation is unclear"
+        score_0:    "Only the quote itself; no context for interpretation"
+        failure_repair_action: refine_query
+
+    scoring_rule: average
+    sufficient_threshold: 0.75
+
+  # ── Temporal / Order ─────────────────────────────────────────────────────────
   temporal:
     rubric_criteria:
       - name: temporal_coverage
@@ -84,17 +116,26 @@ templates:
         score_1:    "Before/after events and key transition points are all covered"
         score_half: "Some events covered but key temporal relationships are missing"
         score_0:    "Segments needed for temporal ordering are absent"
+        failure_repair_action: refine_query
 
       - name: temporal_consistency
         description: "Evidence clearly establishes the before/after relationship between events"
         score_1:    "Temporal order is explicit and unambiguous"
         score_half: "Temporal order is partially inferable but not stated directly"
         score_0:    "Temporal order is absent, ambiguous, or contradictory"
+        failure_repair_action: time_sorted
+
+      - name: chronological_anchor
+        description: "Evidence anchors the asked event to neighbouring segments in chronological order"
+        score_1:    "Evidence places the asked event adjacent to its before/after events"
+        score_half: "Adjacent events present but order is implicit"
+        score_0:    "No adjacency information available"
+        failure_repair_action: time_sorted
 
     scoring_rule: average
     sufficient_threshold: 0.80
 
-  # ── Causal / Why-How (C1-C3) ─────────────────────────────────────────────────
+  # ── Causal / Why-How ─────────────────────────────────────────────────────────
   causal:
     rubric_criteria:
       - name: cause_event_coverage
@@ -102,23 +143,33 @@ templates:
         score_1:    "Cause event is explicitly present in evidence"
         score_half: "Cause event is implied but incomplete"
         score_0:    "Cause event is absent"
+        failure_repair_action: refine_query
 
       - name: effect_event_coverage
         description: "Evidence covers the effect or result event"
         score_1:    "Effect event is explicitly present in evidence"
         score_half: "Effect event is partially present or incompletely described"
         score_0:    "Effect event is absent"
+        failure_repair_action: refine_query
 
       - name: causal_link_completeness
         description: "Evidence connects cause and effect rather than only showing the two events separately"
         score_1:    "Causal chain is explicit and complete"
         score_half: "Causal relationship can be inferred but lacks direct connection"
         score_0:    "Only related events present with no causal linkage"
+        failure_repair_action: loose_verify
+
+      - name: implicit_causal
+        description: "Evidence supports an implicit causal/motivational inference from contextual cues"
+        score_1:    "Contextual cues for the cause/motive are sufficient for inference"
+        score_half: "Some contextual cues but inference is shaky"
+        score_0:    "No contextual signal to infer cause/motive"
+        failure_repair_action: loose_verify
 
     scoring_rule: average
-    sufficient_threshold: 0.80
+    sufficient_threshold: 0.75
 
-  # ── State Transition (S1-S3) ─────────────────────────────────────────────────
+  # ── State Transition ────────────────────────────────────────────────────────
   state_transition:
     rubric_criteria:
       - name: initial_state_coverage
@@ -126,23 +177,26 @@ templates:
         score_1:    "Initial state is explicitly described"
         score_half: "Initial state is partially visible or inferable"
         score_0:    "Initial state is absent"
+        failure_repair_action: refine_query
 
       - name: transition_process_coverage
         description: "Evidence covers the process of state change"
         score_1:    "Transition process is explicitly described"
         score_half: "Only before/after states visible; transition process is incomplete"
         score_0:    "Transition process is absent"
+        failure_repair_action: dense_sample
 
       - name: final_state_coverage
         description: "Evidence covers the state after the transition"
         score_1:    "Final state is explicitly described"
         score_half: "Final state is partially visible or ambiguous"
         score_0:    "Final state is absent"
+        failure_repair_action: refine_query
 
     scoring_rule: average
     sufficient_threshold: 0.80
 
-  # ── Visual Detail (V1-V3) ─────────────────────────────────────────────────────
+  # ── Visual Detail ───────────────────────────────────────────────────────────
   visual_detail:
     rubric_criteria:
       - name: visual_observability
@@ -150,23 +204,46 @@ templates:
         score_1:    "Key visual information is clearly visible in evidence"
         score_half: "Partially visible; occlusion, blur, or angle limitations present"
         score_0:    "Key visual information is not visible"
+        failure_repair_action: dense_sample
 
       - name: attribute_specificity
         description: "Evidence includes sufficiently specific visual attributes"
         score_1:    "Color, quantity, position, shape, or other attributes are explicitly stated"
         score_half: "Attributes are partially explicit but some remain vague"
         score_0:    "Key attribute information is missing"
+        failure_repair_action: refine_query
 
       - name: visual_entity_consistency
         description: "The visual target object is consistently and stably identified across evidence"
         score_1:    "Target entity is clearly and consistently identified"
         score_half: "Target entity is mostly identifiable but with some ambiguity"
         score_0:    "Target entity is confused or cannot be confirmed"
+        failure_repair_action: refine_query
 
     scoring_rule: average
-    sufficient_threshold: 0.80
+    sufficient_threshold: 0.75
 
-  # ── Action / Event (A1-A2) ───────────────────────────────────────────────────
+  # ── Counting ────────────────────────────────────────────────────────────────
+  counting:
+    rubric_criteria:
+      - name: counting_visual
+        description: "Evidence keyframes show the target entities clearly enough to count"
+        score_1:    "All target entities are visible and countable in keyframes"
+        score_half: "Some entities visible but the full set is hard to enumerate"
+        score_0:    "Target entities are not visible / countable in evidence"
+        failure_repair_action: dense_sample
+
+      - name: counting_completeness
+        description: "Evidence covers the scene containing the full set to be counted (not just a partial view)"
+        score_1:    "Full scene present"
+        score_half: "Partial scene; some members likely off-frame"
+        score_0:    "No scene containing the target set"
+        failure_repair_action: broadcast
+
+    scoring_rule: average
+    sufficient_threshold: 0.75
+
+  # ── Action / Event ──────────────────────────────────────────────────────────
   action:
     rubric_criteria:
       - name: action_visibility
@@ -174,17 +251,26 @@ templates:
         score_1:    "Key action is completely and directly visible in evidence"
         score_half: "Action is partially visible or can only be indirectly inferred"
         score_0:    "Key action is not visible in evidence"
+        failure_repair_action: dense_sample
 
       - name: event_completion
         description: "Evidence covers whether the event started, progressed, or completed"
         score_1:    "Event completion status is explicitly clear"
         score_half: "Event occurrence is partially observed but completion status is unclear"
         score_0:    "Cannot confirm whether event occurred or was completed"
+        failure_repair_action: refine_query
+
+      - name: temporal_alignment
+        description: "Evidence pinpoints what happens AT a specific trigger moment (event-aligned frames)"
+        score_1:    "Evidence shows the trigger moment with co-occurring action"
+        score_half: "Trigger moment present but action at that instant ambiguous"
+        score_0:    "Trigger moment is not captured at frame level"
+        failure_repair_action: dense_sample
 
     scoring_rule: average
-    sufficient_threshold: 0.80
+    sufficient_threshold: 0.75
 
-  # ── Spatial / Location (L1-L2) ───────────────────────────────────────────────
+  # ── Spatial / Location ──────────────────────────────────────────────────────
   spatial:
     rubric_criteria:
       - name: location_grounding
@@ -192,12 +278,14 @@ templates:
         score_1:    "Location is explicitly identified in evidence"
         score_half: "Location is partially inferable but not directly stated"
         score_0:    "Location information is absent"
+        failure_repair_action: refine_query
 
       - name: spatial_relation
         description: "Evidence clearly shows the positional or directional relationship between objects"
         score_1:    "Spatial relationship between objects is explicitly described"
         score_half: "Spatial relationship is partially visible or contains ambiguity"
         score_0:    "Spatial relationship cannot be determined from evidence"
+        failure_repair_action: dense_sample
 
     scoring_rule: average
     sufficient_threshold: 0.80

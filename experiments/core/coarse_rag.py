@@ -41,8 +41,8 @@ def run_coarse_rag(
     opts = "\n".join(f"({chr(ord('A')+i)}) {c}" for i, c in enumerate(candidates))
     query = f"{question}\nChoices:\n{opts}"
     q_vec = embedder.encode([query])[0]
-    if bank.chunks[0].v_dynamic:
-        doc_vecs = np.array([c.v_dynamic for c in bank.chunks], dtype=np.float32)
+    if bank.chunks[0].v_text:
+        doc_vecs = np.array([c.v_text for c in bank.chunks], dtype=np.float32)
     else:
         doc_vecs = embedder.encode(texts)
     scores = doc_vecs @ q_vec

@@ -14,10 +14,17 @@ Safety nets on iter≥1 query generation (applied via ``filter_targeted_queries`
 from __future__ import annotations
 
 import json as _json
+import os
 import re
 from typing import List, Optional, Tuple
 
 import numpy as np
+
+
+def _env_prompt(name: str, default: str) -> str:
+    """Allow a prompt to be overridden at runtime via an env var (for prompt-
+    iteration experiments without editing source). Empty/unset → default."""
+    return os.environ.get(name, "").strip() or default
 
 
 # ── Iter-0: sub-question decomposition ────────────────────────────────────────
@@ -60,18 +67,6 @@ def _decompose_into_subquestions(
         except Exception:
             pass
     return [question]
-
-
-def _option_grounded_subquestions(question: str, candidates: List[str]) -> List[str]:
-    """Iter-0 alternative: one verification query per answer option."""
-    letters = [chr(ord("A") + i) for i in range(len(candidates))]
-    return [
-        (
-            f"For option ({letter}) {candidate}: retrieve concrete evidence that supports, "
-            f"refutes, or makes unclear whether this option answers the question: {question}"
-        )
-        for letter, candidate in zip(letters, candidates)
-    ]
 
 
 # ── Iter ≥1: Unified Planner ─────────────────────────────────────────────────
@@ -121,7 +116,6 @@ def _plan_next(
     llm,
     plan_history: List[List[str]] = (),
     unknown_options: Optional[List[str]] = None,
-    weak_rubric_criteria: Optional[dict] = None,
     prune_satisfied: bool = False,
 ) -> dict:
     """Unified planner for iter ≥1: pick {targeted (n queries), broadcast}.
@@ -132,19 +126,11 @@ def _plan_next(
     opts_lines = []
     for i, c in enumerate(candidates):
         letter = chr(ord('A')+i)
-        tag = " [UNKNOWN]" if letter in unknown_set else ""
+        tag = " [UNRESOLVED]" if letter in unknown_set else ""
         opts_lines.append(f"  ({letter}) {c}{tag}")
     opts = "\n".join(opts_lines)
 
     parts = [f"Question: {question}", f"Options:\n{opts}"]
-    if unknown_options:
-        parts.append(f"Current unresolved options: {unknown_options}.")
-    if weak_rubric_criteria:
-        lines = [f"  - {name}" for name in weak_rubric_criteria]
-        parts.append(
-            "Weak rubric criteria to repair:\n" + "\n".join(lines) +
-            "\nGenerate queries that directly address these criteria."
-        )
     if prune_satisfied and plan_history:
         parts.append(
             "NOTE: Review the previously tried queries against the CURRENT evidence. "
@@ -166,16 +152,18 @@ def _plan_next(
         covered = _extract_covered_times(evidence_texts)
         if covered:
             parts.append(f"Evidence covers video segments: {covered}")
-        ev_sample = "\n".join(f"  [E{i+1}] {t[:200]}" for i, t in enumerate(evidence_texts[:5]))
-        parts.append(f"Current evidence (sample):\n{ev_sample}")
 
     if missing_analysis:
-        parts.append(f"Still missing: {missing_analysis}")
+        parts.append(
+            "Missing fact to retrieve:\n"
+            f"{missing_analysis}\n"
+            "Generate queries for the concrete visual/dialogue evidence needed to resolve this fact."
+        )
 
     parts.append("Output the retrieval strategy JSON now.")
 
     messages = [
-        {"role": "system", "content": _PLANNER_UNIFIED_SYS},
+        {"role": "system", "content": _env_prompt("VEIL_PLANNER_SYS", _PLANNER_UNIFIED_SYS)},
         {"role": "user",   "content": "\n\n".join(parts)},
     ]
     raw = llm.chat(messages, max_new_tokens=200, enable_thinking=False)
@@ -202,24 +190,19 @@ def _plan_next(
 
 # ── Verifier → planner repair context ────────────────────────────────────────
 
-def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> Tuple[str, Optional[List[str]]]:
-    """Build verifier-derived context for the planner."""
+def _planner_repair_context(verdict: dict, rubric_judgment: bool) -> str:
+    """Build the verifier-derived missing-evidence description for the planner."""
     missing = str(verdict.get("missing_evidence_analysis") or "").strip()
 
     if not rubric_judgment:
-        return (f"Missing evidence analysis: {missing}" if missing else ""), None
+        return f"Missing evidence analysis: {missing}" if missing else ""
 
-    weak_list: List[str] = list(verdict.get("weak_rubric_criteria") or [])
-    unknown = list(verdict.get("unknown_options") or [])
-
-    parts = []
-    if weak_list:
-        parts.append("Weak rubric criteria: " + ", ".join(weak_list))
-    if unknown:
-        parts.append("Unresolved options: " + ", ".join(unknown))
     if missing:
-        parts.append(f"Missing evidence analysis: {missing}")
-    return "\n".join(parts), weak_list or None
+        return missing
+    if list(verdict.get("unknown_options") or []):
+        return ("Retrieve concrete evidence that can confirm or rule out the options "
+                "marked [UNRESOLVED].")
+    return ""
 
 
 # ── Query similarity safety nets ─────────────────────────────────────────────
@@ -251,34 +234,13 @@ class Planner:
         self,
         question: str,
         candidates: List[str],
-        *,
-        force_option: bool = False,
     ) -> dict:
-        """Iter-0 plan.
-
-        Two modes:
-          - force_option=True  -> one option-grounded query per candidate
-          - force_option=False -> LLM splits into 2-4 atomic sub-queries
-        """
-        if force_option:
-            return {
-                "strategy":  "targeted",
-                "queries":   _option_grounded_subquestions(question, candidates),
-                "reasoning": "iter0_option_grounded",
-            }
+        """Iter-0 plan: LLM splits the question into 2-4 atomic sub-queries."""
         return {
             "strategy":  "targeted",
             "queries":   _decompose_into_subquestions(question, candidates, self.llm),
             "reasoning": "iter0_decompose",
         }
-
-    def repair_context(
-        self,
-        verdict: dict,
-        rubric_judgment: bool,
-    ) -> Tuple[str, Optional[List[str]]]:
-        """Project a verifier verdict into (missing_description, weak_rubric_criteria)."""
-        return _planner_repair_context(verdict, rubric_judgment)
 
     def plan_next(
         self,
@@ -290,21 +252,20 @@ class Planner:
         *,
         rubric_judgment: bool = True,
         prune_satisfied: bool = False,
-    ) -> Tuple[dict, str, Optional[List[str]]]:
+    ) -> Tuple[dict, str]:
         """Pick the next iter plan from the verifier verdict.
 
-        Returns (plan, missing_description, weak_rubric_criteria).
+        Returns (plan, missing_description).
         """
-        m_desc, weak = _planner_repair_context(verdict, rubric_judgment)
+        m_desc = _planner_repair_context(verdict, rubric_judgment)
 
         unk_opts = verdict.get("unknown_options") if rubric_judgment else None
         plan = _plan_next(
             question, candidates, evidence_texts, m_desc, self.llm, plan_history,
             unknown_options=unk_opts,
-            weak_rubric_criteria=weak if rubric_judgment else None,
             prune_satisfied=prune_satisfied,
         )
-        return plan, m_desc, weak
+        return plan, m_desc
 
     def filter_targeted_queries(
         self,

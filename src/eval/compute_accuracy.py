@@ -13,6 +13,8 @@ def compute_accuracy(records: List[dict]) -> Dict[str, dict]:
     """
     by_task: Dict[str, List[dict]] = defaultdict(list)
     for r in records:
+        if r.get("record_type"):
+            continue
         by_task[r["question_type"]].append(r)
 
     out: Dict[str, dict] = {}

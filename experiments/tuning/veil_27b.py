@@ -13,11 +13,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -29,6 +33,41 @@ from experiments.core.veil import run_veil
 PIPELINE_NAME = "veil_27b"
 
 log = get_logger(PIPELINE_NAME)
+
+
+def _file_sha1(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    h = hashlib.sha1()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _git_text(args: list[str]) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parents[2],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return None
+
+
+def _count_memory_videos(memory_dir: Path) -> int | None:
+    if not memory_dir.exists():
+        return None
+    try:
+        return sum(
+            1
+            for p in memory_dir.iterdir()
+            if p.is_dir() and ((p / "L1.jsonl").exists() or (p / "narrative.json").exists())
+        )
+    except Exception:
+        return None
 
 
 def load_samples(cfg: dict, filter_video_ids: set | None = None):
@@ -67,6 +106,8 @@ def main():
                     help="Inclusive lower bound on sample_idx")
     ap.add_argument("--sample-end",   type=int, default=None,
                     help="Exclusive upper bound on sample_idx")
+    ap.add_argument("--sample-indices-file", default=None,
+                    help="JSONL containing sample_idx fields, or a text file with one sample_idx per line")
     ap.add_argument("--vlm-gpu",        default="cuda:0")
     ap.add_argument("--bge-gpu",        default="cuda:3")
     ap.add_argument("--llm-gpu",        default="cuda:1")
@@ -108,10 +149,12 @@ def main():
     ap.add_argument("--single-query-iter0",  action="store_true",
                     help="At iter 0, use the original question as a single query "
                          "instead of LLM-decomposing into per-option sub-queries")
-    ap.add_argument("--pass-verifier-judgment", action="store_true",
-                    help="Pass verifier's last option_judgment+scores into the final answerer prompt")
-    ap.add_argument("--loose-verifier", action="store_true",
-                    help="Use VERIFIER_SYS_LOOSE that accepts indirect/synthesized evidence")
+    ap.add_argument("--ignore-verifier-signal", action="store_true",
+                    help="For iter >= 1 planning, ignore verifier feedback and plan only from question/evidence/history")
+    ap.add_argument("--verifier-two-pass", action="store_true",
+                    help="Two-pass verifier: pass1 scores sufficiency only, pass2 judges true/false conditioned on the per-option threshold result")
+    ap.add_argument("--sufficient-threshold-delta", type=float, default=0.0,
+                    help="Add this value to rubric sufficient_threshold inside verifier, capped at 1.0")
     ap.add_argument("--dialogue-first", action="store_true",
                     help="Reformat evidence_texts to put ASR/Speech first with [DIALOGUE] tag")
     ap.add_argument("--asr-alpha", type=float, default=0.0,
@@ -130,6 +173,10 @@ def main():
     ap.add_argument("--align-images-to-evidence", action="store_true",
                     help="Reorder keyframes so they follow the rubric-reranked evidence order "
                          "(image i sits alongside evidence segment i by chunk_id)")
+    ap.add_argument("--online-layer", action="store_true",
+                    help="If evidence is still insufficient after all iterations, re-examine "
+                         "the raw frames (frames_raw) of the relevant chunks with a "
+                         "question-aware VLM pass and inject the result as evidence.")
     ap.add_argument("--use-oracle", action="store_true",
                     help="At each iter, also call answerer with gold_answer known; if "
                          "oracle_pred == gold, freeze that result as final answer. "
@@ -164,6 +211,53 @@ def main():
     out_path = Path(args.out) if args.out else \
                default_out_dir / "veil_27b.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Keep run metadata in a meta/ subfolder next to the results (less clutter).
+    meta_path = out_path.parent / "meta" / (out_path.stem + ".meta.json")
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    config_path = Path(args.config)
+    rubric_override = os.environ.get("VEIL_RUBRIC_PATH")
+    rubric_path = Path(rubric_override).expanduser() if rubric_override else \
+        repo_root / "outputs" / "rubric" / "direct_answer_generated_v2.yaml"
+    run_metadata = {
+        "started_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "cwd": str(Path.cwd().resolve()),
+        "command": [sys.executable, *sys.argv],
+        "git_commit": _git_text(["rev-parse", "HEAD"]),
+        "git_branch": _git_text(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "git_dirty": bool(_git_text(["status", "--porcelain"])),
+        "config_path": str(config_path.resolve()),
+        "config_sha1": _file_sha1(config_path),
+        "memory_dir": str(memory_dir.resolve()),
+        "memory_dir_exists": memory_dir.exists(),
+        "memory_video_dirs": _count_memory_videos(memory_dir),
+        "rubric_path": str(rubric_path.resolve()),
+        "rubric_sha1": _file_sha1(rubric_path),
+        "rubric_path_env": rubric_override,
+        "out_path": str(out_path.resolve()),
+        "metadata_path": str(meta_path.resolve()),
+        "pipeline": PIPELINE_NAME,
+        "sample_start": args.sample_start,
+        "sample_end": args.sample_end,
+        "sample_indices_file": args.sample_indices_file,
+        "vlm_api_url": args.vlm_api_url,
+        "vlm_api_model": args.vlm_api_model,
+        "llm_api_url": args.llm_api_url,
+        "llm_api_model": args.llm_api_model,
+        "embed_api_url": args.embed_api_url,
+        "question_first": args.question_first,
+        "single_query_iter0": args.single_query_iter0,
+        "sufficient_threshold_delta": args.sufficient_threshold_delta,
+        "multi_layer_mode": args.multi_layer_mode,
+    }
+    log.info("run_metadata: %s", json.dumps(run_metadata, ensure_ascii=False, sort_keys=True))
+    sidecar_metadata = dict(run_metadata)
+    sidecar_metadata.pop("command", None)
+    meta_path.write_text(
+        json.dumps(sidecar_metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
     # Filter video ids
     filter_vids: set | None = None
@@ -179,6 +273,21 @@ def main():
         samples = [s for s in samples if int(s.sample_idx) >= args.sample_start]
     if args.sample_end is not None:
         samples = [s for s in samples if int(s.sample_idx) < args.sample_end]
+    if args.sample_indices_file:
+        selected_indices: set[int] = set()
+        with Path(args.sample_indices_file).open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    value = json.loads(line)
+                    selected_indices.add(int(value["sample_idx"] if isinstance(value, dict) else value))
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Invalid sample index line in {args.sample_indices_file}: {line!r}"
+                    ) from exc
+        samples = [s for s in samples if int(s.sample_idx) in selected_indices]
     log.info("loaded %d samples (%d videos)", len(samples),
              len({s.video_id for s in samples}))
 
@@ -186,8 +295,16 @@ def main():
     done_keys: set[str] = set()
     if out_path.exists():
         for line in out_path.open():
-            try: done_keys.add(json.loads(line)["key"])
-            except: pass
+            try:
+                rec = json.loads(line)
+                if rec.get("record_type"):
+                    continue
+                key = rec.get("key")
+                if not key:
+                    key = f"{bench}|{rec['video_id']}|{rec['sample_idx']}|{PIPELINE_NAME}"
+                done_keys.add(key)
+            except Exception:
+                pass
     log.info("already done: %d records", len(done_keys))
 
     # ── Model loading ──────────────────────────────────────────────────────────
@@ -316,8 +433,9 @@ def main():
             rubric_rerank=True,
             per_chunk_keyframe_cap=args.per_chunk_keyframe_cap,
             single_query_iter0=args.single_query_iter0,
-            pass_verifier_judgment_to_answerer=args.pass_verifier_judgment,
-            loose_verifier=args.loose_verifier,
+            ignore_verifier_signal=args.ignore_verifier_signal,
+            verifier_two_pass=args.verifier_two_pass,
+            sufficient_threshold_delta=args.sufficient_threshold_delta,
             dialogue_first=args.dialogue_first,
             asr_alpha=args.asr_alpha,
             text_first_keyframes=args.text_first_keyframes,
@@ -327,14 +445,26 @@ def main():
             use_oracle=args.use_oracle,
             gold_answer=s.answer if args.use_oracle else "",
             multi_layer_mode=args.multi_layer_mode,
+            online_layer=args.online_layer,
         )
         return run_veil(s.question, s.candidates, bank, embedder, answerer, llm,
                         task_type=s.question_type, **kw), None
 
     # ── Run loop ──────────────────────────────────────────────────────────────
+    write_header = (not out_path.exists()) or out_path.stat().st_size == 0
     out_fh      = out_path.open("a")
     _write_lock = threading.Lock()
     _stats_lock = threading.Lock()
+
+    if write_header:
+        out_fh.write(json.dumps({
+            "record_type": "header",
+            "benchmark": bench,
+            "pipeline": PIPELINE_NAME,
+            "command": run_metadata["command"],
+            "metadata_path": str(meta_path.resolve()),
+        }, ensure_ascii=False) + "\n")
+        out_fh.flush()
 
     def append_record(rec: dict):
         with _write_lock:
@@ -368,18 +498,15 @@ def main():
 
         trace = result.get("trace_iters") if result else None
         rec = {
-            "key":              key,
-            "benchmark":        bench,
-            "question_type":    s.question_type,
             "video_id":         s.video_id,
             "sample_idx":       s.sample_idx,
-            "pipeline":         PIPELINE_NAME,
+            "correct":          correct,
+            "question_type":    s.question_type,
             "question":         s.question,
             "candidates":       s.candidates,
             "gold_answer":      s.answer,
             "pred_letter":      pred_letter,
             "pred_text":        pred_text,
-            "correct":          correct,
             "evidence_chunk_ids": (result or {}).get("evidence_chunk_ids", []),
             "n_keyframes_to_answer": (result or {}).get("n_keyframes_to_answer"),
             "n_evidence_to_answer":  (result or {}).get("n_evidence_to_answer"),

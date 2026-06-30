@@ -18,7 +18,7 @@ def load_keyframe_pil(path: str):
     return None
 
 
-DEFAULT_KEYFRAME_SUBDIR = "keyframes_origin"
+DEFAULT_KEYFRAME_SUBDIR = "keyframes_resized"
 LEGACY_KEYFRAME_SUBDIR  = "frames"
 
 
@@ -88,7 +88,18 @@ def keyframe_paths(keyframe_dir, video_id: str, chunk_id: int, cap: int = 3,
     first so that cap=1 always returns the best frame. ``subdir`` selects
     ``keyframes_origin`` vs ``keyframes_resized``; falls back to legacy
     ``frames/`` if the requested subdir is missing.
+
+    Cross-bank: a text bank (e.g. ml3_n12) stores the absolute keyframe path of
+    its source multiframe dir on each chunk; prefer that over globbing
+    ``keyframe_dir`` (which holds no images for such banks).
     """
+    if chunk is not None:
+        kp = getattr(chunk, "keyframe_path", "") or ""
+        if kp:
+            kp_path = Path(kp)
+            if kp_path.is_absolute() and kp_path.is_file():
+                return [str(kp_path)]
+
     video_dir = Path(keyframe_dir) / video_id
     actual = _resolve_subdir(video_dir, subdir)
     frames_dir = video_dir / actual

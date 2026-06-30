@@ -51,7 +51,7 @@ def _load_legacy_dir(vd: Path) -> MemoryBank:
     for nc in narr.get("chunks", []):
         cid = nc["chunk_id"]
         vi = cid_to_vidx.get(cid)
-        v_dynamic = n_vecs[vi].tolist() if vi is not None else []
+        v_text = n_vecs[vi].tolist() if vi is not None else []
         if v_vecs is not None and vi is not None:
             v_visual = v_vecs[vi].tolist()
         else:
@@ -68,7 +68,7 @@ def _load_legacy_dir(vd: Path) -> MemoryBank:
             sampled_frames=nc.get("sampled_frames", []) or [],
             keyframe_ts=nc.get("keyframe_ts", 0.0),
             keyframe_path=nc.get("keyframe_path", "") or "",
-            v_dynamic=v_dynamic,
+            v_text=v_text,
             v_visual=v_visual,
         ))
 
@@ -114,7 +114,7 @@ def _load_pyramid_upper(vd: Path, layer: int, video_id: str, id_offset: int) -> 
             start_time=row["t_start"],
             end_time=row["t_end"],
             memory_text=display,
-            v_dynamic=v_dyn,
+            v_text=v_dyn,
             layer=layer,
         ))
     return chunks
@@ -159,7 +159,7 @@ def _load_pyramid_dir(vd: Path) -> MemoryBank:
             start_time=row["t_start"],
             end_time=row["t_end"],
             memory_text=row.get("text", ""),
-            v_dynamic=v_dyn,
+            v_text=v_dyn,
             v_visual=v_vis,
             keyframe_path=kf_path,
             keyframe_ts=(row.get("frame_ts") or [row["t_start"]])[0],

@@ -204,7 +204,7 @@ def main():
 
         # Single-stage: BGE top-24 → Answerer
         query_emb = embedder.encode([s.question])[0]
-        doc_vecs = np.array([c.v_dynamic for c in bank.chunks], dtype=np.float32)
+        doc_vecs = np.array([c.v_text for c in bank.chunks], dtype=np.float32)
         scores = doc_vecs @ query_emb
         top_indices = scores.argsort()[-24:][::-1]
         evidence_ids = [bank.chunks[i].chunk_id for i in top_indices]

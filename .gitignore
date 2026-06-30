@@ -42,3 +42,16 @@ outputs/memory/
 # Logs
 *.log
 outputs/logs/
+
+# Research papers (copyright — do not redistribute)
+*.pdf
+
+# Generated experiment artifacts (large, regenerable). NOTE: outputs/rubric/ is
+# intentionally TRACKED — it holds the final runtime rubrics used by the verifier.
+outputs/debug/
+outputs/results/intermediate_goods/
+# Rubric eval results live in tuning/ (flat). Keep tracked baselines (mf_qf*,
+# mf_tsqf), ignore the bulk rubric-comparison runs.
+outputs/results/videomme/tuning/mf_rubric_*.jsonl
+outputs/results/videomme/tuning/r2_merged_900*
+outputs/results/videomme/tuning/split_runs/
