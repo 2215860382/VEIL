@@ -633,27 +633,6 @@ templates:
       failure_repair_action: asr_match
       source_pair_examples:
       - 739:weak_vs_great:739:weak:iter0->739:great:final
-    - name: evidence_specificity
-      description: Evidence explicitly grounds the relevant person, object, action, scene, speaker, text, or spatial relation instead of only giving a generic related scene.
-      score_1: Evidence pinpoints exact entities (e.g., 'the red car on the left', 'Speaker A at 00:12') and their precise spatial relations required for the answer.
-      score_half: Evidence identifies the general scene or object type but lacks the specific attributes or precise spatial positioning needed to distinguish between similar options.
-      score_0: Evidence relies on vague descriptions (e.g., 'a car', 'someone') or generic scene summaries that could apply to multiple options.
-      failure_repair_action: refine_query
-      source_pair_examples: []
-    - name: evidence_coverage
-      description: Evidence covers the key event, time window, state change, comparison target, or causal chain needed to verify or exclude each option.
-      score_1: Evidence spans the complete temporal and spatial scope required to confirm the correct option and definitively falsify all distractors.
-      score_half: Evidence covers the primary event but misses critical temporal boundaries or comparative details needed to fully exclude specific distractors.
-      score_0: Evidence is fragmented, missing the key event window or failing to address the specific comparison targets required by the options.
-      failure_repair_action: expand_window
-      source_pair_examples: []
-    - name: evidence_consistency
-      description: Evidence is internally consistent and contains enough contrary evidence to exclude options that conflict with the video.
-      score_1: Evidence provides a coherent narrative with explicit visual or textual contradictions that rule out incorrect options.
-      score_half: Evidence is mostly consistent but lacks explicit contradictory details to definitively rule out plausible distractors.
-      score_0: Evidence contains internal contradictions or fails to provide any information that conflicts with incorrect options.
-      failure_repair_action: cross_verify
-      source_pair_examples: []
   temporal_perception:
     rubric_criteria:
     - name: segment_thematic_grounding

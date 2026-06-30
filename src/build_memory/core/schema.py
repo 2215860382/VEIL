@@ -31,7 +31,7 @@ class MemoryChunk(BaseModel):
     temporal_relation: str = ""
     evidence_caption: str = ""
     # Chunk fields for similarity_group banks (SigLIP cosine grouping + BGE/VLM text)
-    v_dynamic: List[float] = Field(default_factory=list)   # BGE-M3 (1024,) L2-normed, text embedding (summary + speech)
+    v_text: List[float] = Field(default_factory=list)   # BGE-M3 (1024,) L2-normed, text embedding (summary + speech)
     v_visual: List[float] = Field(default_factory=list)     # SigLIP keyframe (1024,) L2-normed
     keyframe_path: str = ""
     keyframe_ts: float = 0.0

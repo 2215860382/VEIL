@@ -151,13 +151,12 @@ def main():
                          "instead of LLM-decomposing into per-option sub-queries")
     ap.add_argument("--ignore-verifier-signal", action="store_true",
                     help="For iter >= 1 planning, ignore verifier feedback and plan only from question/evidence/history")
-    ap.add_argument("--no-weak-rubric-criteria", action="store_false",
-                    dest="use_weak_rubric_criteria", default=True,
-                    help="Do not pass weak_rubric_criteria names to the iter>=1 planner; keep missing analysis and unknown options")
     ap.add_argument("--pass-verifier-judgment", action="store_true",
                     help="Pass verifier's last option_judgment+scores into the final answerer prompt")
     ap.add_argument("--loose-verifier", action="store_true",
                     help="Use VERIFIER_SYS_LOOSE that accepts indirect/synthesized evidence")
+    ap.add_argument("--verifier-two-pass", action="store_true",
+                    help="Two-pass verifier: pass1 scores sufficiency only, pass2 judges true/false conditioned on the per-option threshold result")
     ap.add_argument("--sufficient-threshold-delta", type=float, default=0.0,
                     help="Add this value to rubric sufficient_threshold inside verifier, capped at 1.0")
     ap.add_argument("--dialogue-first", action="store_true",
@@ -178,6 +177,10 @@ def main():
     ap.add_argument("--align-images-to-evidence", action="store_true",
                     help="Reorder keyframes so they follow the rubric-reranked evidence order "
                          "(image i sits alongside evidence segment i by chunk_id)")
+    ap.add_argument("--online-layer", action="store_true",
+                    help="If evidence is still insufficient after all iterations, re-examine "
+                         "the raw frames (frames_raw) of the relevant chunks with a "
+                         "question-aware VLM pass and inject the result as evidence.")
     ap.add_argument("--use-oracle", action="store_true",
                     help="At each iter, also call answerer with gold_answer known; if "
                          "oracle_pred == gold, freeze that result as final answer. "
@@ -436,9 +439,9 @@ def main():
             per_chunk_keyframe_cap=args.per_chunk_keyframe_cap,
             single_query_iter0=args.single_query_iter0,
             ignore_verifier_signal=args.ignore_verifier_signal,
-            use_weak_rubric_criteria=args.use_weak_rubric_criteria,
             pass_verifier_judgment_to_answerer=args.pass_verifier_judgment,
             loose_verifier=args.loose_verifier,
+            verifier_two_pass=args.verifier_two_pass,
             sufficient_threshold_delta=args.sufficient_threshold_delta,
             dialogue_first=args.dialogue_first,
             asr_alpha=args.asr_alpha,
@@ -449,6 +452,7 @@ def main():
             use_oracle=args.use_oracle,
             gold_answer=s.answer if args.use_oracle else "",
             multi_layer_mode=args.multi_layer_mode,
+            online_layer=args.online_layer,
         )
         return run_veil(s.question, s.candidates, bank, embedder, answerer, llm,
                         task_type=s.question_type, **kw), None

@@ -16,6 +16,7 @@ Call-site variants (``run_experiments.py --pipelines``):
 """
 from __future__ import annotations
 
+import os
 import re
 from typing import List, Optional, Set
 
@@ -51,8 +52,69 @@ def _broadcast_retrieve(
         if i is not None:
             texts.append(texts_ev[i])
             ids.append(c.chunk_id)
-            vecs.append(c.v_dynamic or [])
+            vecs.append(c.v_text or [])
     return texts, ids, vecs
+
+
+# ── Online layer: on-demand re-examination of raw frames ─────────────────────
+
+_SUFFICIENT_LABELS = ("sufficient", "SUFFICIENT", "FULLY_SUFFICIENT", "ANSWER_SUFFICIENT")
+
+
+def _verdict_sufficient(verdict: dict) -> bool:
+    """True if the verifier considers evidence sufficient (no online layer needed)."""
+    if verdict.get("label") in _SUFFICIENT_LABELS:
+        return True
+    # Also treat "no unknown options remaining" as sufficient.
+    return not (verdict.get("unknown_options") or [])
+
+
+def _load_frames_raw(keyframe_dir, video_id: str, chunk_id: int, cap: int = 3) -> list:
+    """Load up to `cap` raw frames for a chunk from frames_raw/{chunk:04d}/."""
+    from pathlib import Path
+    d = Path(keyframe_dir) / video_id / "frames_raw" / f"{int(chunk_id):04d}"
+    if not d.is_dir():
+        return []
+    imgs = []
+    paths = sorted(d.glob("*.jpg"))
+    # Sample evenly across the chunk's frames, not just the first few.
+    if paths and cap and len(paths) > cap:
+        step = max(1, len(paths) // cap)
+        paths = paths[::step][:cap]
+    for p in paths:
+        im = load_keyframe_pil(str(p))
+        if im is not None:
+            imgs.append(im)
+    return imgs
+
+
+def _online_recaption(question, candidates, missing, chunk_ids, video_id,
+                      keyframe_dir, vlm, max_chunks: int = 4, per_chunk: int = 3) -> str:
+    """Re-examine raw frames of the most relevant chunks with a question-aware VLM
+    pass; return concrete visual text, or '' on any failure (safe fallback)."""
+    try:
+        frames = []
+        for cid in list(chunk_ids)[:max_chunks]:
+            if int(cid) < 0:
+                continue
+            frames.extend(_load_frames_raw(keyframe_dir, video_id, int(cid), per_chunk))
+        if not frames:
+            return ""
+        opts = " ".join(f"({chr(65+i)}) {c}" for i, c in enumerate(candidates))
+        miss = f"A verifier reported still missing: {missing}\n" if missing else ""
+        prompt = (
+            "These are raw frames sampled from the moments of the video most relevant "
+            "to a multiple-choice question.\n"
+            f"Question: {question}\nOptions: {opts}\n{miss}"
+            "Looking ONLY at these frames, state the concrete visual facts needed to "
+            "answer — objects, colors, counts, on-screen text (quote verbatim), actions, "
+            "and spatial layout. Be specific and factual; do not guess beyond the frames."
+        )
+        txt = vlm.chat_with_frames(frames, prompt, max_new_tokens=220, enable_thinking=False)
+        txt = (txt or "").strip()
+        return f"[On-demand inspection of raw frames]\n{txt}" if txt else ""
+    except Exception:
+        return ""
 
 
 # ── Oracle mode (debug upper bound) ──────────────────────────────────────────
@@ -209,7 +271,7 @@ def _dedup_by_similarity(
     existing_vecs: List[List[float]],
     threshold: float = 0.85,
 ) -> tuple[List[str], List[int], List[List[float]]]:
-    """Drop new chunks whose v_dynamic cosine sim ≥ threshold against any already-accumulated chunk."""
+    """Drop new chunks whose v_text cosine sim ≥ threshold against any already-accumulated chunk."""
     if not new_vecs or all(not v for v in new_vecs):
         return new_texts, new_ids, new_vecs
     kept_t, kept_i, kept_v = [], [], []
@@ -244,19 +306,19 @@ def _query_retrieve(
     dialogue_first: bool = False,
     asr_alpha: float = 0.0,
 ) -> tuple[List[str], List[int], List[List[float]]]:
-    """Return (evidence_texts, chunk_ids, v_dynamic_vecs), skipping already-seen chunks.
+    """Return (evidence_texts, chunk_ids, v_text_vecs), skipping already-seen chunks.
 
     dialogue_first=True      → put ASR up front with [DIALOGUE] tag in evidence text
     asr_alpha>0              → blend an ASR-only BGE channel into scoring
-                               final = (1-asr_alpha)·q·v_dynamic + asr_alpha·q·v_asr
+                               final = (1-asr_alpha)·q·v_text + asr_alpha·q·v_asr
                                (v_asr is computed once per bank and cached)
     """
     texts    = bank.memory_texts()
     texts_ev = bank.memory_texts(with_time=True, with_asr=True,
                                  dialogue_first=dialogue_first)
     q_vec  = embedder.encode([query])[0]
-    if bank.chunks[0].v_dynamic:
-        doc_vecs = np.array([c.v_dynamic for c in bank.chunks], dtype=np.float32)
+    if bank.chunks[0].v_text:
+        doc_vecs = np.array([c.v_text for c in bank.chunks], dtype=np.float32)
     else:
         doc_vecs = embedder.encode(texts)
     scores = doc_vecs @ q_vec
@@ -290,7 +352,7 @@ def _query_retrieve(
     return (
         [texts_ev[i] for i in new_idx],
         [bank.chunks[i].chunk_id for i in new_idx],
-        [bank.chunks[i].v_dynamic for i in new_idx],
+        [bank.chunks[i].v_text for i in new_idx],
     )
 
 
@@ -308,7 +370,7 @@ def _retrieve_on_chunks(
     if not chunks:
         return [], [], []
     q_vec = embedder.encode([query])[0]
-    doc_vecs = np.array([c.v_dynamic for c in chunks], dtype=np.float32)
+    doc_vecs = np.array([c.v_text for c in chunks], dtype=np.float32)
     scores = doc_vecs @ q_vec
     order = np.argsort(-scores)
 
@@ -325,7 +387,7 @@ def _retrieve_on_chunks(
                 parts.append(f"Speech: {c.asr}")
         out_texts.append("\n".join(parts))
         out_ids.append(c.chunk_id)
-        out_vecs.append(c.v_dynamic)
+        out_vecs.append(c.v_text)
         if len(out_ids) >= top_k:
             break
     return out_texts, out_ids, out_vecs
@@ -354,7 +416,7 @@ def _coarse_to_fine_retrieve(
                                asr_alpha=asr_alpha)
 
     q_vec = embedder.encode([query])[0]
-    l3_vecs = np.array([c.v_dynamic for c in bank.l3_chunks], dtype=np.float32)
+    l3_vecs = np.array([c.v_text for c in bank.l3_chunks], dtype=np.float32)
     l3_scores = l3_vecs @ q_vec
     top_l3 = np.argsort(-l3_scores)[:l3_top_k]
     windows = [(bank.l3_chunks[i].start_time, bank.l3_chunks[i].end_time) for i in top_l3]
@@ -370,7 +432,7 @@ def _coarse_to_fine_retrieve(
     if not candidate_pool:
         return [], [], []
 
-    doc_vecs = np.array([c.v_dynamic for c in candidate_pool], dtype=np.float32)
+    doc_vecs = np.array([c.v_text for c in candidate_pool], dtype=np.float32)
     scores = doc_vecs @ q_vec
 
     k = min(coarse_top_k, len(scores))
@@ -398,7 +460,7 @@ def _coarse_to_fine_retrieve(
     return (
         [ev_texts_pool[i] for i in new_idx],
         [candidate_pool[i].chunk_id for i in new_idx],
-        [candidate_pool[i].v_dynamic for i in new_idx],
+        [candidate_pool[i].v_text for i in new_idx],
     )
 
 
@@ -413,22 +475,44 @@ def _multi_pool_retrieve(
     dialogue_first: bool = False,
     l2_cap: int = 4,
 ) -> tuple[List[str], List[int], List[List[float]]]:
-    """Mode B: retrieve from L1 and L2 pools, merge by score."""
+    """Mode B: retrieve from L1..L4 pools, merge by score.
+
+    Round-2 tuning (2026-06-28): the original variant used only L1+L2 (+14 @900,
+    p=0.122). L3/L4 are now poolable via env vars so summary depth can be swept
+    without touching the CLI (consistent with VEIL's env-override pattern):
+
+      VEIL_MP_L2_CAP          how many L2 summaries enter the pool (default 4)
+      VEIL_MP_L3_CAP          how many L3 summaries enter the pool (default 0=off)
+      VEIL_MP_L4_CAP          how many L4 summaries enter the pool (default 0=off)
+      VEIL_MP_SUMMARY_WEIGHT  multiply L2/L3/L4 scores in the merge (default 1.0;
+                              >1 favours summaries, <1 favours raw L1 evidence)
+    """
     if not bank.l2_chunks:
         return _query_retrieve(query, bank, embedder, reranker, coarse_top_k, final_top_k,
                                exclude_ids, dialogue_first=dialogue_first)
 
+    def _envi(name, default):
+        try:
+            return int(os.environ.get(name, "").strip() or default)
+        except ValueError:
+            return default
+
+    l1_cap = _envi("VEIL_MP_L1_CAP", coarse_top_k)
+    l2_cap = _envi("VEIL_MP_L2_CAP", l2_cap)
+    l3_cap = _envi("VEIL_MP_L3_CAP", 0)
+    l4_cap = _envi("VEIL_MP_L4_CAP", 0)
+    final_keep = final_top_k
+    try:
+        sw = float(os.environ.get("VEIL_MP_SUMMARY_WEIGHT", "").strip() or 1.0)
+    except ValueError:
+        sw = 1.0
+
     q_vec = embedder.encode([query])[0]
 
     # L1 pool
-    l1_vecs = np.array([c.v_dynamic for c in bank.chunks], dtype=np.float32)
+    l1_vecs = np.array([c.v_text for c in bank.chunks], dtype=np.float32)
     l1_scores = l1_vecs @ q_vec
-    l1_order = np.argsort(-l1_scores)[:coarse_top_k]
-
-    # L2 pool (smaller cap)
-    l2_vecs = np.array([c.v_dynamic for c in bank.l2_chunks], dtype=np.float32)
-    l2_scores = l2_vecs @ q_vec
-    l2_order = np.argsort(-l2_scores)[:l2_cap]
+    l1_order = np.argsort(-l1_scores)[:l1_cap]
 
     # Merge by score
     def _l1_ev(c):
@@ -445,17 +529,26 @@ def _multi_pool_retrieve(
         c = bank.chunks[i]
         if c.chunk_id not in exclude_ids:
             candidates.append((float(l1_scores[i]), c, _l1_ev(c)))
-    for i in l2_order:
-        c = bank.l2_chunks[i]
-        if c.chunk_id not in exclude_ids:
-            candidates.append((float(l2_scores[i]), c, c.memory_text))
+
+    # L2/L3/L4 summary pools (score-weighted by VEIL_MP_SUMMARY_WEIGHT)
+    for layer, cap in ((bank.l2_chunks, l2_cap),
+                       (bank.l3_chunks, l3_cap),
+                       (bank.l4_chunks, l4_cap)):
+        if not layer or cap <= 0:
+            continue
+        vecs = np.array([c.v_text for c in layer], dtype=np.float32)
+        scores = vecs @ q_vec
+        for i in np.argsort(-scores)[:cap]:
+            c = layer[int(i)]
+            if c.chunk_id not in exclude_ids:
+                candidates.append((float(scores[int(i)]) * sw, c, c.memory_text))
 
     candidates.sort(key=lambda x: -x[0])
-    selected = candidates[:final_top_k]
+    selected = candidates[:final_keep]
     return (
         [ev for _, _, ev in selected],
         [c.chunk_id for _, c, _ in selected],
-        [c.v_dynamic for _, c, _ in selected],
+        [c.v_text for _, c, _ in selected],
     )
 
 
@@ -464,7 +557,7 @@ def _get_l3_context(question: str, bank: "MemoryBank", embedder, top_k: int = 2)
     if not bank.l3_chunks:
         return ""
     q_vec = embedder.encode([question])[0]
-    l3_vecs = np.array([c.v_dynamic for c in bank.l3_chunks], dtype=np.float32)
+    l3_vecs = np.array([c.v_text for c in bank.l3_chunks], dtype=np.float32)
     scores = l3_vecs @ q_vec
     order = np.argsort(-scores)[:top_k]
     parts = []
@@ -502,8 +595,6 @@ def run_veil(
     rubric_judgment:       bool         = True,
     single_query_iter0:    bool         = False,
     ignore_verifier_signal:    bool     = False,
-    use_weak_rubric_criteria: bool      = True,
-    force_option_subquestions: bool     = False,
     verifier_attr:         bool         = False,
     verifier_opstatus:     bool         = False,
     sufficient_threshold_delta: float   = 0.0,
@@ -516,6 +607,7 @@ def run_veil(
     per_chunk_keyframe_cap: int         = 1,
     pass_verifier_judgment_to_answerer: bool = False,
     loose_verifier:        bool         = False,
+    verifier_two_pass:     bool         = False,
     dialogue_first:        bool         = False,
     asr_alpha:             float        = 0.0,
     text_first_keyframes:  bool         = False,
@@ -523,6 +615,7 @@ def run_veil(
     question_first:        bool         = True,
     align_images_to_evidence: bool      = False,
     multi_layer_mode:      str          = "none",
+    online_layer:          bool         = False,
 ) -> dict:
     """Iter-0 sub-question decomposition + iter ≥1 unified-planner repair.
 
@@ -567,10 +660,7 @@ def run_veil(
             "reasoning": "iter0_single_query"
         }
     else:
-        current_plan: dict = planner.decompose_iter0(
-            question, candidates,
-            force_option=force_option_subquestions,
-        )
+        current_plan: dict = planner.decompose_iter0(question, candidates)
     plan_history.append(current_plan["queries"])
     last_verdict: dict = {}
     gold_letter = (chr(65 + candidates.index(gold_answer))
@@ -582,11 +672,10 @@ def run_veil(
         # ── Plan (iter ≥ 1): generate new queries from last verdict + history ─
         if it > 0:
             verdict_for_planning = {} if ignore_verifier_signal else last_verdict
-            next_plan, m_desc, _weak = planner.plan_next(
+            next_plan, m_desc = planner.plan_next(
                 question, candidates, all_evidence_texts, verdict_for_planning, plan_history,
                 rubric_judgment=rubric_judgment,
                 prune_satisfied=prune_satisfied,
-                use_weak_rubric_criteria=use_weak_rubric_criteria,
             )
             next_plan = planner.filter_targeted_queries(
                 next_plan, plan_history, embedder, all_ev_vecs,
@@ -690,7 +779,8 @@ def run_veil(
                                   verifier_attr=verifier_attr,
                                   verifier_opstatus=verifier_opstatus,
                                   sufficient_threshold_delta=sufficient_threshold_delta,
-                                  loose=loose_verifier)
+                                  loose=loose_verifier,
+                                  two_pass=verifier_two_pass)
 
         # ── Oracle check (post-verifier) ──────────────────────────────────────
         # Oracle uses the same evidence/keyframe caps as the final answerer.
@@ -766,7 +856,6 @@ def run_veil(
             "option_judgment":           last_verdict.get("option_judgment"),
             "unknown_options":           last_verdict.get("unknown_options"),
             "option_rubric_scores":      last_verdict.get("option_rubric_scores"),
-            "weak_rubric_criteria":      last_verdict.get("weak_rubric_criteria"),
             "missing_evidence_analysis": last_verdict.get("missing_evidence_analysis") or None,
             "oracle_pred":               oracle_pred or None,
             "plan_strategy":             current_plan.get("strategy"),
@@ -841,6 +930,21 @@ def run_veil(
             verifier_hint_oj = last_verdict.get("option_judgment")
             verifier_hint_scores = last_verdict.get("option_rubric_scores")
 
+        # ── Online layer: if still insufficient after all iterations, go back to
+        # the raw video frames (frames_raw) for the relevant chunks and re-examine
+        # them with a question-aware VLM pass; prepend the fresh text as evidence.
+        online_used = False
+        if online_layer and keyframe_dir is not None and last_verdict \
+                and not _verdict_sufficient(last_verdict):
+            extra = _online_recaption(
+                question, candidates,
+                last_verdict.get("missing_evidence_analysis") or "",
+                ev_ids, bank.video_id, keyframe_dir, answerer.model)
+            if extra:
+                ev_texts = [extra] + list(ev_texts)
+                ev_ids   = [-999] + list(ev_ids)
+                online_used = True
+
         result = answerer.answer(question, candidates, ev_texts,
                                  keyframe_images=kf_for_answer,
                                  keyframe_chunk_ids=kf_chunk_ids_for_ans,
@@ -852,6 +956,7 @@ def run_veil(
                                  verifier_option_scores=verifier_hint_scores)
         result["n_keyframes_to_answer"] = len(kf_for_answer)
         result["n_evidence_to_answer"]  = len(ev_texts)
+        result["online_used"]           = online_used
         if text_first_status is not None:
             result["text_first_status"]    = text_first_status
             result["text_first_kept_cids"] = text_first_kept_cids

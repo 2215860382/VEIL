@@ -229,6 +229,57 @@ Return ONLY this JSON:
 }"""
 
 
+# ── Two-pass rubric verifier (--verifier-two-pass) ───────────────────────────
+# Pass 1 scores sufficiency ONLY (no true/false), so the model is not anchored by
+# its own answer guess. Python then thresholds per option, and Pass 2 judges
+# true/false conditioned on which options cleared the threshold.
+VERIFIER_SYS_TWOPASS_SCORE = """\
+You evaluate whether retrieved video evidence is SUFFICIENT to judge each answer option.
+Do NOT decide which option is correct — only score evidence sufficiency.
+Output ONE strict JSON object — no prose, no markdown fences.
+
+## Per-Option Evidence Sufficiency Scoring
+For each answer option, convert it into a proposition and score each rubric criterion:
+  1.0 = evidence fully sufficient to judge this option on this criterion
+        (clearly confirms OR clearly rules it out — both count as sufficient)
+  0.5 = evidence partially sufficient — some relevant information present but incomplete
+  0.0 = evidence insufficient to judge this option on this criterion
+Score whether the evidence ALLOWS JUDGMENT of this option, not whether it supports it.
+Evidence that clearly rules out an option scores as high as evidence that confirms it.
+When unsure between 1.0 and 0.5, choose 0.5; between 0.5 and 0.0, choose 0.0.
+
+Return ONLY this JSON (use actual criterion names from the Rubric):
+{
+  "option_criteria_scores": {
+    "A": {"<criterion>": 0.0, ...},
+    "B": {"<criterion>": 0.0, ...}
+  }
+}"""
+
+VERIFIER_SYS_TWOPASS_JUDGE = """\
+You judge multiple-choice answer options for a video question. A separate scoring step
+already decided which options have SUFFICIENT evidence to judge and which do not; each
+option below is tagged [SUFFICIENT] or [INSUFFICIENT].
+Output ONE strict JSON object — no prose, no markdown fences.
+
+## Step 1 — Judge the [SUFFICIENT] options
+For each option tagged [SUFFICIENT], commit to:
+  true   : evidence clearly establishes this option is correct
+  false  : evidence clearly establishes this option is incorrect
+Do NOT output a judgment for [INSUFFICIENT] options — they are already "unknown".
+
+## Step 2 — Missing Evidence Analysis
+If any option is [INSUFFICIENT], write ONE actionable sentence in "missing_evidence_analysis"
+naming the specific fact, time range, or event still needed to resolve it.
+Leave it empty string if every option is [SUFFICIENT].
+
+Return ONLY this JSON:
+{
+  "option_judgment": { "A": "true|false", ... },
+  "missing_evidence_analysis": "..."
+}"""
+
+
 VERIFIER_SYS_NORUBRIC_ATTR = """\
 You judge whether retrieved video-segment evidence is sufficient to answer a multiple-choice question.
 No rubric scoring. Follow these THREE steps, then output ONE strict JSON object.
@@ -408,6 +459,120 @@ class Verifier:
     def get_rubric(self, question: str, task_type: Optional[str] = None) -> str:
         return get_rubric(question, task_type)
 
+    def _parse_criteria_scores(self, parsed: dict) -> Dict[str, Dict[str, float]]:
+        """Parse the LLM's option_criteria_scores into {opt: {criterion: float}}."""
+        out: Dict[str, Dict[str, float]] = {}
+        raw = parsed.get("option_criteria_scores") or {}
+        if isinstance(raw, dict):
+            for opt_key, crit_dict in raw.items():
+                opt = as_str(opt_key).strip().upper()[:1]
+                if not opt or not isinstance(crit_dict, dict):
+                    continue
+                scores: Dict[str, float] = {}
+                for cname, cscore in crit_dict.items():
+                    try:
+                        scores[str(cname).strip()] = float(cscore)
+                    except (TypeError, ValueError):
+                        scores[str(cname).strip()] = 0.0
+                if scores:
+                    out[opt] = scores
+        return out
+
+    def _verify_twopass(
+        self, question, candidates, opts, rubric_section, ev, rubric_dict,
+        keyframe_images, sufficient_threshold_delta,
+    ) -> Dict:
+        """Two-pass rubric verify: pass 1 scores sufficiency, pass 2 judges t/f.
+
+        Pass 1 outputs ONLY option_criteria_scores (no answer guess). Python
+        thresholds per option, then pass 2 commits true/false on the options that
+        cleared the threshold and writes missing_evidence_analysis for the rest.
+        Returns the same 6-field verdict as the single-pass rubric path.
+        """
+        has_imgs = bool(keyframe_images) and bool(getattr(self.llm, '_api_endpoints', None))
+
+        # ── Pass 1: sufficiency scoring only ──────────────────────────────────
+        sys1 = os.environ.get("VEIL_VERIFIER_SYS_SCORE", "").strip() or VERIFIER_SYS_TWOPASS_SCORE
+        user1 = "\n\n".join([
+            f"Question: {question}", f"Options:\n{opts}",
+            f"Rubric:\n{rubric_section}", f"Evidence Chain:\n{ev}",
+            "Return the sufficiency-scores JSON now.",
+        ])
+        msg1 = [{"role": "system", "content": sys1}, {"role": "user", "content": user1}]
+        if has_imgs:
+            msg1[-1] = _inject_images(msg1[-1], keyframe_images)
+        parsed1 = extract_json(self.llm.chat(msg1, max_new_tokens=600, enable_thinking=False))
+
+        option_criteria_scores = self._parse_criteria_scores(parsed1)
+
+        weights = _criterion_weights(rubric_dict)
+        option_rubric_scores: Dict[str, float] = {}
+        for opt, crit_scores in option_criteria_scores.items():
+            total_w = weighted_sum = 0.0
+            for name, val in crit_scores.items():
+                w = weights.get(name, 1.0)
+                total_w += w
+                weighted_sum += w * val
+            option_rubric_scores[opt] = (weighted_sum / total_w) if total_w > 0 else 0.0
+
+        sufficient_threshold = min(
+            1.0,
+            float(rubric_dict.get("sufficient_threshold", 0.75)) + float(sufficient_threshold_delta),
+        )
+        all_opts   = [chr(ord('A') + i) for i in range(len(candidates))]
+        suff_opts  = [o for o in all_opts if option_rubric_scores.get(o, 0.0) >= sufficient_threshold]
+        insuff_set = {o for o in all_opts if o not in suff_opts}
+
+        # ── Pass 2: judge the sufficient options, ask missing for the rest ────
+        opts_tagged = "\n".join(
+            f"  ({chr(ord('A') + i)}) {c} "
+            + ("[INSUFFICIENT]" if chr(ord('A') + i) in insuff_set else "[SUFFICIENT]")
+            for i, c in enumerate(candidates)
+        )
+        sys2 = os.environ.get("VEIL_VERIFIER_SYS_JUDGE", "").strip() or VERIFIER_SYS_TWOPASS_JUDGE
+        user2 = "\n\n".join([
+            f"Question: {question}", f"Options:\n{opts_tagged}",
+            f"Evidence Chain:\n{ev}", "Return the judgment JSON now.",
+        ])
+        msg2 = [{"role": "system", "content": sys2}, {"role": "user", "content": user2}]
+        if has_imgs:
+            msg2[-1] = _inject_images(msg2[-1], keyframe_images)
+        parsed2 = extract_json(self.llm.chat(msg2, max_new_tokens=400, enable_thinking=False))
+
+        raw_judgment = parsed2.get("option_judgment") or {}
+        llm_judgment: Dict[str, str] = {}
+        if isinstance(raw_judgment, dict):
+            for k, v in raw_judgment.items():
+                key = as_str(k).strip().upper()[:1]
+                val = as_str(v).strip().lower()
+                if key and val in ("true", "false", "unknown"):
+                    llm_judgment[key] = val
+
+        option_judgment: Dict[str, str] = {}
+        for opt in all_opts:
+            option_judgment[opt] = "unknown" if opt in insuff_set else llm_judgment.get(opt, "unknown")
+
+        n_opts       = len(candidates)
+        true_opts    = [k for k, v in option_judgment.items() if v == "true"]
+        false_opts   = [k for k, v in option_judgment.items() if v == "false"]
+        unknown_opts = [k for k, v in option_judgment.items() if v == "unknown"]
+        label = "SUFFICIENT" if len(true_opts) == 1 and len(false_opts) == n_opts - 1 else "INSUFFICIENT"
+
+        missing: Optional[str] = None
+        if label == "INSUFFICIENT" and unknown_opts:
+            raw_missing = parsed2.get("missing_evidence_analysis")
+            if isinstance(raw_missing, str) and raw_missing.strip():
+                missing = raw_missing.strip()
+
+        return {
+            "label":                  label,
+            "option_judgment":        option_judgment,
+            "unknown_options":        unknown_opts,
+            "option_rubric_scores":   {k: round(v, 4) for k, v in option_rubric_scores.items()},
+            "option_criteria_scores": option_criteria_scores,
+            "missing_evidence_analysis": missing,
+        }
+
     def verify(
         self,
         question: str,
@@ -422,12 +587,13 @@ class Verifier:
         margin_threshold: float = 0.20,
         sufficient_threshold_delta: float = 0.0,
         loose: bool = False,
+        two_pass: bool = False,
     ) -> Dict:
         """Judge evidence sufficiency with rubric-guided per-option scoring.
 
         rubric_judgment=True (default):
             LLM scores each rubric criterion per option; Python computes
-            option_scores, option_status, label, and weak_rubric_criteria.
+            option_scores, option_status, and label.
             label: "SUFFICIENT" | "INSUFFICIENT"
 
         rubric_judgment=False:
@@ -478,7 +644,6 @@ class Verifier:
             return {
                 "label": label, "option_status": option_status,
                 "option_scores": {}, "option_criteria_scores": {},
-                "weak_rubric_criteria": [],
                 "missing_evidence_analysis": missing if label == "insufficient" else None,
                 "score": 0.0, "criteria": {}, "reasoning": as_str(parsed.get("reasoning", "")),
                 "evidence_attribution": {}, "key_ids": [], "distractor_ids": [],
@@ -492,12 +657,21 @@ class Verifier:
         )
         opts = "\n".join(f"  ({chr(ord('A')+i)}) {c}" for i, c in enumerate(candidates))
         ev   = _format_evidence(evidence_texts)
+
+        if two_pass:
+            return self._verify_twopass(
+                question, candidates, opts, rubric_section, ev, rubric_dict,
+                keyframe_images, sufficient_threshold_delta,
+            )
+
         user = "\n\n".join([
             f"Question: {question}", f"Options:\n{opts}",
             f"Rubric:\n{rubric_section}", f"Evidence Chain:\n{ev}",
             "Return the JSON now.",
         ])
         sys_for_rubric = VERIFIER_SYS_LOOSE if loose else VERIFIER_SYS
+        # Prompt-iteration override (no source edit needed); empty/unset → default.
+        sys_for_rubric = os.environ.get("VEIL_VERIFIER_SYS", "").strip() or sys_for_rubric
         messages = [
             {"role": "system", "content": sys_for_rubric},
             {"role": "user",   "content": user},
@@ -570,22 +744,9 @@ class Verifier:
 
         label = "SUFFICIENT" if len(true_opts) == 1 and len(false_opts) == n_opts - 1 else "INSUFFICIENT"
 
-        # ── Weak rubric criteria (from unknown options only) ───────────────────
-        weak_rubric_criteria: List[str] = []
+        # ── Missing evidence analysis (from unknown options only) ──────────────
         missing: Optional[str] = None
         if label == "INSUFFICIENT" and unknown_opts:
-            crit_totals: Dict[str, float] = {}
-            crit_counts: Dict[str, int]   = {}
-            for opt in unknown_opts:
-                for crit, sc in option_criteria_scores.get(opt, {}).items():
-                    crit_totals[crit] = crit_totals.get(crit, 0.0) + sc
-                    crit_counts[crit] = crit_counts.get(crit, 0) + 1
-            if crit_totals:
-                crit_avgs = {k: crit_totals[k] / crit_counts[k] for k in crit_totals}
-                weak_rubric_criteria = [
-                    k for k, v in sorted(crit_avgs.items(), key=lambda x: x[1])
-                    if v < 0.5
-                ]
             raw_missing = parsed.get("missing_evidence_analysis")
             if isinstance(raw_missing, str) and raw_missing.strip():
                 missing = raw_missing.strip()
@@ -596,13 +757,5 @@ class Verifier:
             "unknown_options":        unknown_opts,
             "option_rubric_scores":   {k: round(v, 4) for k, v in option_rubric_scores.items()},
             "option_criteria_scores": option_criteria_scores,
-            "weak_rubric_criteria":   weak_rubric_criteria,
             "missing_evidence_analysis": missing,
-            # Legacy fields
-            "score":               round(max(option_rubric_scores.values()), 4) if option_rubric_scores else 0.0,
-            "criteria":            {},
-            "reasoning":           "",
-            "evidence_attribution": {},
-            "key_ids":             [],
-            "distractor_ids":      [],
         }

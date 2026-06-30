@@ -64,3 +64,21 @@ k=64 probe, and a rubric-score-vs-prediction analysis showing the rubric changes
 verifier scoring on 141/180 questions but flips only 11/180 final answers) indicate the
 system is **answerer-bound**: rubric design is correct and active but is not the accuracy
 lever at this scale.
+
+Two answerer-prompt interventions were tried and both falsified:
+
+1. **Keyword-routed question-type guidance** (negation / synopsis / temporal) hurt both
+   held-out splits in the same direction (val 81.1%→73.3%, test 78.9%→75.6%; 12
+   regressions vs 2 gains). Reverted.
+2. **Chain-of-thought answerer** (reason briefly over evidence timestamps, then emit the
+   letter) looked marginally positive on 180 (val −1, test +4, net +3) — but that was
+   small-sample noise. On **dev-720** it was significantly *negative*: 72.5%→69.6%
+   (−2.9 pt, 31 gained / 52 lost, McNemar p=0.021). Reverted. Forcing the answerer to
+   reason over the lossy memory summary makes it argue itself out of correct intuitions.
+
+Method lesson: **only ≥720-question results are trustworthy here**; 180-split rankings
+flip as noise (this is why the constructed rubrics looked split-dependent). The answerer
+is near its ceiling on the given evidence — gains require *better evidence* (retrieval
+recall / richer memory captions), not answerer-prompt steering. A text-only full-context
+probe (feed all chunk texts, no retrieval) was net +8 on the 180-split, suggesting a real
+recall gap, but that too needs 720-scale confirmation before being trusted.
